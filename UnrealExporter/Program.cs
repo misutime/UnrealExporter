@@ -1,20 +1,21 @@
-﻿using Newtonsoft.Json;
+﻿using System.Collections.Concurrent;
 using System.Globalization;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using CUE4Parse_Conversion.Textures;
+using CUE4Parse_Conversion.Textures.BC;
+using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
+using CUE4Parse.MappingsProvider;
+using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse.UE4.Localization;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.Utils;
-using System.Text.RegularExpressions;
-using CUE4Parse.UE4.Assets.Exports.Texture;
-using CUE4Parse_Conversion.Textures;
-using SkiaSharp;
-using CUE4Parse.UE4.Localization;
-using System.Collections.Concurrent;
-using CUE4Parse.MappingsProvider;
 using JSBeautifyLib;
-using CUE4Parse.Compression;
-using System.Reflection;
+using Newtonsoft.Json;
+using SkiaSharp;
 
 namespace UnrealExporter;
 
@@ -31,7 +32,6 @@ public class UnrealExporter
 
     public static void Main(string[] args)
     {
-
 #if DEBUG
         // During development (dotnet run), BaseDirectory is bin\Debug\net8.0
         // Adjust to project root
@@ -46,6 +46,7 @@ public class UnrealExporter
         // Initialize CUE4Parse dependencies
         InitOodle();
         InitZlib();
+        InitDetex();
 
         try
         {
@@ -59,7 +60,9 @@ public class UnrealExporter
                 totalExportedFiles = 0;
 
                 EGame selectedVersion = GetGameVersion(config.Version);
-                Console.WriteLine($"Config: {config.ConfigFileName} (object #{config.ConfigObjectIndex + 1})");
+                Console.WriteLine(
+                    $"Config: {config.ConfigFileName} (object #{config.ConfigObjectIndex + 1})"
+                );
                 Console.WriteLine($"Game: {config.GameTitle}");
                 Console.WriteLine($"Version: {selectedVersion}");
                 Console.WriteLine($"Locale: {config.Lang}");
@@ -75,7 +78,9 @@ public class UnrealExporter
                 Export(provider, config, start);
             }
 
-            Console.WriteLine($"UnrealExporter finished in {Elapsed(trueStart, Now(), 1000)} seconds");
+            Console.WriteLine(
+                $"UnrealExporter finished in {Elapsed(trueStart, Now(), 1000)} seconds"
+            );
         }
         catch (OperationCanceledException)
         {
@@ -87,30 +92,25 @@ public class UnrealExporter
         }
     }
 
-    public static async ValueTask InitOodle()
+    public static void InitOodle()
     {
-        var oodlePath = Path.Combine(".", OodleHelper.OODLE_DLL_NAME);
-        if (File.Exists(OodleHelper.OODLE_DLL_NAME))
-        {
-            File.Move(OodleHelper.OODLE_DLL_NAME, oodlePath, true);
-        }
-        else if (!File.Exists(oodlePath))
-        {
-            await OodleHelper.DownloadOodleDllAsync(oodlePath);
-        }
-
-        OodleHelper.Initialize(oodlePath);
+        OodleHelper.Initialize();
     }
 
-    public static async ValueTask InitZlib()
+    public static void InitZlib()
     {
-        var zlibPath = Path.Combine(".", ZlibHelper.DLL_NAME);
-        if (!File.Exists(zlibPath))
+        ZlibHelper.Initialize();
+    }
+
+    public static void InitDetex()
+    {
+        var detexPath = Path.Combine(RootDir, DetexHelper.DLL_NAME);
+        if (!File.Exists(detexPath))
         {
-            await ZlibHelper.DownloadDllAsync(zlibPath);
+            DetexHelper.LoadDll(detexPath);
         }
 
-        ZlibHelper.Initialize(zlibPath);
+        DetexHelper.Initialize(detexPath);
     }
 
     public static List<ConfigObj>? LoadConfigFile(string path)
@@ -118,7 +118,8 @@ public class UnrealExporter
         try
         {
             string jsonString = File.ReadAllText(path);
-            List<ConfigObj> configObjs = JsonConvert.DeserializeObject<List<ConfigObj>>(jsonString) ?? [];
+            List<ConfigObj> configObjs =
+                JsonConvert.DeserializeObject<List<ConfigObj>>(jsonString) ?? [];
             int index = 0;
             foreach (ConfigObj obj in configObjs)
             {
@@ -139,7 +140,10 @@ public class UnrealExporter
         return null;
     }
 
-    public static List<ConfigObj> LoadConfigsFromSelector(string[] args, string[] allConfigFilePaths)
+    public static List<ConfigObj> LoadConfigsFromSelector(
+        string[] args,
+        string[] allConfigFilePaths
+    )
     {
         if (allConfigFilePaths.Length < 1)
         {
@@ -196,7 +200,9 @@ public class UnrealExporter
         while (true)
         {
             Console.Clear(); // Clear the console screen before re-printing options
-            Console.WriteLine($"{(allConfigFilePaths.Length > 1 ? "Multiple config files detected. Select the ones" : "Select the config files")} you wish to execute with arrows keys, space to select, enter to confirm, or escape to exit.");
+            Console.WriteLine(
+                $"{(allConfigFilePaths.Length > 1 ? "Multiple config files detected. Select the ones" : "Select the config files")} you wish to execute with arrows keys, space to select, enter to confirm, or escape to exit."
+            );
 
             for (int i = 0; i < selectedOptions.Length; i++)
             {
@@ -222,7 +228,8 @@ public class UnrealExporter
             switch (key.Key)
             {
                 case ConsoleKey.UpArrow:
-                    currentOption = (currentOption - 1 + selectedOptions.Length) % selectedOptions.Length;
+                    currentOption =
+                        (currentOption - 1 + selectedOptions.Length) % selectedOptions.Length;
                     break;
                 case ConsoleKey.DownArrow:
                     currentOption = (currentOption + 1) % selectedOptions.Length;
@@ -246,7 +253,12 @@ public class UnrealExporter
                     {
                         if (selectedOptions[i])
                         {
-                            result.Add(allConfigFilePaths[i - 1].Split(Path.DirectorySeparatorChar).Last().Split(".")[0]);
+                            result.Add(
+                                allConfigFilePaths[i - 1]
+                                    .Split(Path.DirectorySeparatorChar)
+                                    .Last()
+                                    .Split(".")[0]
+                            );
                         }
                     }
                     Console.WriteLine();
@@ -292,7 +304,9 @@ public class UnrealExporter
                             allConfigObjs.Add(configObj);
                         }
                         totalConfigFiles++;
-                        Console.WriteLine($"{filePath.Split(Path.DirectorySeparatorChar).Last()} ({configObjsInFile.Count} object{(configObjsInFile.Count > 1 ? "s" : "")})");
+                        Console.WriteLine(
+                            $"{filePath.Split(Path.DirectorySeparatorChar).Last()} ({configObjsInFile.Count} object{(configObjsInFile.Count > 1 ? "s" : "")})"
+                        );
                     }
                 }
             }
@@ -301,7 +315,9 @@ public class UnrealExporter
             {
                 foreach (var arg in args)
                 {
-                    List<ConfigObj>? configObjsInFile = LoadConfigFile($"{RootDir}\\configs\\{arg}.json");
+                    List<ConfigObj>? configObjsInFile = LoadConfigFile(
+                        $"{RootDir}\\configs\\{arg}.json"
+                    );
 
                     if (configObjsInFile != null)
                     {
@@ -310,12 +326,16 @@ public class UnrealExporter
                             allConfigObjs.Add(configObj);
                         }
                         totalConfigFiles++;
-                        Console.WriteLine($"{arg}.json ({configObjsInFile.Count} object{(configObjsInFile.Count > 1 ? "s" : "")})");
+                        Console.WriteLine(
+                            $"{arg}.json ({configObjsInFile.Count} object{(configObjsInFile.Count > 1 ? "s" : "")})"
+                        );
                     }
                 }
             }
 
-            Console.WriteLine($"Loaded {totalConfigFiles} config file(s) ({allConfigObjs.Count} total object{(allConfigObjs.Count > 1 ? "s" : "")})");
+            Console.WriteLine(
+                $"Loaded {totalConfigFiles} config file(s) ({allConfigObjs.Count} total object{(allConfigObjs.Count > 1 ? "s" : "")})"
+            );
         }
         // Fallback to default config.json
         else
@@ -329,7 +349,9 @@ public class UnrealExporter
                 {
                     allConfigObjs.Add(configObj);
                 }
-                Console.WriteLine($"Loaded config.json ({allConfigObjs.Count} object{(allConfigObjs.Count > 1 ? "s" : "")})");
+                Console.WriteLine(
+                    $"Loaded config.json ({allConfigObjs.Count} object{(allConfigObjs.Count > 1 ? "s" : "")})"
+                );
             }
         }
         Console.WriteLine();
@@ -367,22 +389,38 @@ public class UnrealExporter
     {
         // Load CUE4Parse
         // TODO: Ignore mods (all folders within /Content/Paks)
-        var provider = new DefaultFileProvider(config.PaksDir, SearchOption.AllDirectories, true, new VersionContainer(selectedVersion));
+        var provider = new DefaultFileProvider(
+            config.PaksDir,
+            SearchOption.AllDirectories,
+            true,
+            new VersionContainer(selectedVersion)
+        );
         provider.Initialize();
 
         // Decrypt
-        string aes = config.Aes.Length > 0 ? config.Aes : "0x0000000000000000000000000000000000000000000000000000000000000000";
+        string aes =
+            config.Aes.Length > 0
+                ? config.Aes
+                : "0x0000000000000000000000000000000000000000000000000000000000000000";
         provider.SubmitKey(new FGuid(), new FAesKey(aes));
 
-        // Set locale if provided, otherwise English
-        if (config.Lang?.Length > 0)
+        // Set locale if provided, otherwise English. Some games ship no matching
+        // locres culture, and asset export can continue without localization.
+        try
         {
-            ELanguage selectedLang = (ELanguage)Enum.Parse(typeof(ELanguage), config.Lang);
-            provider.LoadLocalization(selectedLang);
+            if (config.Lang?.Length > 0)
+            {
+                ELanguage selectedLang = (ELanguage)Enum.Parse(typeof(ELanguage), config.Lang);
+                provider.LoadLocalization(selectedLang);
+            }
+            else
+            {
+                provider.LoadLocalization(ELanguage.English);
+            }
         }
-        else
+        catch (Exception ex)
         {
-            provider.LoadLocalization(ELanguage.English);
+            Console.WriteLine($"WARN: localization skipped ({ex.Message})");
         }
 
         // TEMP (need to fix patchProvider for utoc/ucas support). For now it's not guaranteed that the patch paks will be reconciled correctly.
@@ -393,19 +431,7 @@ public class UnrealExporter
             provider.MappingsContainer = new FileUsmapTypeMappingsProvider(pathToMapping);
         }
 
-        // Load files into PatchFileProvider so the patch uassets override original uassets
-        var patchProvider = new PatchFileProvider();
-        patchProvider.Load(provider);
-
-        // Add mapping file based on GameTitle if provided
-        string pathToMappingFile = $"{RootDir}\\mappings\\{config.GameTitle}.usmap";
-        if (File.Exists(pathToMappingFile))
-        {
-            Console.WriteLine($"Using mapping file: {pathToMappingFile}");
-            patchProvider.MappingsContainer = new FileUsmapTypeMappingsProvider(pathToMappingFile);
-        }
-
-        return patchProvider;
+        return provider;
     }
 
     public static void Export(AbstractFileProvider provider, ConfigObj config, double start)
@@ -418,66 +444,79 @@ public class UnrealExporter
         Console.WriteLine($"Scanning {provider.Files.Count} files...{Environment.NewLine}");
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
-        Parallel.ForEach(provider.Files, file =>
-        {
-            // "Hotta/Content/Resources/UI/Activity/Activity/DT_Activityquest_Balance.uasset"
-            // file.Value.Path
-
-            // "Hotta\Content\Resources\UI\Activity\Activity"
-            var fileDir = Path.GetDirectoryName(file.Value.Path);
-
-            // "DT_Activityquest_Balance"
-            var fileName = Path.GetFileNameWithoutExtension(file.Value.Path);
-
-            // "Hotta\Content\Resources\UI\Activity\Activity\DT_Activityquest_Balance"
-            var filePath = fileDir + Path.DirectorySeparatorChar + fileName;
-
-            // "D:\UnrealExporter\output\Hotta\Content\Resources\UI\Activity\Activity"
-            var outputDir = config.KeepDirectoryStructure ?
-                Path.GetFullPath(config.OutputDir) + Path.DirectorySeparatorChar + fileDir
-                : Path.GetFullPath(config.OutputDir);
-
-            // "D:\UnrealExporter\output\Hotta\Content\Resources\UI\Activity\Activity\DT_Activityquest_Balance"
-            var outputPath = outputDir + Path.DirectorySeparatorChar + fileName;
-
-            string regexMatch =
-                config.Export
-                .FirstOrDefault(path => new Regex("^" + path[..path.LastIndexOf(':')] + "$", RegexOptions.IgnoreCase)
-                .IsMatch(file.Value.Path), "");
-
-            bool isExclude =
-                config.Exclude
-                .Any(path => new Regex("^" + path + "$", RegexOptions.IgnoreCase)
-                .IsMatch(file.Value.Path));
-
-            bool isChanged = true;
-
-            // If checkpoint is specified, skip files whose sizes are the same as in the checkpoint
-            if (useCheckpoint && loadedCheckpoint.TryGetValue(file.Value.Path, out long fileSize))
+        Parallel.ForEach(
+            provider.Files,
+            file =>
             {
-                isChanged = fileSize != file.Value.Size;
-                if (isChanged) Interlocked.Increment(ref totalChangedFiles);
-            }
+                // "Hotta/Content/Resources/UI/Activity/Activity/DT_Activityquest_Balance.uasset"
+                // file.Value.Path
 
-            if (config.CreateNewCheckpoint) newCheckpointDict.TryAdd(file.Value.Path, file.Value.Size);
+                // "Hotta\Content\Resources\UI\Activity\Activity"
+                var fileDir = Path.GetDirectoryName(file.Value.Path);
 
-            if (regexMatch.Length > 0 && !isExclude && isChanged)
-            {
-                // "uasset"
-                var fileType = file.Value.Path.SubstringAfterLast('.').ToLower();
+                // "DT_Activityquest_Balance"
+                var fileName = Path.GetFileNameWithoutExtension(file.Value.Path);
 
-                // "json" etc.
-                var outputType = regexMatch.SubstringAfterLast(':').ToLower();
+                // "Hotta\Content\Resources\UI\Activity\Activity\DT_Activityquest_Balance"
+                var filePath = fileDir + Path.DirectorySeparatorChar + fileName;
 
-                try
+                // "D:\UnrealExporter\output\Hotta\Content\Resources\UI\Activity\Activity"
+                var outputDir = config.KeepDirectoryStructure
+                    ? Path.GetFullPath(config.OutputDir) + Path.DirectorySeparatorChar + fileDir
+                    : Path.GetFullPath(config.OutputDir);
+
+                // "D:\UnrealExporter\output\Hotta\Content\Resources\UI\Activity\Activity\DT_Activityquest_Balance"
+                var outputPath = outputDir + Path.DirectorySeparatorChar + fileName;
+
+                string regexMatch = config.Export.FirstOrDefault(
+                    path =>
+                        new Regex(
+                            "^" + path[..path.LastIndexOf(':')] + "$",
+                            RegexOptions.IgnoreCase
+                        ).IsMatch(file.Value.Path),
+                    ""
+                );
+
+                bool isExclude = config.Exclude.Any(path =>
+                    new Regex("^" + path + "$", RegexOptions.IgnoreCase).IsMatch(file.Value.Path)
+                );
+
+                bool isChanged = true;
+
+                // If checkpoint is specified, skip files whose sizes are the same as in the checkpoint
+                if (
+                    useCheckpoint
+                    && loadedCheckpoint.TryGetValue(file.Value.Path, out long fileSize)
+                )
                 {
-                    switch (fileType)
+                    isChanged = fileSize != file.Value.Size;
+                    if (isChanged)
+                        Interlocked.Increment(ref totalChangedFiles);
+                }
+
+                if (config.CreateNewCheckpoint)
+                    newCheckpointDict.TryAdd(file.Value.Path, file.Value.Size);
+
+                if (regexMatch.Length > 0 && !isExclude && isChanged)
+                {
+                    // "uasset"
+                    var fileType = file.Value.Path.SubstringAfterLast('.').ToLower();
+
+                    // "json" etc.
+                    var outputType = regexMatch.SubstringAfterLast(':').ToLower();
+
+                    try
                     {
-                        // Referencing CUE4ParseViewModel.cs from Fmodel source code
-                        case "uasset":
-                        case "umap":
+                        switch (fileType)
+                        {
+                            // Referencing CUE4ParseViewModel.cs from Fmodel source code
+                            case "uasset":
+                            case "umap":
                             {
-                                var allObjects = provider.LoadAllObjects(file.Value.Path);
+                                var allObjects = provider
+                                    .LoadPackage(file.Value)
+                                    .GetExports()
+                                    .ToArray();
 
                                 if (outputType == "png")
                                 {
@@ -486,17 +525,31 @@ public class UnrealExporter
                                         // Only exports the first object that is a valid bitmap
                                         if (obj is UTexture2D texture)
                                         {
-                                            var bitmap = texture.Decode(ETexturePlatform.DesktopMobile);
+                                            var decodedTexture = texture.Decode(
+                                                ETexturePlatform.DesktopMobile
+                                            );
 
-                                            if (bitmap != null)
+                                            if (decodedTexture != null)
                                             {
-                                                if (config.LogOutputs) Console.WriteLine("=> " + outputPath + ".png");
-                                                if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                                if (config.LogOutputs)
+                                                    Console.WriteLine("=> " + outputPath + ".png");
+                                                if (!Directory.Exists(outputDir))
+                                                    Directory.CreateDirectory(outputDir);
 
                                                 // Save the bitmap to a file
+                                                using SKBitmap bitmap = decodedTexture.ToSkBitmap();
                                                 using (SKImage image = SKImage.FromBitmap(bitmap))
-                                                using (SKData data = image.Encode(SKEncodedImageFormat.Png, 100))
-                                                using (Stream stream = File.OpenWrite(outputPath + ".png"))
+                                                using (
+                                                    SKData data = image.Encode(
+                                                        SKEncodedImageFormat.Png,
+                                                        100
+                                                    )
+                                                )
+                                                using (
+                                                    Stream stream = File.OpenWrite(
+                                                        outputPath + ".png"
+                                                    )
+                                                )
                                                 {
                                                     data.SaveTo(stream);
                                                 }
@@ -506,7 +559,9 @@ public class UnrealExporter
                                             }
                                             else
                                             {
-                                                Console.WriteLine($"ERROR: Failed to export {file.Value.Path} (not a valid image bitmap).");
+                                                Console.WriteLine(
+                                                    $"ERROR: Failed to export {file.Value.Path} (not a valid image bitmap)."
+                                                );
                                             }
                                         }
                                         else
@@ -516,17 +571,20 @@ public class UnrealExporter
                                         }
                                     }
                                 }
-
                                 else if (outputType == "json")
                                 {
                                     // Serialize to JSON, then write to file
-                                    if (config.LogOutputs) Console.WriteLine("=> " + outputPath + ".json");
-                                    var json = JsonConvert.SerializeObject(allObjects, Formatting.Indented);
-                                    if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                    if (config.LogOutputs)
+                                        Console.WriteLine("=> " + outputPath + ".json");
+                                    var json = JsonConvert.SerializeObject(
+                                        allObjects,
+                                        Formatting.Indented
+                                    );
+                                    if (!Directory.Exists(outputDir))
+                                        Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".json", json);
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
-
                                 // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
                                 // https://github.com/4sval/FModel/blob/master/FModel/ViewModels/CUE4ParseViewModel.cs#L928
                                 // Possible refactor to include TryGetValue
@@ -535,13 +593,28 @@ public class UnrealExporter
                                 {
                                     if (provider.TrySavePackage(file.Value, out var assets))
                                     {
-                                        Parallel.ForEach(assets, kvp =>
-                                        {
-                                            if (config.LogOutputs) Console.WriteLine("=> " + outputPath + "." + kvp.Key.SubstringAfterLast('.'));
-                                            if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
-                                            File.WriteAllBytes(outputPath + "." + kvp.Key.SubstringAfterLast('.'), kvp.Value);
-                                            Interlocked.Increment(ref totalExportedFiles);
-                                        });
+                                        Parallel.ForEach(
+                                            assets,
+                                            kvp =>
+                                            {
+                                                if (config.LogOutputs)
+                                                    Console.WriteLine(
+                                                        "=> "
+                                                            + outputPath
+                                                            + "."
+                                                            + kvp.Key.SubstringAfterLast('.')
+                                                    );
+                                                if (!Directory.Exists(outputDir))
+                                                    Directory.CreateDirectory(outputDir);
+                                                File.WriteAllBytes(
+                                                    outputPath
+                                                        + "."
+                                                        + kvp.Key.SubstringAfterLast('.'),
+                                                    kvp.Value
+                                                );
+                                                Interlocked.Increment(ref totalExportedFiles);
+                                            }
+                                        );
                                     }
                                 }
 
@@ -564,67 +637,94 @@ public class UnrealExporter
 
                                 break;
                             }
-                        case "locres":
+                            case "locres":
                             {
-                                if (outputType == "json" && provider.TryCreateReader(file.Value.Path, out var archive))
+                                if (
+                                    outputType == "json"
+                                    && provider.TryCreateReader(file.Value.Path, out var archive)
+                                )
                                 {
-                                    if (config.LogOutputs) Console.WriteLine("=> " + outputPath + ".json");
+                                    if (config.LogOutputs)
+                                        Console.WriteLine("=> " + outputPath + ".json");
                                     var locres = new FTextLocalizationResource(archive);
-                                    var json = JsonConvert.SerializeObject(locres, Formatting.Indented);
-                                    if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                    var json = JsonConvert.SerializeObject(
+                                        locres,
+                                        Formatting.Indented
+                                    );
+                                    if (!Directory.Exists(outputDir))
+                                        Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".json", json);
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
                             }
-                        case "js":
+                            case "js":
                             {
-                                if (outputType == fileType && provider.TrySaveAsset(file.Value.Path, out var data))
+                                if (
+                                    outputType == fileType
+                                    && provider.TrySaveAsset(file.Value.Path, out var data)
+                                )
                                 {
-                                    if (config.LogOutputs) Console.WriteLine("=> " + outputPath + "." + outputType);
+                                    if (config.LogOutputs)
+                                        Console.WriteLine("=> " + outputPath + "." + outputType);
                                     using var stream = new MemoryStream(data) { Position = 0 };
                                     using var reader = new StreamReader(stream);
                                     JSBeautifyOptions options = new() { };
                                     JSBeautify beautifier = new(reader.ReadToEnd(), options);
-                                    if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                    if (!Directory.Exists(outputDir))
+                                        Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".js", beautifier.GetResult());
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
                             }
-                        case "db":
+                            case "db":
                             {
-                                if (outputType == fileType && provider.TrySaveAsset(file.Value.Path, out var data))
+                                if (
+                                    outputType == fileType
+                                    && provider.TrySaveAsset(file.Value.Path, out var data)
+                                )
                                 {
-                                    if (config.LogOutputs) Console.WriteLine("=> " + outputPath + "." + outputType);
+                                    if (config.LogOutputs)
+                                        Console.WriteLine("=> " + outputPath + "." + outputType);
                                     using var stream = new MemoryStream(data) { Position = 0 };
                                     using var reader = new StreamReader(stream);
-                                    if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                    if (!Directory.Exists(outputDir))
+                                        Directory.CreateDirectory(outputDir);
                                     File.WriteAllBytes(outputPath + ".db", data);
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
                             }
+                        }
                     }
-                }
-                catch (AggregateException ae)
-                {
-                    Console.WriteLine(ae.Message);
-                    // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
-                }
+                    catch (AggregateException ae)
+                    {
+                        Console.WriteLine(ae.Message);
+                        // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
+                    }
 
-                Interlocked.Increment(ref totalRegexMatches);
+                    Interlocked.Increment(ref totalRegexMatches);
+                }
             }
-        });
+        );
 
         // Create checkpoint
-        if (config.CreateNewCheckpoint) CreateCheckpoint(newCheckpointDict, config);
+        if (config.CreateNewCheckpoint)
+            CreateCheckpoint(newCheckpointDict, config);
 
         // Log results
-        if (config.LogOutputs && totalExportedFiles > 0 && !config.CreateNewCheckpoint) Console.WriteLine();
-        Console.WriteLine($"Scanned {provider.Files.Count} files{(useCheckpoint ? $" ({totalChangedFiles} changed, {provider.Files.Count - totalChangedFiles} unchanged)" : "")}");
-        Console.WriteLine($"Regex matched {totalRegexMatches} files {(totalRegexMatches > totalExportedFiles ? $"(skipped {totalRegexMatches - totalExportedFiles} incompatible file types)" : "")}");
-        Console.WriteLine($"Exported {totalExportedFiles} files in {Elapsed(start, Now(), 1000)} seconds");
+        if (config.LogOutputs && totalExportedFiles > 0 && !config.CreateNewCheckpoint)
+            Console.WriteLine();
+        Console.WriteLine(
+            $"Scanned {provider.Files.Count} files{(useCheckpoint ? $" ({totalChangedFiles} changed, {provider.Files.Count - totalChangedFiles} unchanged)" : "")}"
+        );
+        Console.WriteLine(
+            $"Regex matched {totalRegexMatches} files {(totalRegexMatches > totalExportedFiles ? $"(skipped {totalRegexMatches - totalExportedFiles} incompatible file types)" : "")}"
+        );
+        Console.WriteLine(
+            $"Exported {totalExportedFiles} files in {Elapsed(start, Now(), 1000)} seconds"
+        );
         Console.WriteLine();
     }
 
@@ -636,20 +736,31 @@ public class UnrealExporter
             if (config.UseCheckpointFile.Equals("latest"))
             {
                 string[] allCheckpointPaths = Directory.GetFiles($"{RootDir}\\checkpoints");
-                var pathsForGameTitle = allCheckpointPaths.Where(path => path.Contains(config.GameTitle));
+                var pathsForGameTitle = allCheckpointPaths.Where(path =>
+                    path.Contains(config.GameTitle)
+                );
 
                 if (!pathsForGameTitle.Any())
                 {
-                    Console.WriteLine($"ERROR: could not find any checkpoints for \"{config.GameTitle}\". Ignoring...");
+                    Console.WriteLine(
+                        $"ERROR: could not find any checkpoints for \"{config.GameTitle}\". Ignoring..."
+                    );
                     return [];
                 }
 
                 var sortedPaths = pathsForGameTitle.OrderBy(path =>
                 {
-                    string dateTimeFromFileName = path.Split(Path.DirectorySeparatorChar).Last().Split(".").First().SubstringAfter(config.GameTitle)[1..];
+                    string dateTimeFromFileName = path.Split(Path.DirectorySeparatorChar)
+                        .Last()
+                        .Split(".")
+                        .First()
+                        .SubstringAfter(config.GameTitle)[1..];
                     string date = dateTimeFromFileName.Split(" ")[0];
                     string time = dateTimeFromFileName.Split(" ")[1].Replace("-", ":");
-                    double unixTime = DateTime.Parse($"{date} {time}").Subtract(new DateTime(1970, 1, 1)).TotalSeconds;
+                    double unixTime = DateTime
+                        .Parse($"{date} {time}")
+                        .Subtract(new DateTime(1970, 1, 1))
+                        .TotalSeconds;
                     return unixTime;
                 });
 
@@ -658,9 +769,13 @@ public class UnrealExporter
                 if (File.Exists(latestCheckpointPath))
                 {
                     useCheckpoint = true;
-                    Console.WriteLine($"Using checkpoint: latest ({latestCheckpointPath.Split(Path.DirectorySeparatorChar).Last()})");
+                    Console.WriteLine(
+                        $"Using checkpoint: latest ({latestCheckpointPath.Split(Path.DirectorySeparatorChar).Last()})"
+                    );
                     var fromFile = File.ReadAllText(latestCheckpointPath);
-                    var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(fromFile);
+                    var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(
+                        fromFile
+                    );
                     return loadedCheckpoint ?? [];
                 }
 
@@ -671,12 +786,16 @@ public class UnrealExporter
                 useCheckpoint = true;
                 Console.WriteLine($"Using checkpoint: {config.UseCheckpointFile}");
                 var fromFile = File.ReadAllText(checkpointPath);
-                var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(fromFile);
+                var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(
+                    fromFile
+                );
                 return loadedCheckpoint ?? [];
             }
             else
             {
-                Console.WriteLine($"ERROR: checkpoint file at location \"{config.UseCheckpointFile}\" does not exist. Ignoring...");
+                Console.WriteLine(
+                    $"ERROR: checkpoint file at location \"{config.UseCheckpointFile}\" does not exist. Ignoring..."
+                );
                 return [];
             }
         }
@@ -687,7 +806,10 @@ public class UnrealExporter
         }
     }
 
-    public static void CreateCheckpoint(ConcurrentDictionary<string, long> newCheckpointDict, ConfigObj config)
+    public static void CreateCheckpoint(
+        ConcurrentDictionary<string, long> newCheckpointDict,
+        ConfigObj config
+    )
     {
         Console.WriteLine();
         var newCheckpointJson = JsonConvert.SerializeObject(newCheckpointDict, Formatting.Indented);
@@ -698,7 +820,9 @@ public class UnrealExporter
             Directory.CreateDirectory(checkpointsDirPath);
         }
         File.WriteAllText($"./checkpoints/{config.GameTitle} {dateStamp}.ckpt", newCheckpointJson);
-        Console.WriteLine($"Created checkpoint file: ./checkpoints/{config.GameTitle} {dateStamp}.ckpt");
+        Console.WriteLine(
+            $"Created checkpoint file: ./checkpoints/{config.GameTitle} {dateStamp}.ckpt"
+        );
     }
 
     public static double Now()
