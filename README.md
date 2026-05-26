@@ -69,6 +69,8 @@ Example config files can be found in `/configs/examples`. The excluded paths in 
 | export        | `Array(string)` | A list of files to export. Supports regex. Add a colon with the desired output type at the end, such as `:json` or `:png` (see [supported file types](#supported-file-types)). |
 | exclude      | `Array(string)` | A list of files to skip exporting. Supports regex. Useful for avoiding files that crash CUE4Parse. Note: the program will try to automatically skip files that cannot be parsed by CUE4Parse, however files causing issues such as segmentation faults and heap corruption will not be skipped as they are not technically a failed parse, so they will need to be added to the excluded paths. |
 
+Fortnite configs can set `fortniteMode: true`. In that mode the exporter automatically fetches Fortnite AES keys and mappings from the FortnitePorting API, enables on-demand chunk loading, and applies the UE 5.8 cooked mesh version flags needed for valid GLB output.
+
 > [!NOTE]
 > File paths for `export` and `exclude` reside **inside the game files** (virtual file system). Use [FModel](https://github.com/4sval/FModel) to verify the paths that you wish to export. For example, Tower of Fantasy starts at `Hotta/Content/...`
 

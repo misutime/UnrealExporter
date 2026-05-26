@@ -1,6 +1,8 @@
 ﻿using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Meshes;
@@ -15,6 +17,7 @@ using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse.UE4.IO;
 using CUE4Parse.UE4.Localization;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
@@ -32,7 +35,15 @@ namespace UnrealExporter;
 public class UnrealExporter
 {
     public const int DefaultMaxDegreeOfParallelism = 12;
+    private const string FortniteGameTitle = "FortniteGame";
+    private const string FortnitePortingApiBase = "https://api.fortniteporting.app";
+    private const string FortniteApiBase = "https://api.fortniteapi.com";
     private static readonly ConcurrentDictionary<string, object> FileLocks = [];
+    private static readonly HttpClient Http = new()
+    {
+        Timeout = TimeSpan.FromSeconds(60),
+        DefaultRequestHeaders = { UserAgent = { new ProductInfoHeaderValue("UnrealExporter", "1.0") } },
+    };
     private static int totalChangedFiles = 0;
     private static int totalRegexMatches = 0;
     private static int totalExportedFiles = 0;
@@ -399,20 +410,48 @@ public class UnrealExporter
     {
         // Load CUE4Parse
         // TODO: Ignore mods (all folders within /Content/Paks)
+        bool isFortnite = IsFortniteConfig(config);
+        var extraDirectories = isFortnite ? GetFortniteExtraDirectories(config) : [];
+        var versions = new VersionContainer(selectedVersion);
+        if (isFortnite)
+        {
+            versions["SkeletalMesh.KeepMobileMinLODSettingOnDesktop"] = true;
+            versions["StaticMesh.KeepMobileMinLODSettingOnDesktop"] = true;
+        }
+
         var provider = new DefaultFileProvider(
-            config.PaksDir,
+            new DirectoryInfo(config.PaksDir),
+            extraDirectories,
             SearchOption.AllDirectories,
-            true,
-            new VersionContainer(selectedVersion)
+            versions,
+            StringComparer.OrdinalIgnoreCase
         );
+
+        if (isFortnite)
+        {
+            provider.SkipReferencedTextures = true;
+            provider.ReadNaniteData = config.ReadNaniteData ?? true;
+
+            if (config.LoadOnDemandTocs ?? true)
+            {
+                provider.OnDemandOptions = new IoStoreOnDemandOptions
+                {
+                    ChunkHostUri = new Uri(config.OnDemandHostUri ?? "https://download.epicgames.com/", UriKind.Absolute),
+                    ChunkCacheDirectory = new DirectoryInfo(
+                        config.OnDemandCacheDir ?? Path.Combine(RootDir, ".cache", "fortnite-on-demand")
+                    ),
+                    Timeout = TimeSpan.FromSeconds(config.OnDemandTimeoutSeconds > 0 ? config.OnDemandTimeoutSeconds : 120),
+                    Authorization = string.IsNullOrWhiteSpace(config.EpicAuthToken)
+                        ? null
+                        : new AuthenticationHeaderValue("Bearer", config.EpicAuthToken),
+                };
+                provider.OnDemandOptions.ChunkCacheDirectory.Create();
+            }
+        }
+
         provider.Initialize();
 
-        // Decrypt
-        string aes =
-            config.Aes.Length > 0
-                ? config.Aes
-                : "0x0000000000000000000000000000000000000000000000000000000000000000";
-        provider.SubmitKey(new FGuid(), new FAesKey(aes));
+        SubmitEncryptionKeys(provider, config, isFortnite);
 
         // Set locale if provided, otherwise English. Some games ship no matching
         // locres culture, and asset export can continue without localization.
@@ -434,14 +473,243 @@ public class UnrealExporter
         }
 
         // TEMP (need to fix patchProvider for utoc/ucas support). For now it's not guaranteed that the patch paks will be reconciled correctly.
-        string pathToMapping = $"{RootDir}\\mappings\\{config.GameTitle}.usmap";
+        string pathToMapping = ResolveMappingPath(config, isFortnite);
         if (File.Exists(pathToMapping))
         {
             Console.WriteLine($"Using mapping file: {pathToMapping}");
-            provider.MappingsContainer = new FileUsmapTypeMappingsProvider(pathToMapping);
+            provider.MappingsContainer = new FileUsmapTypeMappingsProvider(pathToMapping, StringComparer.Ordinal);
         }
 
+        PrintDebugFileMatches(provider, config);
+
         return provider;
+    }
+
+    private static void PrintDebugFileMatches(DefaultFileProvider provider, ConfigObj config)
+    {
+        if (config.DebugFileContains is not { Count: > 0 })
+            goto RegexDebug;
+
+        foreach (var needle in config.DebugFileContains.Where(item => !string.IsNullOrWhiteSpace(item)))
+        {
+            Console.WriteLine($"Debug file search: {needle}");
+            foreach (var file in provider.Files.Values
+                         .Where(file => file.Path.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                         .Take(30))
+            {
+                Console.WriteLine($"  {file.Path} [{file.GetType().Name}]");
+            }
+        }
+
+    RegexDebug:
+        if (config.DebugFileRegex is not { Count: > 0 })
+            return;
+
+        foreach (var pattern in config.DebugFileRegex.Where(item => !string.IsNullOrWhiteSpace(item)))
+        {
+            Console.WriteLine($"Debug file regex: {pattern}");
+            var regex = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+            foreach (var file in provider.Files.Values
+                         .Where(file => regex.IsMatch(file.Path))
+                         .Take(config.DebugFileLimit > 0 ? config.DebugFileLimit : 50))
+            {
+                Console.WriteLine($"  {file.Path} [{file.GetType().Name}]");
+            }
+        }
+    }
+
+    private static bool IsFortniteConfig(ConfigObj config) =>
+        config.FortniteMode
+        || config.GameTitle.Equals(FortniteGameTitle, StringComparison.OrdinalIgnoreCase);
+
+    private static DirectoryInfo[] GetFortniteExtraDirectories(ConfigObj config)
+    {
+        var paths = new List<string>();
+        if (config.LoadInstalledBundles ?? true)
+        {
+            paths.Add(
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "FortniteGame",
+                    "Saved",
+                    "PersistentDownloadDir",
+                    "GameCustom",
+                    "InstalledBundles"
+                )
+            );
+        }
+
+        if (config.ExtraDirectories is { Count: > 0 })
+            paths.AddRange(config.ExtraDirectories);
+
+        var directories = paths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Environment.ExpandEnvironmentVariables(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(path => new DirectoryInfo(path))
+            .Where(directory => directory.Exists)
+            .ToArray();
+
+        foreach (var directory in directories)
+            Console.WriteLine($"Fortnite extra directory: {directory.FullName}");
+
+        return directories;
+    }
+
+    private static void SubmitEncryptionKeys(
+        DefaultFileProvider provider,
+        ConfigObj config,
+        bool isFortnite
+    )
+    {
+        var keys = new List<KeyValuePair<FGuid, FAesKey>>();
+        string aes =
+            config.Aes.Length > 0
+                ? config.Aes
+                : "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        if (isFortnite && (config.AutoFetchFortniteKeys ?? true))
+        {
+            try
+            {
+                var response = FetchFortniteAes(config.FortniteVersion);
+                if (!string.IsNullOrWhiteSpace(response.MainKey))
+                {
+                    Console.WriteLine($"Fortnite AES version: {response.Version}");
+                    aes = response.MainKey;
+                }
+
+                foreach (var dynamicKey in response.DynamicKeys)
+                {
+                    if (string.IsNullOrWhiteSpace(dynamicKey.Guid) || string.IsNullOrWhiteSpace(dynamicKey.Key))
+                        continue;
+
+                    keys.Add(
+                        new KeyValuePair<FGuid, FAesKey>(
+                            new FGuid(dynamicKey.Guid),
+                            new FAesKey(dynamicKey.Key)
+                        )
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WARN: failed to fetch Fortnite AES keys ({ex.Message})");
+            }
+        }
+
+        keys.Insert(0, new KeyValuePair<FGuid, FAesKey>(new FGuid(), new FAesKey(aes)));
+
+        if (config.DynamicAesKeys is { Count: > 0 })
+        {
+            foreach (var dynamicKey in config.DynamicAesKeys)
+            {
+                if (string.IsNullOrWhiteSpace(dynamicKey.Guid) || string.IsNullOrWhiteSpace(dynamicKey.Key))
+                    continue;
+
+                keys.Add(
+                    new KeyValuePair<FGuid, FAesKey>(
+                        new FGuid(dynamicKey.Guid),
+                        new FAesKey(dynamicKey.Key)
+                    )
+                );
+            }
+        }
+
+        int mountedCount = provider.SubmitKeys(keys);
+        Console.WriteLine($"Mounted encrypted archives: {mountedCount}");
+
+        int plainMountedCount = provider.Mount();
+        if (plainMountedCount > 0)
+            Console.WriteLine($"Mounted plain archives: {plainMountedCount}");
+    }
+
+    private static string ResolveMappingPath(ConfigObj config, bool isFortnite)
+    {
+        if (!string.IsNullOrWhiteSpace(config.MappingsFile))
+            return Environment.ExpandEnvironmentVariables(config.MappingsFile);
+
+        string pathToMapping = Path.Combine(RootDir, "mappings", $"{config.GameTitle}.usmap");
+        if (!isFortnite || !(config.AutoFetchFortniteMappings ?? true))
+            return pathToMapping;
+
+        try
+        {
+            var response = FetchFortniteMappings(config.FortniteVersion);
+            if (string.IsNullOrWhiteSpace(response.Url))
+                return pathToMapping;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(pathToMapping)!);
+            if (!File.Exists(pathToMapping) || !MatchesHash(pathToMapping, response.HashMd5, response.Hash))
+            {
+                Console.WriteLine($"Downloading Fortnite mappings {response.Version}: {response.Url}");
+                var bytes = Http.GetByteArrayAsync(response.Url).GetAwaiter().GetResult();
+                File.WriteAllBytes(pathToMapping, bytes);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARN: failed to fetch Fortnite mappings ({ex.Message})");
+        }
+
+        return pathToMapping;
+    }
+
+    private static FortniteAesResponse FetchFortniteAes(string? version)
+    {
+        return FetchFortniteApiJson<FortniteAesResponse>("aes", version);
+    }
+
+    private static FortniteMappingsResponse FetchFortniteMappings(string? version)
+    {
+        return FetchFortniteApiJson<FortniteMappingsResponse>("mappings", version);
+    }
+
+    private static T FetchFortniteApiJson<T>(string endpoint, string? version)
+        where T : new()
+    {
+        Exception? lastError = null;
+        foreach (string apiBase in new[] { FortnitePortingApiBase, FortniteApiBase })
+        {
+            try
+            {
+                string parameterName = apiBase == FortniteApiBase ? "Version" : "version";
+                string url = $"{apiBase}/v1/{endpoint}";
+                if (!string.IsNullOrWhiteSpace(version))
+                    url += $"?{parameterName}={Uri.EscapeDataString(version)}";
+
+                var json = Http.GetStringAsync(url).GetAwaiter().GetResult();
+                return JsonConvert.DeserializeObject<T>(json) ?? new T();
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                Console.WriteLine($"WARN: failed to fetch Fortnite {endpoint} from {apiBase} ({ex.Message})");
+            }
+        }
+
+        throw lastError ?? new InvalidOperationException($"Failed to fetch Fortnite {endpoint}");
+    }
+
+    private static bool MatchesHash(string path, string? expectedMd5, string? expectedSha1)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedMd5))
+            return MatchesHash(path, expectedMd5, MD5.Create());
+
+        if (!string.IsNullOrWhiteSpace(expectedSha1))
+            return MatchesHash(path, expectedSha1, SHA1.Create());
+
+        return true;
+    }
+
+    private static bool MatchesHash(string path, string expected, HashAlgorithm algorithm)
+    {
+        using (algorithm)
+        {
+            using var stream = File.OpenRead(path);
+            var actual = Convert.ToHexString(algorithm.ComputeHash(stream)).ToLowerInvariant();
+            return actual.Equals(expected, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     public static void Export(AbstractFileProvider provider, ConfigObj config, double start)
@@ -930,7 +1198,14 @@ public class UnrealExporter
                     options.NaniteMeshFormat
                 );
                 if (!converted)
-                    return "StaticMesh TryConvert=false";
+                {
+                    string packageFlags = staticMesh.Owner is null
+                        ? "Owner=null"
+                        : $"Flags={staticMesh.Owner.Summary.PackageFlags}";
+                    int? lods = staticMesh.RenderData?.LODs?.Length;
+                    int skipped = staticMesh.RenderData?.LODs?.Count(lod => lod.SkipLod) ?? 0;
+                    return $"StaticMesh TryConvert=false, bCooked={staticMesh.bCooked}, RenderData={(staticMesh.RenderData is null ? "null" : "ok")}, Bounds={(staticMesh.RenderData?.Bounds is null ? "null" : "ok")}, LODs={(lods.HasValue ? lods.Value.ToString(CultureInfo.InvariantCulture) : "null")}, skipped={skipped}, {packageFlags}";
+                }
 
                 int lodCount = convertedMesh.LODs.Count;
                 int skippedLodCount = convertedMesh.LODs.Count(lod => lod.SkipLod);
@@ -945,7 +1220,12 @@ public class UnrealExporter
 
                 int lodCount = convertedMesh.LODs.Count;
                 int skippedLodCount = convertedMesh.LODs.Count(lod => lod.SkipLod);
-                return $"SkeletalMesh LODs={lodCount}, skipped={skippedLodCount}";
+                int sourceLodCount = skeletalMesh.LODModels?.Length ?? -1;
+                int sourceSkippedLodCount = skeletalMesh.LODModels?.Count(lod => lod.SkipLod) ?? 0;
+                string packageFlags = skeletalMesh.Owner is null
+                    ? "Owner=null"
+                    : $"Flags={skeletalMesh.Owner.Summary.PackageFlags}";
+                return $"SkeletalMesh LODs={lodCount}, skipped={skippedLodCount}, sourceLODs={sourceLodCount}, sourceSkipped={sourceSkippedLodCount}, materials={skeletalMesh.SkeletalMaterials.Length}, {packageFlags}";
             }
         }
         catch (Exception ex)
@@ -1204,8 +1484,59 @@ public class ConfigObj
     public string? Lang { get; set; }
     public int MaxDegreeOfParallelism { get; set; } =
         UnrealExporter.DefaultMaxDegreeOfParallelism;
+    public bool FortniteMode { get; set; }
+    public string? FortniteVersion { get; set; }
+    public string? MappingsFile { get; set; }
+    public bool? AutoFetchFortniteKeys { get; set; }
+    public bool? AutoFetchFortniteMappings { get; set; }
+    public bool? LoadOnDemandTocs { get; set; }
+    public bool? LoadInstalledBundles { get; set; }
+    public bool? ReadNaniteData { get; set; }
+    public string? OnDemandHostUri { get; set; }
+    public string? OnDemandCacheDir { get; set; }
+    public int OnDemandTimeoutSeconds { get; set; }
+    public string? EpicAuthToken { get; set; }
+    public List<string>? ExtraDirectories { get; set; }
+    public List<DynamicAesKeyConfig>? DynamicAesKeys { get; set; }
+    public List<string>? DebugFileContains { get; set; }
+    public List<string>? DebugFileRegex { get; set; }
+    public int DebugFileLimit { get; set; }
     public bool CreateNewCheckpoint { get; set; }
     public string? UseCheckpointFile { get; set; }
     public required List<string> Export { get; set; }
     public required List<string> Exclude { get; set; }
+}
+
+public class DynamicAesKeyConfig
+{
+    public string? Guid { get; set; }
+    public string? Key { get; set; }
+}
+
+public class FortniteAesResponse
+{
+    public string? Version { get; set; }
+    public string? MainKey { get; set; }
+    public List<FortniteDynamicKeyResponse> DynamicKeys { get; set; } = [];
+}
+
+public class FortniteDynamicKeyResponse
+{
+    public string? Name { get; set; }
+    public string? Guid { get; set; }
+    public string? Key { get; set; }
+}
+
+public class FortniteMappingsResponse
+{
+    public string? Version { get; set; }
+    public DateTime? Updated { get; set; }
+    public string? Hash { get; set; }
+    public string? FileName { get; set; }
+    public long Size { get; set; }
+
+    [JsonProperty("hash-md5")]
+    public string? HashMd5 { get; set; }
+
+    public string? Url { get; set; }
 }
