@@ -37,6 +37,7 @@ public class UnrealExporter
     public const int DefaultMaxDegreeOfParallelism = 12;
     private const string FortniteGameTitle = "FortniteGame";
     private const string FortnitePortingApiBase = "https://api.fortniteporting.app";
+    private const string FortniteApiBase = "https://api.fortniteapi.com";
     private static readonly ConcurrentDictionary<string, object> FileLocks = [];
     private static readonly HttpClient Http = new()
     {
@@ -639,7 +640,7 @@ public class UnrealExporter
                 return pathToMapping;
 
             Directory.CreateDirectory(Path.GetDirectoryName(pathToMapping)!);
-            if (!File.Exists(pathToMapping) || !MatchesMd5(pathToMapping, response.HashMd5))
+            if (!File.Exists(pathToMapping) || !MatchesHash(pathToMapping, response.HashMd5, response.Hash))
             {
                 Console.WriteLine($"Downloading Fortnite mappings {response.Version}: {response.Url}");
                 var bytes = Http.GetByteArrayAsync(response.Url).GetAwaiter().GetResult();
@@ -656,33 +657,59 @@ public class UnrealExporter
 
     private static FortniteAesResponse FetchFortniteAes(string? version)
     {
-        string url = $"{FortnitePortingApiBase}/v1/aes";
-        if (!string.IsNullOrWhiteSpace(version))
-            url += $"?version={Uri.EscapeDataString(version)}";
-
-        var json = Http.GetStringAsync(url).GetAwaiter().GetResult();
-        return JsonConvert.DeserializeObject<FortniteAesResponse>(json) ?? new FortniteAesResponse();
+        return FetchFortniteApiJson<FortniteAesResponse>("aes", version);
     }
 
     private static FortniteMappingsResponse FetchFortniteMappings(string? version)
     {
-        string url = $"{FortnitePortingApiBase}/v1/mappings";
-        if (!string.IsNullOrWhiteSpace(version))
-            url += $"?version={Uri.EscapeDataString(version)}";
-
-        var json = Http.GetStringAsync(url).GetAwaiter().GetResult();
-        return JsonConvert.DeserializeObject<FortniteMappingsResponse>(json) ?? new FortniteMappingsResponse();
+        return FetchFortniteApiJson<FortniteMappingsResponse>("mappings", version);
     }
 
-    private static bool MatchesMd5(string path, string? expected)
+    private static T FetchFortniteApiJson<T>(string endpoint, string? version)
+        where T : new()
     {
-        if (string.IsNullOrWhiteSpace(expected))
-            return true;
+        Exception? lastError = null;
+        foreach (string apiBase in new[] { FortnitePortingApiBase, FortniteApiBase })
+        {
+            try
+            {
+                string parameterName = apiBase == FortniteApiBase ? "Version" : "version";
+                string url = $"{apiBase}/v1/{endpoint}";
+                if (!string.IsNullOrWhiteSpace(version))
+                    url += $"?{parameterName}={Uri.EscapeDataString(version)}";
 
-        using var md5 = MD5.Create();
-        using var stream = File.OpenRead(path);
-        var actual = Convert.ToHexString(md5.ComputeHash(stream)).ToLowerInvariant();
-        return actual.Equals(expected, StringComparison.OrdinalIgnoreCase);
+                var json = Http.GetStringAsync(url).GetAwaiter().GetResult();
+                return JsonConvert.DeserializeObject<T>(json) ?? new T();
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                Console.WriteLine($"WARN: failed to fetch Fortnite {endpoint} from {apiBase} ({ex.Message})");
+            }
+        }
+
+        throw lastError ?? new InvalidOperationException($"Failed to fetch Fortnite {endpoint}");
+    }
+
+    private static bool MatchesHash(string path, string? expectedMd5, string? expectedSha1)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedMd5))
+            return MatchesHash(path, expectedMd5, MD5.Create());
+
+        if (!string.IsNullOrWhiteSpace(expectedSha1))
+            return MatchesHash(path, expectedSha1, SHA1.Create());
+
+        return true;
+    }
+
+    private static bool MatchesHash(string path, string expected, HashAlgorithm algorithm)
+    {
+        using (algorithm)
+        {
+            using var stream = File.OpenRead(path);
+            var actual = Convert.ToHexString(algorithm.ComputeHash(stream)).ToLowerInvariant();
+            return actual.Equals(expected, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     public static void Export(AbstractFileProvider provider, ConfigObj config, double start)
@@ -1504,6 +1531,9 @@ public class FortniteMappingsResponse
 {
     public string? Version { get; set; }
     public DateTime? Updated { get; set; }
+    public string? Hash { get; set; }
+    public string? FileName { get; set; }
+    public long Size { get; set; }
 
     [JsonProperty("hash-md5")]
     public string? HashMd5 { get; set; }
