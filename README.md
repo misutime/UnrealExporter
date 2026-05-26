@@ -97,7 +97,7 @@ Create multiple JSONs in the `configs` folder, naming them something easy for yo
 2. 可识别性优先：导出的 GLB 必须方便在 F3D、Blender 等工具里快速预览。预览阶段不追求 100% 还原 Unreal 复杂材质；如果顶点色、alpha、材质槽导致有效模型看起来全黑、透明或空白，导出器应优先修成可见。
 3. 配置优先收窄：新游戏先写 `*-models` / `*-smoke` 这类聚焦配置，确认模型和贴图质量后再扩大范围。避免直接用 `Content/.*\\.uasset` 全量扫描，除非只是做一次诊断。
 
-团队操作流程见 [UE 游戏素材提取流程](docs/UE游戏素材提取流程.md)。
+团队操作流程见 [UE 游戏素材提取流程](docs/UE游戏素材提取流程.md)。常用项目命令见 [常用导出命令](docs/常用导出命令.md)。
 
 ### Neverness To Everness asset export
 

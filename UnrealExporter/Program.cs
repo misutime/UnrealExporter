@@ -31,6 +31,7 @@ namespace UnrealExporter;
 
 public class UnrealExporter
 {
+    public const int DefaultMaxDegreeOfParallelism = 12;
     private static readonly ConcurrentDictionary<string, object> FileLocks = [];
     private static int totalChangedFiles = 0;
     private static int totalRegexMatches = 0;
@@ -452,7 +453,9 @@ public class UnrealExporter
 
         Console.WriteLine($"Scanning {provider.Files.Count} files...{Environment.NewLine}");
         int maxDegreeOfParallelism =
-            config.MaxDegreeOfParallelism > 0 ? config.MaxDegreeOfParallelism : 4;
+            config.MaxDegreeOfParallelism > 0
+                ? config.MaxDegreeOfParallelism
+                : DefaultMaxDegreeOfParallelism;
         Console.WriteLine($"Max parallel exports: {maxDegreeOfParallelism}");
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
@@ -1160,7 +1163,8 @@ public class ConfigObj
     public required bool LogOutputs { get; set; }
     public required bool KeepDirectoryStructure { get; set; }
     public string? Lang { get; set; }
-    public int MaxDegreeOfParallelism { get; set; } = 12;
+    public int MaxDegreeOfParallelism { get; set; } =
+        UnrealExporter.DefaultMaxDegreeOfParallelism;
     public bool CreateNewCheckpoint { get; set; }
     public string? UseCheckpointFile { get; set; }
     public required List<string> Export { get; set; }

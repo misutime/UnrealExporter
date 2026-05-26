@@ -129,7 +129,7 @@ configs/game-smoke.json
     "logOutputs": true,
     "keepDirectoryStructure": true,
     "lang": "English",
-    "maxDegreeOfParallelism": 4,
+    "maxDegreeOfParallelism": 12,
     "createNewCheckpoint": false,
     "useCheckpointFile": "",
     "export": [],
@@ -351,7 +351,7 @@ Proxy
 - 不要全量扫 Content。
 - 分目录拆多个配置运行。
 
-可以用 `maxDegreeOfParallelism` 调整并发。默认值是 `4`。64GB 内存机器可以先试 `8`，如果内存、CPU、磁盘读写都稳定，再逐步试 `12` 或 `16`。如果内存快速上涨、系统开始明显卡顿，或导出速度没有继续提升，就降回上一个稳定值。
+可以用 `maxDegreeOfParallelism` 调整并发。默认值是 `12`。64GB 内存机器上如果 CPU 已接近满载，就不建议继续提高；如果 CPU、磁盘和内存仍有明显余量，再逐步试 `16` 或更高。
 
 ### GLB 贴图看起来不完整
 
