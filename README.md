@@ -18,7 +18,7 @@ This project can be used as-is or as a reference, since CUE4Parse documentation 
 
 ### [Supported file types](#supported-file-types)
 When listing an export file path, specify the desired output type at the end, such as `:json`.
-- [x] uasset (as json, png, uasset + uexp)
+- [x] uasset (as json, png, glb/gltf, uasset + uexp)
 - [x] umap (as json)
 - [x] locres (as json)
 - [x] js (as js)
@@ -88,6 +88,44 @@ Create multiple JSONs in the `configs` folder, naming them something easy for yo
 | `dotnet run --project UnrealExporter --list bp tof`     | Lists all configs, with `bp.json` and `tof.json` checked by default |
 
 <!-- `--project UnrealExporter` can be omitted if cd into the project -->
+
+### Neverness To Everness asset export
+
+本仓库当前已经放了几份本地 NTE 配置，运行命令时使用配置文件名，不需要带 `.json` 后缀。
+
+| Command | Output | Purpose |
+|---------|--------|---------|
+| `dotnet run --project UnrealExporter nte-models-smoke` | `output/nte-models-smoke` | 单个模型冒烟测试，确认 AES、mapping、GLB 导出链路可用。 |
+| `dotnet run --project UnrealExporter nte-models` | `output/nte-models` | 只导出常见模型目录的 GLB 和独立材质/贴图文件，适合先看效果。 |
+| `dotnet run --project UnrealExporter nte-all-assets` | `output/nte-all-assets` | 扫描 `HT/Content` 下所有 `.uasset`，导出模型 GLB 和贴图 PNG。 |
+
+Full export command:
+
+```powershell
+cd D:\misutime\UnrealExporter
+dotnet run --project UnrealExporter nte-all-assets
+```
+
+`nte-all-assets.json` uses:
+
+```json
+"export": [
+  "HT/Content/.*\\.uasset:glb",
+  "HT/Content/.*\\.uasset:png"
+]
+```
+
+The GLB exporter embeds common material textures into the GLB so viewers and DCC tools can display the model immediately. It also keeps the Unreal material path and texture slot paths in `material.extras.textureSlots`, and still writes sidecar material JSON / texture files when material export is enabled.
+
+For a Unity-oriented pipeline, prefer:
+
+```text
+UnrealExporter -> GLB models with embedded preview textures + sidecar PNG/material JSON
+Blender/Assimp -> optional GLB to FBX batch conversion
+Unity Editor script -> rebuild Unity materials from material JSON / textureSlots
+```
+
+FBX is not written directly by this exporter at the moment. If FBX is required, export GLB first and convert it in Blender or Assimp.
 
 #### [Config List](#config-list)
 If you pass the config list flag `--list`, the program will prompt you to select the configs you wish to use, listing the `gameTitle` for each object in the config. **This is enabled by default in the binary executable** unless an argument is passed.

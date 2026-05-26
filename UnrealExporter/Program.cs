@@ -2,12 +2,18 @@
 using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Meshes;
 using CUE4Parse_Conversion.Textures;
 using CUE4Parse_Conversion.Textures.BC;
 using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider;
+using CUE4Parse_Conversion.UEFormat.Enums;
+using CUE4Parse.UE4.Assets.Exports.Material;
+using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
+using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Localization;
 using CUE4Parse.UE4.Objects.Core.Misc;
@@ -24,6 +30,7 @@ namespace UnrealExporter;
 
 public class UnrealExporter
 {
+    private static readonly ConcurrentDictionary<string, object> FileLocks = [];
     private static int totalChangedFiles = 0;
     private static int totalRegexMatches = 0;
     private static int totalExportedFiles = 0;
@@ -537,21 +544,38 @@ public class UnrealExporter
                                                     Directory.CreateDirectory(outputDir);
 
                                                 // Save the bitmap to a file
-                                                using SKBitmap bitmap = decodedTexture.ToSkBitmap();
-                                                using (SKImage image = SKImage.FromBitmap(bitmap))
-                                                using (
-                                                    SKData data = image.Encode(
-                                                        SKEncodedImageFormat.Png,
-                                                        100
-                                                    )
-                                                )
-                                                using (
-                                                    Stream stream = File.OpenWrite(
-                                                        outputPath + ".png"
-                                                    )
-                                                )
+                                                try
                                                 {
-                                                    data.SaveTo(stream);
+                                                    using SKBitmap bitmap = decodedTexture.ToSkBitmap();
+                                                    using (SKImage image = SKImage.FromBitmap(bitmap))
+                                                    {
+                                                        using SKData data = image.Encode(
+                                                            SKEncodedImageFormat.Png,
+                                                            100
+                                                        );
+                                                        var pngPath = outputPath + ".png";
+                                                        var fileLock = FileLocks.GetOrAdd(
+                                                            pngPath,
+                                                            _ => new object()
+                                                        );
+                                                        lock (fileLock)
+                                                        {
+                                                            using Stream stream = File.Open(
+                                                                pngPath,
+                                                                FileMode.Create,
+                                                                FileAccess.Write,
+                                                                FileShare.Read
+                                                            );
+                                                            data.SaveTo(stream);
+                                                        }
+                                                    }
+                                                }
+                                                catch (IOException ex)
+                                                {
+                                                    Console.WriteLine(
+                                                        $"WARN: Skipped locked texture {outputPath}.png ({ex.Message})"
+                                                    );
+                                                    break;
                                                 }
                                                 Interlocked.Increment(ref totalExportedFiles);
 
@@ -615,6 +639,58 @@ public class UnrealExporter
                                                 Interlocked.Increment(ref totalExportedFiles);
                                             }
                                         );
+                                    }
+                                }
+                                else if (outputType is "glb" or "gltf")
+                                {
+                                    foreach (var obj in allObjects)
+                                    {
+                                        if (obj is not UStaticMesh && obj is not USkeletalMesh)
+                                            continue;
+
+                                        var options = new ExporterOptions
+                                        {
+                                            LodFormat = ELodFormat.FirstLod,
+                                            MeshFormat = EMeshFormat.Gltf2,
+                                            MaterialFormat = EMaterialFormat.AllLayersNoRef,
+                                            TextureFormat = ETextureFormat.Png,
+                                            CompressionFormat = EFileCompressionFormat.None,
+                                            Platform = ETexturePlatform.DesktopMobile,
+                                            SocketFormat = ESocketFormat.Bone,
+                                            ExportMorphTargets = true,
+                                            ExportMaterials = true,
+                                            ExportHdrTexturesAsHdr = true
+                                        };
+
+                                        try
+                                        {
+                                            var exporter = new Exporter(obj, options);
+                                            if (
+                                                exporter.TryWriteToDir(
+                                                    new DirectoryInfo(
+                                                        Path.GetFullPath(config.OutputDir)
+                                                    ),
+                                                    out var label,
+                                                    out var savedFilePath
+                                                )
+                                            )
+                                            {
+                                                if (config.LogOutputs)
+                                                    Console.WriteLine($"=> {savedFilePath}");
+                                                Interlocked.Increment(ref totalExportedFiles);
+                                                break;
+                                            }
+
+                                            Console.WriteLine(
+                                                $"ERROR: Failed to export {file.Value.Path} as GLB."
+                                            );
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine(
+                                                $"WARN: Skipped mesh {file.Value.Path} ({ex.Message})"
+                                            );
+                                        }
                                     }
                                 }
 
@@ -702,6 +778,12 @@ public class UnrealExporter
                     {
                         Console.WriteLine(ae.Message);
                         // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
+                        );
                     }
 
                     Interlocked.Increment(ref totalRegexMatches);
