@@ -21,6 +21,7 @@ using CUE4Parse.UE4.Versions;
 using CUE4Parse.Utils;
 using JSBeautifyLib;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SkiaSharp;
 
 namespace UnrealExporter;
@@ -101,7 +102,8 @@ public class UnrealExporter
 
     public static void InitOodle()
     {
-        OodleHelper.Initialize();
+        var oodlePath = Path.Combine(RootDir, OodleHelper.OODLE_NAME_OLD);
+        OodleHelper.Initialize(File.Exists(oodlePath) ? oodlePath : null);
     }
 
     public static void InitZlib()
@@ -453,6 +455,7 @@ public class UnrealExporter
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
             provider.Files,
+            new ParallelOptions { MaxDegreeOfParallelism = 4 },
             file =>
             {
                 // "Hotta/Content/Resources/UI/Activity/Activity/DT_Activityquest_Balance.uasset"
@@ -675,6 +678,7 @@ public class UnrealExporter
                                                 )
                                             )
                                             {
+                                                SanitizeGlbVertexColors(savedFilePath);
                                                 if (config.LogOutputs)
                                                     Console.WriteLine($"=> {savedFilePath}");
                                                 Interlocked.Increment(ref totalExportedFiles);
@@ -808,6 +812,120 @@ public class UnrealExporter
             $"Exported {totalExportedFiles} files in {Elapsed(start, Now(), 1000)} seconds"
         );
         Console.WriteLine();
+    }
+
+    public static void SanitizeGlbVertexColors(string savedFilePath)
+    {
+        if (!savedFilePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        try
+        {
+            byte[] data = File.ReadAllBytes(savedFilePath);
+            if (data.Length < 28 || System.Text.Encoding.ASCII.GetString(data, 0, 4) != "glTF")
+                return;
+
+            int jsonLength = BitConverter.ToInt32(data, 12);
+            if (jsonLength <= 0 || data.Length < 20 + jsonLength + 8)
+                return;
+
+            string jsonText = System.Text.Encoding.UTF8
+                .GetString(data, 20, jsonLength)
+                .TrimEnd('\0', ' ', '\r', '\n', '\t');
+            JObject gltf = JObject.Parse(jsonText);
+            JArray? meshes = gltf["meshes"] as JArray;
+            JArray? accessors = gltf["accessors"] as JArray;
+            JArray? bufferViews = gltf["bufferViews"] as JArray;
+            if (meshes is null || accessors is null || bufferViews is null)
+                return;
+
+            int binHeaderOffset = 20 + jsonLength;
+            int binStart = binHeaderOffset + 8;
+            bool changed = false;
+
+            foreach (
+                JObject primitive in meshes.SelectMany(mesh =>
+                    mesh["primitives"]?.Children<JObject>() ?? []
+                )
+            )
+            {
+                int? colorAccessorIndex = primitive["attributes"]?["COLOR_0"]?.Value<int>();
+                if (
+                    colorAccessorIndex is null
+                    || colorAccessorIndex < 0
+                    || colorAccessorIndex >= accessors.Count
+                )
+                    continue;
+
+                JObject accessor = (JObject)accessors[colorAccessorIndex.Value];
+                if (
+                    accessor["componentType"]?.Value<int>() != 5121
+                    || accessor["type"]?.Value<string>() != "VEC4"
+                )
+                    continue;
+
+                int? bufferViewIndex = accessor["bufferView"]?.Value<int>();
+                if (
+                    bufferViewIndex is null
+                    || bufferViewIndex < 0
+                    || bufferViewIndex >= bufferViews.Count
+                )
+                    continue;
+
+                JObject bufferView = (JObject)bufferViews[bufferViewIndex.Value];
+                int count = accessor["count"]?.Value<int>() ?? 0;
+                int accessorOffset = accessor["byteOffset"]?.Value<int>() ?? 0;
+                int bufferViewOffset = bufferView["byteOffset"]?.Value<int>() ?? 0;
+                int stride = bufferView["byteStride"]?.Value<int>() ?? 4;
+                int start = binStart + bufferViewOffset + accessorOffset;
+
+                byte maxColorChannel = 0;
+                byte maxAlphaChannel = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int offset = start + i * stride;
+                    if (offset + 3 >= data.Length)
+                        break;
+
+                    maxColorChannel = Math.Max(
+                        maxColorChannel,
+                        Math.Max(data[offset], Math.Max(data[offset + 1], data[offset + 2]))
+                    );
+                    maxAlphaChannel = Math.Max(maxAlphaChannel, data[offset + 3]);
+                }
+
+                bool nearlyInvisible = maxColorChannel <= 1;
+                for (int i = 0; i < count; i++)
+                {
+                    int offset = start + i * stride;
+                    if (offset + 3 >= data.Length)
+                        break;
+
+                    if (nearlyInvisible)
+                    {
+                        data[offset] = 255;
+                        data[offset + 1] = 255;
+                        data[offset + 2] = 255;
+                        data[offset + 3] = 255;
+                        changed = true;
+                    }
+                    else if (data[offset + 3] == 0)
+                    {
+                        data[offset + 3] = 255;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed)
+                File.WriteAllBytes(savedFilePath, data);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(
+                $"WARN: Failed to sanitize GLB vertex colors for {savedFilePath} ({ex.Message})"
+            );
+        }
     }
 
     public static Dictionary<string, long> LoadCheckpoint(ConfigObj config)

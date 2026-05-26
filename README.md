@@ -89,6 +89,16 @@ Create multiple JSONs in the `configs` folder, naming them something easy for yo
 
 <!-- `--project UnrealExporter` can be omitted if cd into the project -->
 
+### Export policy for local game assets
+
+本地批量提取资源时，默认优先级是：
+
+1. 资源精简优先：只提取有用的模型和贴图，尽量排除 `PlaceHolder`、`Blockout`、`FunctionalTests`、碰撞体、代理模型、地图、蓝图、数据表、影片等噪音。宁愿少导一点，也不要把大量无用资源混进结果里。
+2. 可识别性优先：导出的 GLB 必须方便在 F3D、Blender 等工具里快速预览。预览阶段不追求 100% 还原 Unreal 复杂材质；如果顶点色、alpha、材质槽导致有效模型看起来全黑、透明或空白，导出器应优先修成可见。
+3. 配置优先收窄：新游戏先写 `*-models` / `*-smoke` 这类聚焦配置，确认模型和贴图质量后再扩大范围。避免直接用 `Content/.*\\.uasset` 全量扫描，除非只是做一次诊断。
+
+团队操作流程见 [UE 游戏素材提取流程](docs/UE游戏素材提取流程.md)。
+
 ### Neverness To Everness asset export
 
 本仓库当前已经放了几份本地 NTE 配置，运行命令时使用配置文件名，不需要带 `.json` 后缀。
