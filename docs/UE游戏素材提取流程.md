@@ -129,6 +129,7 @@ configs/game-smoke.json
     "logOutputs": true,
     "keepDirectoryStructure": true,
     "lang": "English",
+    "maxDegreeOfParallelism": 4,
     "createNewCheckpoint": false,
     "useCheckpointFile": "",
     "export": [],
@@ -236,6 +237,18 @@ cd D:\misutime\UnrealExporter
 dotnet run --project UnrealExporter game-models
 ```
 
+当前仓库内已纳入 git 管理的示例配置放在 `configs/examples`。实际运行前先复制到 `configs`，再使用不带 `.json` 后缀的配置名运行：
+
+```powershell
+Copy-Item configs\examples\nte-useful-assets.json configs\nte-useful-assets.json
+Copy-Item configs\examples\batman-models.json configs\batman-models.json
+```
+
+```powershell
+dotnet run --project UnrealExporter nte-useful-assets
+dotnet run --project UnrealExporter batman-models
+```
+
 输出通常在：
 
 ```text
@@ -337,6 +350,8 @@ Proxy
 - 再跑 models。
 - 不要全量扫 Content。
 - 分目录拆多个配置运行。
+
+可以用 `maxDegreeOfParallelism` 调整并发。默认值是 `4`。64GB 内存机器可以先试 `8`，如果内存、CPU、磁盘读写都稳定，再逐步试 `12` 或 `16`。如果内存快速上涨、系统开始明显卡顿，或导出速度没有继续提升，就降回上一个稳定值。
 
 ### GLB 贴图看起来不完整
 

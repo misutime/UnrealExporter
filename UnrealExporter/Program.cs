@@ -6,11 +6,11 @@ using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Meshes;
 using CUE4Parse_Conversion.Textures;
 using CUE4Parse_Conversion.Textures.BC;
+using CUE4Parse_Conversion.UEFormat.Enums;
 using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider;
-using CUE4Parse_Conversion.UEFormat.Enums;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
@@ -451,11 +451,14 @@ public class UnrealExporter
         ConcurrentDictionary<string, long> newCheckpointDict = [];
 
         Console.WriteLine($"Scanning {provider.Files.Count} files...{Environment.NewLine}");
+        int maxDegreeOfParallelism =
+            config.MaxDegreeOfParallelism > 0 ? config.MaxDegreeOfParallelism : 4;
+        Console.WriteLine($"Max parallel exports: {maxDegreeOfParallelism}");
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
             provider.Files,
-            new ParallelOptions { MaxDegreeOfParallelism = 4 },
+            new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
             file =>
             {
                 // "Hotta/Content/Resources/UI/Activity/Activity/DT_Activityquest_Balance.uasset"
@@ -549,8 +552,11 @@ public class UnrealExporter
                                                 // Save the bitmap to a file
                                                 try
                                                 {
-                                                    using SKBitmap bitmap = decodedTexture.ToSkBitmap();
-                                                    using (SKImage image = SKImage.FromBitmap(bitmap))
+                                                    using SKBitmap bitmap =
+                                                        decodedTexture.ToSkBitmap();
+                                                    using (
+                                                        SKImage image = SKImage.FromBitmap(bitmap)
+                                                    )
                                                     {
                                                         using SKData data = image.Encode(
                                                             SKEncodedImageFormat.Png,
@@ -662,7 +668,7 @@ public class UnrealExporter
                                             SocketFormat = ESocketFormat.Bone,
                                             ExportMorphTargets = true,
                                             ExportMaterials = true,
-                                            ExportHdrTexturesAsHdr = true
+                                            ExportHdrTexturesAsHdr = true,
                                         };
 
                                         try
@@ -678,7 +684,7 @@ public class UnrealExporter
                                                 )
                                             )
                                             {
-                                                SanitizeGlbVertexColors(savedFilePath);
+                                                SanitizeGlbForPreview(savedFilePath);
                                                 if (config.LogOutputs)
                                                     Console.WriteLine($"=> {savedFilePath}");
                                                 Interlocked.Increment(ref totalExportedFiles);
@@ -814,7 +820,7 @@ public class UnrealExporter
         Console.WriteLine();
     }
 
-    public static void SanitizeGlbVertexColors(string savedFilePath)
+    public static void SanitizeGlbForPreview(string savedFilePath)
     {
         if (!savedFilePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
             return;
@@ -829,103 +835,209 @@ public class UnrealExporter
             if (jsonLength <= 0 || data.Length < 20 + jsonLength + 8)
                 return;
 
-            string jsonText = System.Text.Encoding.UTF8
-                .GetString(data, 20, jsonLength)
+            string jsonText = System
+                .Text.Encoding.UTF8.GetString(data, 20, jsonLength)
                 .TrimEnd('\0', ' ', '\r', '\n', '\t');
             JObject gltf = JObject.Parse(jsonText);
             JArray? meshes = gltf["meshes"] as JArray;
             JArray? accessors = gltf["accessors"] as JArray;
             JArray? bufferViews = gltf["bufferViews"] as JArray;
-            if (meshes is null || accessors is null || bufferViews is null)
-                return;
 
             int binHeaderOffset = 20 + jsonLength;
+            int binLength = BitConverter.ToInt32(data, binHeaderOffset);
             int binStart = binHeaderOffset + 8;
+            if (binLength < 0 || binStart + binLength > data.Length)
+                return;
+
+            byte[] binData = new byte[binLength];
+            Buffer.BlockCopy(data, binStart, binData, 0, binLength);
             bool changed = false;
 
-            foreach (
-                JObject primitive in meshes.SelectMany(mesh =>
-                    mesh["primitives"]?.Children<JObject>() ?? []
-                )
-            )
+            if (gltf["materials"] is JArray materials)
             {
-                int? colorAccessorIndex = primitive["attributes"]?["COLOR_0"]?.Value<int>();
-                if (
-                    colorAccessorIndex is null
-                    || colorAccessorIndex < 0
-                    || colorAccessorIndex >= accessors.Count
-                )
-                    continue;
-
-                JObject accessor = (JObject)accessors[colorAccessorIndex.Value];
-                if (
-                    accessor["componentType"]?.Value<int>() != 5121
-                    || accessor["type"]?.Value<string>() != "VEC4"
-                )
-                    continue;
-
-                int? bufferViewIndex = accessor["bufferView"]?.Value<int>();
-                if (
-                    bufferViewIndex is null
-                    || bufferViewIndex < 0
-                    || bufferViewIndex >= bufferViews.Count
-                )
-                    continue;
-
-                JObject bufferView = (JObject)bufferViews[bufferViewIndex.Value];
-                int count = accessor["count"]?.Value<int>() ?? 0;
-                int accessorOffset = accessor["byteOffset"]?.Value<int>() ?? 0;
-                int bufferViewOffset = bufferView["byteOffset"]?.Value<int>() ?? 0;
-                int stride = bufferView["byteStride"]?.Value<int>() ?? 4;
-                int start = binStart + bufferViewOffset + accessorOffset;
-
-                byte maxColorChannel = 0;
-                byte maxAlphaChannel = 0;
-                for (int i = 0; i < count; i++)
+                foreach (JObject material in materials.Children<JObject>())
                 {
-                    int offset = start + i * stride;
-                    if (offset + 3 >= data.Length)
-                        break;
-
-                    maxColorChannel = Math.Max(
-                        maxColorChannel,
-                        Math.Max(data[offset], Math.Max(data[offset + 1], data[offset + 2]))
-                    );
-                    maxAlphaChannel = Math.Max(maxAlphaChannel, data[offset + 3]);
-                }
-
-                bool nearlyInvisible = maxColorChannel <= 1;
-                for (int i = 0; i < count; i++)
-                {
-                    int offset = start + i * stride;
-                    if (offset + 3 >= data.Length)
-                        break;
-
-                    if (nearlyInvisible)
+                    string? alphaMode = material["alphaMode"]?.Value<string>();
+                    string? blendMode = material["extras"]?["blendMode"]?.Value<string>();
+                    string? shadingModel = material["extras"]?["shadingModel"]?.Value<string>();
+                    if (
+                        alphaMode?.Equals("MASK", StringComparison.OrdinalIgnoreCase) == true
+                        || alphaMode?.Equals("BLEND", StringComparison.OrdinalIgnoreCase) == true
+                    )
                     {
-                        data[offset] = 255;
-                        data[offset + 1] = 255;
-                        data[offset + 2] = 255;
-                        data[offset + 3] = 255;
+                        material.Remove("alphaMode");
+                        material.Remove("alphaCutoff");
                         changed = true;
                     }
-                    else if (data[offset + 3] == 0)
+
+                    if (
+                        blendMode?.Equals("BLEND_Masked", StringComparison.OrdinalIgnoreCase)
+                            == true
+                        || shadingModel?.Equals("MSM_ClearCoat", StringComparison.OrdinalIgnoreCase)
+                            == true
+                    )
                     {
-                        data[offset + 3] = 255;
+                        AddUnlitPreviewExtension(gltf, material);
+                        changed = true;
+                    }
+
+                    if (
+                        material["pbrMetallicRoughness"]?["baseColorFactor"]
+                            is JArray baseColorFactor
+                        && baseColorFactor.Count >= 4
+                        && baseColorFactor[3]?.Value<double>() < 1.0
+                    )
+                    {
+                        baseColorFactor[3] = 1.0;
                         changed = true;
                     }
                 }
             }
 
+            if (meshes is not null && accessors is not null && bufferViews is not null)
+                changed |= SanitizeGlbVertexColorData(
+                    gltf,
+                    binData,
+                    meshes,
+                    accessors,
+                    bufferViews
+                );
+
             if (changed)
-                File.WriteAllBytes(savedFilePath, data);
+                WriteGlb(savedFilePath, gltf, binData);
         }
         catch (Exception ex)
         {
             Console.WriteLine(
-                $"WARN: Failed to sanitize GLB vertex colors for {savedFilePath} ({ex.Message})"
+                $"WARN: Failed to sanitize GLB for preview for {savedFilePath} ({ex.Message})"
             );
         }
+    }
+
+    private static bool SanitizeGlbVertexColorData(
+        JObject gltf,
+        byte[] binData,
+        JArray meshes,
+        JArray accessors,
+        JArray bufferViews
+    )
+    {
+        bool changed = false;
+
+        foreach (
+            JObject primitive in meshes.SelectMany(mesh =>
+                mesh["primitives"]?.Children<JObject>() ?? []
+            )
+        )
+        {
+            int? colorAccessorIndex = primitive["attributes"]?["COLOR_0"]?.Value<int>();
+            if (
+                colorAccessorIndex is null
+                || colorAccessorIndex < 0
+                || colorAccessorIndex >= accessors.Count
+            )
+                continue;
+
+            JObject accessor = (JObject)accessors[colorAccessorIndex.Value];
+            if (
+                accessor["componentType"]?.Value<int>() != 5121
+                || accessor["type"]?.Value<string>() != "VEC4"
+            )
+                continue;
+
+            int? bufferViewIndex = accessor["bufferView"]?.Value<int>();
+            if (
+                bufferViewIndex is null
+                || bufferViewIndex < 0
+                || bufferViewIndex >= bufferViews.Count
+            )
+                continue;
+
+            JObject bufferView = (JObject)bufferViews[bufferViewIndex.Value];
+            int count = accessor["count"]?.Value<int>() ?? 0;
+            int accessorOffset = accessor["byteOffset"]?.Value<int>() ?? 0;
+            int bufferViewOffset = bufferView["byteOffset"]?.Value<int>() ?? 0;
+            int stride = bufferView["byteStride"]?.Value<int>() ?? 4;
+            int start = bufferViewOffset + accessorOffset;
+
+            byte maxColorChannel = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int offset = start + i * stride;
+                if (offset + 3 >= binData.Length)
+                    break;
+
+                maxColorChannel = Math.Max(
+                    maxColorChannel,
+                    Math.Max(binData[offset], Math.Max(binData[offset + 1], binData[offset + 2]))
+                );
+            }
+
+            bool nearlyInvisible = maxColorChannel <= 1;
+            for (int i = 0; i < count; i++)
+            {
+                int offset = start + i * stride;
+                if (offset + 3 >= binData.Length)
+                    break;
+
+                if (nearlyInvisible)
+                {
+                    binData[offset] = 255;
+                    binData[offset + 1] = 255;
+                    binData[offset + 2] = 255;
+                    binData[offset + 3] = 255;
+                    changed = true;
+                }
+                else if (binData[offset + 3] == 0)
+                {
+                    binData[offset + 3] = 255;
+                    changed = true;
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    private static void AddUnlitPreviewExtension(JObject gltf, JObject material)
+    {
+        JArray extensionsUsed = gltf["extensionsUsed"] as JArray ?? new JArray();
+        if (gltf["extensionsUsed"] is null)
+            gltf["extensionsUsed"] = extensionsUsed;
+
+        if (!extensionsUsed.Any(extension => extension.Value<string>() == "KHR_materials_unlit"))
+            extensionsUsed.Add("KHR_materials_unlit");
+
+        JObject extensions = material["extensions"] as JObject ?? new JObject();
+        if (material["extensions"] is null)
+            material["extensions"] = extensions;
+
+        extensions["KHR_materials_unlit"] = new JObject();
+    }
+
+    private static void WriteGlb(string savedFilePath, JObject gltf, byte[] binData)
+    {
+        byte[] jsonData = System.Text.Encoding.UTF8.GetBytes(gltf.ToString(Formatting.None));
+        int paddedJsonLength = (jsonData.Length + 3) & ~3;
+        Array.Resize(ref jsonData, paddedJsonLength);
+        for (int i = jsonData.Length - 1; i >= 0 && jsonData[i] == 0; i--)
+            jsonData[i] = 0x20;
+
+        int paddedBinLength = (binData.Length + 3) & ~3;
+        Array.Resize(ref binData, paddedBinLength);
+
+        using MemoryStream stream = new();
+        using BinaryWriter writer = new(stream);
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("glTF"));
+        writer.Write(2);
+        writer.Write(12 + 8 + jsonData.Length + 8 + binData.Length);
+        writer.Write(jsonData.Length);
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("JSON"));
+        writer.Write(jsonData);
+        writer.Write(binData.Length);
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("BIN\0"));
+        writer.Write(binData);
+        File.WriteAllBytes(savedFilePath, stream.ToArray());
     }
 
     public static Dictionary<string, long> LoadCheckpoint(ConfigObj config)
@@ -1048,6 +1160,7 @@ public class ConfigObj
     public required bool LogOutputs { get; set; }
     public required bool KeepDirectoryStructure { get; set; }
     public string? Lang { get; set; }
+    public int MaxDegreeOfParallelism { get; set; } = 12;
     public bool CreateNewCheckpoint { get; set; }
     public string? UseCheckpointFile { get; set; }
     public required List<string> Export { get; set; }

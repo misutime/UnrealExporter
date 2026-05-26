@@ -1,0 +1,44 @@
+[
+  {
+    "gameTitle": "LEGOBatmanLotDK",
+    "version": "5.6",
+    "paksDir": "D:\\BaiduNetdiskDownload\\LEGO Batman Legacy of the Dark Knight\\LEGO Batman Legacy of the Dark Knight\\LEGOBatmanLotDK\\Content\\Paks",
+    "outputDir": "D:\\misutime\\UnrealExporter\\output\\batman-models",
+    "aes": "0x2AC1CF37605D2132EAB22D51CBA5F96AD5AB7F7AE708E3E3D5FEFBDFE249D5D6",
+    "logOutputs": true,
+    "keepDirectoryStructure": true,
+    "lang": "English",
+    "createNewCheckpoint": false,
+    "useCheckpointFile": "",
+    "export": [
+      "LEGOBatmanLotDK/Content/Characters/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/Models/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/Vehicles/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Characters/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Models/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Vehicles/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/Characters/.*/Textures/.*\\.uasset:png",
+      "LEGOBatmanLotDK/Content/Models/.*/Textures/.*\\.uasset:png",
+      "LEGOBatmanLotDK/Content/Vehicles/.*/Textures/.*\\.uasset:png",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Characters/.*/Textures/.*\\.uasset:png",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Models/.*/Textures/.*\\.uasset:png",
+      "LEGOBatmanLotDK/Content/AdditionalContent/.*/Vehicles/.*/Textures/.*\\.uasset:png"
+    ],
+    "exclude": [
+      "LEGOBatmanLotDK/Content/.*/Blueprints/.*",
+      "LEGOBatmanLotDK/Content/.*/Data/.*",
+      "LEGOBatmanLotDK/Content/.*/Maps/.*",
+      "LEGOBatmanLotDK/Content/.*/Movies/.*",
+      "LEGOBatmanLotDK/Content/.*/PlaceHolder/.*",
+      "LEGOBatmanLotDK/Content/.*/Tests/.*",
+      "LEGOBatmanLotDK/Content/FunctionalTests/.*",
+      "LEGOBatmanLotDK/Content/PlaceHolder/.*",
+      ".*Blockout.*",
+      ".*[/_]BO[/_].*",
+      ".*SM_COL_.*\\.uasset",
+      ".*SK_COL_.*\\.uasset",
+      ".*_Proxy.*\\.uasset",
+      ".*ProxyMesh.*\\.uasset"
+    ]
+  }
+]
