@@ -3,6 +3,7 @@
 /Content
 /output
 /output2
+/.cache
 .env
 /test
 **.ckpt
