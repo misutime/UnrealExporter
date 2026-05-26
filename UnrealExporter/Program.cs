@@ -694,8 +694,9 @@ public class UnrealExporter
                                                 break;
                                             }
 
+                                            string meshFailure = DescribeMeshExportFailure(obj, options);
                                             Console.WriteLine(
-                                                $"ERROR: Failed to export {file.Value.Path} as GLB."
+                                                $"ERROR: Failed to export {file.Value.Path} as GLB{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}{(meshFailure.Length > 0 ? $" [{meshFailure}]" : "")}."
                                             );
                                         }
                                         catch (Exception ex)
@@ -915,6 +916,44 @@ public class UnrealExporter
                 $"WARN: Failed to sanitize GLB for preview for {savedFilePath} ({ex.Message})"
             );
         }
+    }
+
+    private static string DescribeMeshExportFailure(object obj, ExporterOptions options)
+    {
+        try
+        {
+            if (obj is UStaticMesh staticMesh)
+            {
+                bool converted = staticMesh.TryConvert(
+                    null,
+                    out var convertedMesh,
+                    options.NaniteMeshFormat
+                );
+                if (!converted)
+                    return "StaticMesh TryConvert=false";
+
+                int lodCount = convertedMesh.LODs.Count;
+                int skippedLodCount = convertedMesh.LODs.Count(lod => lod.SkipLod);
+                return $"StaticMesh LODs={lodCount}, skipped={skippedLodCount}";
+            }
+
+            if (obj is USkeletalMesh skeletalMesh)
+            {
+                bool converted = skeletalMesh.TryConvert(out var convertedMesh);
+                if (!converted)
+                    return "SkeletalMesh TryConvert=false";
+
+                int lodCount = convertedMesh.LODs.Count;
+                int skippedLodCount = convertedMesh.LODs.Count(lod => lod.SkipLod);
+                return $"SkeletalMesh LODs={lodCount}, skipped={skippedLodCount}";
+            }
+        }
+        catch (Exception ex)
+        {
+            return $"diagnostic failed: {ex.Message}";
+        }
+
+        return string.Empty;
     }
 
     private static bool SanitizeGlbVertexColorData(
