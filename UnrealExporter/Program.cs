@@ -104,6 +104,8 @@ public class UnrealExporter
 
                 // Load CUE4Parse and export files
                 AbstractFileProvider provider = CreateProvider(config, selectedVersion);
+                if (config.GenerateSourceIndex)
+                    UESourceIndexBuilder.Build(provider, config);
                 Export(provider, config, start);
             }
 
@@ -1870,6 +1872,9 @@ public class ConfigObj
     public string? UseCheckpointFile { get; set; }
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
+    public bool GenerateSourceIndex { get; set; }
+    public List<string>? SourceIndexRegex { get; set; }
+    public int SourceIndexLimit { get; set; }
     public required List<string> Export { get; set; }
     public required List<string> Exclude { get; set; }
 }

@@ -6,7 +6,7 @@
 
 UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态。
+本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态。
 
 ## 完整实现目标
 
@@ -44,7 +44,8 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、model_validation、model_animation_relations 和 relation_animations。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `model_validation.json` 验证 GLB mesh、material、image、skin、bbox。
-   - 后续应增加 SQLite：`ue_source_index.db` 面向完整 UE 源目录，`library_index.db` 面向已导出素材库。
+   - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations 和 source_index_errors。
+   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、model_validation、model_animation_relations 和 relation_animations。
 
 ## 优化列表
 
@@ -56,9 +57,9 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 ### P1：源关系索引
 
-- 扫描完整 pak/io store，建立 UE 包、对象、Import/Export、材质贴图、SkeletalMesh Skeleton、Animation Skeleton 的源索引。
-- 支持从源索引反查“某个模型需要哪些材质/贴图/动画”。
-- 输出 `ue_source_index.db`，避免每次靠目录扫描和临时加载。
+- 已支持扫描完整 pak/io store 文件表，并按配置路径检查 UE 包对象，记录材质、SkeletalMesh Skeleton、Animation Skeleton 的源索引。
+- 支持从源索引反查“某个模型/动画引用哪个 Skeleton、模型引用哪些 Material”。
+- 下一步继续扩展 Import/Export、材质贴图槽和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路
 
