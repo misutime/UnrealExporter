@@ -1272,10 +1272,49 @@ public class UnrealExporter
             boneCount = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Length ?? 0,
             materialCount = skeletalMesh?.SkeletalMaterials?.Length ?? staticMesh?.Materials?.Length ?? 0,
             morphTargetCount = skeletalMesh?.MorphTargets?.Length ?? 0,
+            socketCount = CountModelSockets(staticMesh, skeletalMesh),
+            socketNames = BuildModelSocketNames(staticMesh, skeletalMesh),
             skeletonPath = GetPackageIndexPath(skeletalMesh?.Skeleton),
             skeletonName = skeletalMesh?.Skeleton?.Name,
             boneNames = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Select(x => x.Name.Text).ToArray(),
         };
+    }
+
+    private static int CountModelSockets(UStaticMesh? staticMesh, USkeletalMesh? skeletalMesh)
+        => (staticMesh?.Sockets.Length ?? 0) + (skeletalMesh?.Sockets.Length ?? 0) + CountSkeletonSockets(skeletalMesh);
+
+    private static int CountSkeletonSockets(USkeletalMesh? skeletalMesh)
+    {
+        try
+        {
+            return skeletalMesh?.Skeleton.Load<USkeleton>()?.Sockets.Length ?? 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string[] BuildModelSocketNames(UStaticMesh? staticMesh, USkeletalMesh? skeletalMesh)
+    {
+        var names = new List<string>();
+        if (staticMesh != null)
+            names.AddRange(staticMesh.Sockets.Select(x => x.Load<UStaticMeshSocket>()?.SocketName.Text).Where(x => !string.IsNullOrWhiteSpace(x))!);
+        if (skeletalMesh != null)
+            names.AddRange(skeletalMesh.Sockets.Select(x => x.Load<USkeletalMeshSocket>()?.SocketName.Text).Where(x => !string.IsNullOrWhiteSpace(x))!);
+
+        try
+        {
+            var skeleton = skeletalMesh?.Skeleton.Load<USkeleton>();
+            if (skeleton != null)
+                names.AddRange(skeleton.Sockets.Select(x => x.Load<USkeletalMeshSocket>()?.SocketName.Text).Where(x => !string.IsNullOrWhiteSpace(x))!);
+        }
+        catch
+        {
+            // Socket 只是辅助关系，加载失败时保留模型导出主流程。
+        }
+
+        return names.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray()!;
     }
 
     private static object BuildTextureCatalogEntry(string sourcePath, UTexture2D texture, string outputPath)

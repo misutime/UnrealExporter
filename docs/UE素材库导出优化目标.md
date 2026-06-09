@@ -45,7 +45,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox。
-   - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
+   - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
    - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
 
 ## 优化列表
@@ -62,6 +62,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 支持从源索引反查“某个模型/动画引用哪个 Skeleton、模型引用哪些 Material”。
 - 已支持 `material_texture_slots`，记录材质名、slot 名、贴图路径、贴图对象路径和关系来源：`DirectParameter`、`ResolvedParams`、`ReferencedTexture`。
 - 已支持 `skeleton_bones` 和 `animation_tracks`，记录模型/骨架的 boneName、parentIndex，以及动画 track 到 skeleton bone index/boneName 的映射。
+- 已支持 `mesh_sockets`，记录 StaticMesh、SkeletalMesh、USkeleton 的 socket 名、绑定骨骼和相对 TRS，服务挂件、武器、特效和任务道具组合关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
 - 下一步继续扩展 Import/Export、蓝图/组件引用和更完整依赖图，减少每次靠目录扫描和临时加载。

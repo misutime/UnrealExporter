@@ -118,6 +118,7 @@ internal static class UESourceIndexBuilder
                 bone_count INTEGER,
                 material_count INTEGER,
                 morph_target_count INTEGER,
+                socket_count INTEGER,
                 duration REAL,
                 frame_count INTEGER,
                 track_count INTEGER,
@@ -160,6 +161,27 @@ internal static class UESourceIndexBuilder
                 bone_index INTEGER NOT NULL,
                 bone_name TEXT NOT NULL,
                 parent_index INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE mesh_sockets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                owner_object_path TEXT,
+                owner_type TEXT NOT NULL,
+                socket_index INTEGER NOT NULL,
+                socket_name TEXT,
+                bone_name TEXT,
+                socket_object_path TEXT,
+                location_x REAL NOT NULL,
+                location_y REAL NOT NULL,
+                location_z REAL NOT NULL,
+                rotation_pitch REAL NOT NULL,
+                rotation_yaw REAL NOT NULL,
+                rotation_roll REAL NOT NULL,
+                scale_x REAL NOT NULL,
+                scale_y REAL NOT NULL,
+                scale_z REAL NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -256,6 +278,8 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_slot ON material_texture_slots(slot_name);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_owner ON skeleton_bones(owner_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_skeleton ON skeleton_bones(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_mesh_sockets_owner ON mesh_sockets(owner_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_mesh_sockets_name ON mesh_sockets(socket_name);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_animation ON animation_tracks(animation_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_skeleton ON animation_tracks(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_segments_animation ON animation_segments(animation_object_path);");
@@ -313,6 +337,7 @@ internal static class UESourceIndexBuilder
             objectPath = obj.GetPathName(),
             skeletonPath,
             skeletonName,
+            socketCount = CountSockets(obj),
             notifyCount = sequenceBase?.Notifies.Length,
             curveCount = animSequence?.CompressedCurveData?.FloatCurves?.Length,
         };
@@ -323,12 +348,12 @@ internal static class UESourceIndexBuilder
             INSERT INTO source_objects (
                 source_path, object_type, export_type, name, object_path,
                 skeleton_path, skeleton_name, skeleton_guid, bone_count, material_count,
-                morph_target_count, duration, frame_count, track_count, notify_count, curve_count, compression, raw_json
+                morph_target_count, socket_count, duration, frame_count, track_count, notify_count, curve_count, compression, raw_json
             )
             VALUES (
                 $sourcePath, $objectType, $exportType, $name, $objectPath,
                 $skeletonPath, $skeletonName, $skeletonGuid, $boneCount, $materialCount,
-                $morphTargetCount, $duration, $frameCount, $trackCount, $notifyCount, $curveCount, $compression, $rawJson
+                $morphTargetCount, $socketCount, $duration, $frameCount, $trackCount, $notifyCount, $curveCount, $compression, $rawJson
             );
             """;
         Add(command, "$sourcePath", file.Path);
@@ -342,6 +367,7 @@ internal static class UESourceIndexBuilder
         Add(command, "$boneCount", skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Length);
         Add(command, "$materialCount", materialCount);
         Add(command, "$morphTargetCount", skeletalMesh?.MorphTargets?.Length);
+        Add(command, "$socketCount", CountSockets(obj));
         Add(command, "$duration", sequenceBase?.SequenceLength);
         Add(command, "$frameCount", animSequence?.NumFrames);
         Add(command, "$trackCount", animSequence?.GetNumTracks());
@@ -373,6 +399,15 @@ internal static class UESourceIndexBuilder
 
         if (obj is USkeleton skeleton)
             InsertSkeletonBones(connection, transaction, file.Path, skeleton.GetPathName(), "Skeleton", skeleton.GetPathName(), skeleton.ReferenceSkeleton.FinalRefBoneInfo);
+
+        if (staticMesh != null)
+            InsertStaticMeshSockets(connection, transaction, file.Path, staticMesh.GetPathName(), "StaticMesh", staticMesh.Sockets);
+
+        if (skeletalMesh != null)
+            InsertSkeletalMeshSockets(connection, transaction, file.Path, skeletalMesh.GetPathName(), "SkeletalMesh", skeletalMesh.Sockets);
+
+        if (obj is USkeleton socketSkeleton)
+            InsertSkeletalMeshSockets(connection, transaction, file.Path, socketSkeleton.GetPathName(), "Skeleton", socketSkeleton.Sockets);
 
         if (animSequence != null)
             InsertAnimationTracks(connection, transaction, file.Path, animSequence, skeletonPath);
@@ -556,6 +591,129 @@ internal static class UESourceIndexBuilder
             Add(command, "$parentIndex", bone.ParentIndex);
             command.ExecuteNonQuery();
         }
+    }
+
+    private static int CountSockets(UObject obj)
+        => obj switch
+        {
+            UStaticMesh staticMesh => staticMesh.Sockets.Length,
+            USkeletalMesh skeletalMesh => skeletalMesh.Sockets.Length,
+            USkeleton skeleton => skeleton.Sockets.Length,
+            _ => 0,
+        };
+
+    private static void InsertStaticMeshSockets(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        FPackageIndex[] sockets)
+    {
+        for (var socketIndex = 0; socketIndex < sockets.Length; socketIndex++)
+        {
+            var socket = sockets[socketIndex].Load<UStaticMeshSocket>();
+            if (socket == null)
+                continue;
+
+            InsertMeshSocket(
+                connection,
+                transaction,
+                sourcePath,
+                ownerObjectPath,
+                ownerType,
+                socketIndex,
+                socket.SocketName.Text,
+                null,
+                GetPackageIndexPath(sockets[socketIndex]),
+                socket.RelativeLocation,
+                socket.RelativeRotation,
+                socket.RelativeScale);
+        }
+    }
+
+    private static void InsertSkeletalMeshSockets(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        FPackageIndex[] sockets)
+    {
+        for (var socketIndex = 0; socketIndex < sockets.Length; socketIndex++)
+        {
+            var socket = sockets[socketIndex].Load<USkeletalMeshSocket>();
+            if (socket == null)
+                continue;
+
+            InsertMeshSocket(
+                connection,
+                transaction,
+                sourcePath,
+                ownerObjectPath,
+                ownerType,
+                socketIndex,
+                socket.SocketName.Text,
+                socket.BoneName.Text,
+                GetPackageIndexPath(sockets[socketIndex]),
+                socket.RelativeLocation,
+                socket.RelativeRotation,
+                socket.RelativeScale);
+        }
+    }
+
+    private static void InsertMeshSocket(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        int socketIndex,
+        string socketName,
+        string? boneName,
+        string? socketObjectPath,
+        CUE4Parse.UE4.Objects.Core.Math.FVector location,
+        CUE4Parse.UE4.Objects.Core.Math.FRotator rotation,
+        CUE4Parse.UE4.Objects.Core.Math.FVector scale)
+    {
+        if (!string.IsNullOrWhiteSpace(socketObjectPath))
+            InsertRelation(connection, transaction, sourcePath, ownerObjectPath, "Socket", socketObjectPath, socketName);
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO mesh_sockets (
+                source_path, owner_object_path, owner_type, socket_index,
+                socket_name, bone_name, socket_object_path,
+                location_x, location_y, location_z,
+                rotation_pitch, rotation_yaw, rotation_roll,
+                scale_x, scale_y, scale_z
+            )
+            VALUES (
+                $sourcePath, $ownerObjectPath, $ownerType, $socketIndex,
+                $socketName, $boneName, $socketObjectPath,
+                $locationX, $locationY, $locationZ,
+                $rotationPitch, $rotationYaw, $rotationRoll,
+                $scaleX, $scaleY, $scaleZ
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$ownerObjectPath", ownerObjectPath);
+        Add(command, "$ownerType", ownerType);
+        Add(command, "$socketIndex", socketIndex);
+        Add(command, "$socketName", socketName);
+        Add(command, "$boneName", boneName);
+        Add(command, "$socketObjectPath", socketObjectPath);
+        Add(command, "$locationX", location.X);
+        Add(command, "$locationY", location.Y);
+        Add(command, "$locationZ", location.Z);
+        Add(command, "$rotationPitch", rotation.Pitch);
+        Add(command, "$rotationYaw", rotation.Yaw);
+        Add(command, "$rotationRoll", rotation.Roll);
+        Add(command, "$scaleX", scale.X);
+        Add(command, "$scaleY", scale.Y);
+        Add(command, "$scaleZ", scale.Z);
+        command.ExecuteNonQuery();
     }
 
     private static void InsertAnimationTracks(
