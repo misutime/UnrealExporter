@@ -2,9 +2,11 @@
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Meshes;
 using CUE4Parse_Conversion.Textures;
 using CUE4Parse_Conversion.Textures.BC;
@@ -13,6 +15,8 @@ using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider;
+using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
@@ -49,6 +53,8 @@ public class UnrealExporter
     private static int totalExportedFiles = 0;
     private static bool useCheckpoint = false;
     private static string RootDir = AppContext.BaseDirectory;
+    private static readonly object ManifestWriteLock = new();
+    private static readonly object CatalogWriteLock = new();
 
     public static void Main(string[] args)
     {
@@ -60,6 +66,9 @@ public class UnrealExporter
 
         // For Oodle to work from outside of project directory
         Directory.SetCurrentDirectory(RootDir);
+
+        if (TryRunPostProcessCommand(args))
+            return;
 
         double trueStart = Now();
 
@@ -110,6 +119,31 @@ public class UnrealExporter
         {
             Console.WriteLine($"ERROR: no config files found.");
         }
+    }
+
+    private static bool TryRunPostProcessCommand(string[] args)
+    {
+        if (args.Length == 0)
+            return false;
+
+        if (
+            !args[0].Equals("--postprocess-library", StringComparison.OrdinalIgnoreCase)
+            && !args[0].Equals("postprocess-library", StringComparison.OrdinalIgnoreCase)
+        )
+            return false;
+
+        if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
+        {
+            Console.WriteLine("ERROR: --postprocess-library requires an exported library root path.");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures]");
+            return true;
+        }
+
+        // 后处理只读取已导出的 GLB/JSON/PNG，不需要重新挂载 pak。
+        var root = args[1];
+        var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.Run(root, dedupeTextures);
+        return true;
     }
 
     public static void InitOodle()
@@ -857,6 +891,8 @@ public class UnrealExporter
                                                     );
                                                     break;
                                                 }
+                                                AppendExportManifest(config, file.Value.Path, obj, outputPath + ".png", "Texture");
+                                                AppendAssetCatalog(config, BuildTextureCatalogEntry(file.Value.Path, texture, outputPath + ".png"));
                                                 Interlocked.Increment(ref totalExportedFiles);
 
                                                 break;
@@ -887,6 +923,7 @@ public class UnrealExporter
                                     if (!Directory.Exists(outputDir))
                                         Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".json", json);
+                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
@@ -916,6 +953,7 @@ public class UnrealExporter
                                                         + kvp.Key.SubstringAfterLast('.'),
                                                     kvp.Value
                                                 );
+                                                AppendExportManifest(config, file.Value.Path, null, outputPath + "." + kvp.Key.SubstringAfterLast('.'), "RawPackage");
                                                 Interlocked.Increment(ref totalExportedFiles);
                                             }
                                         );
@@ -958,6 +996,8 @@ public class UnrealExporter
                                                 SanitizeGlbForPreview(savedFilePath);
                                                 if (config.LogOutputs)
                                                     Console.WriteLine($"=> {savedFilePath}");
+                                                AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
+                                                AppendAssetCatalog(config, BuildModelCatalogEntry(file.Value.Path, obj, savedFilePath));
                                                 Interlocked.Increment(ref totalExportedFiles);
                                                 break;
                                             }
@@ -972,6 +1012,69 @@ public class UnrealExporter
                                             Console.WriteLine(
                                                 $"WARN: Skipped mesh {file.Value.Path} ({ex.Message})"
                                             );
+                                        }
+                                    }
+                                }
+                                else if (outputType is "ueanim" or "psa")
+                                {
+                                    foreach (var obj in allObjects)
+                                    {
+                                        if (obj is not UAnimSequence && obj is not UAnimMontage && obj is not UAnimComposite)
+                                            continue;
+
+                                        var animationAsset = (UAnimationAsset)obj;
+                                        AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "discovered", null);
+                                        if (NeedsAclNative(animationAsset) && !HasAclNativeExports())
+                                        {
+                                            const string error = "missingNativeFeature: ACL. CUE4Parse-Natives 没有编入 ACL，无法解压 ACL 压缩动画。请补齐 CUE4Parse-Natives/ACL/external/acl 后重建。";
+                                            var diagnosticPath = outputPath + "." + outputType + ".missing-acl.json";
+                                            Console.WriteLine($"WARN: Skipped animation {file.Value.Path} ({error})");
+                                            WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
+                                            AppendExportManifest(config, file.Value.Path, obj, diagnosticPath, "AnimationMetadata");
+                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "blocked", error));
+                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "blocked", error);
+                                            break;
+                                        }
+
+                                        var options = new ExporterOptions
+                                        {
+                                            AnimFormat = outputType == "ueanim" ? EAnimFormat.UEFormat : EAnimFormat.ActorX,
+                                            CompressionFormat = EFileCompressionFormat.None,
+                                        };
+
+                                        try
+                                        {
+                                            var exporter = new Exporter(obj, options);
+                                            if (
+                                                exporter.TryWriteToDir(
+                                                    new DirectoryInfo(Path.GetFullPath(config.OutputDir)),
+                                                    out var label,
+                                                    out var savedFilePath
+                                                )
+                                            )
+                                            {
+                                                if (config.LogOutputs)
+                                                    Console.WriteLine($"=> {savedFilePath}");
+                                                AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Animation");
+                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, savedFilePath, outputType, "ok", null));
+                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, savedFilePath, "ok", null);
+                                                Interlocked.Increment(ref totalExportedFiles);
+                                                break;
+                                            }
+
+                                            Console.WriteLine(
+                                                $"ERROR: Failed to export {file.Value.Path} as {outputType}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}."
+                                            );
+                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "error", label));
+                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", label);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine(
+                                                $"WARN: Skipped animation {file.Value.Path} ({ex.Message})"
+                                            );
+                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "error", ex.Message));
+                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", ex.Message);
                                         }
                                     }
                                 }
@@ -1012,6 +1115,7 @@ public class UnrealExporter
                                     if (!Directory.Exists(outputDir))
                                         Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".json", json);
+                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Localization");
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
@@ -1032,6 +1136,7 @@ public class UnrealExporter
                                     if (!Directory.Exists(outputDir))
                                         Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".js", beautifier.GetResult());
+                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".js", "Js");
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
@@ -1050,6 +1155,7 @@ public class UnrealExporter
                                     if (!Directory.Exists(outputDir))
                                         Directory.CreateDirectory(outputDir);
                                     File.WriteAllBytes(outputPath + ".db", data);
+                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".db", "Database");
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 break;
@@ -1089,7 +1195,266 @@ public class UnrealExporter
         Console.WriteLine(
             $"Exported {totalExportedFiles} files in {Elapsed(start, Now(), 1000)} seconds"
         );
+        if (config.GenerateLibraryIndexes)
+        {
+            UELibraryPostProcessor.Run(config.OutputDir, config.UseSharedTextures);
+        }
+        else if (config.UseSharedTextures)
+        {
+            UELibraryPostProcessor.DeduplicateTextureFiles(Path.GetFullPath(config.OutputDir));
+        }
         Console.WriteLine();
+    }
+
+    private static void AppendExportManifest(
+        ConfigObj config,
+        string sourcePath,
+        UObject? obj,
+        string outputPath,
+        string kind
+    )
+    {
+        var manifestPath = Path.Combine(Path.GetFullPath(config.OutputDir), "export_manifest.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(manifestPath)!);
+        var entry = new
+        {
+            exportedAt = DateTime.UtcNow.ToString("O"),
+            gameTitle = config.GameTitle,
+            kind,
+            source = sourcePath,
+            objectType = obj?.GetType().Name,
+            name = obj?.Name,
+            objectPath = obj?.GetPathName(),
+            output = Path.GetFullPath(outputPath),
+        };
+        lock (ManifestWriteLock)
+        {
+            File.AppendAllText(manifestPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
+        }
+    }
+
+    private static void AppendAssetCatalog(ConfigObj config, object entry)
+    {
+        var catalogPath = Path.Combine(Path.GetFullPath(config.OutputDir), "asset_catalog.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(catalogPath)!);
+        lock (CatalogWriteLock)
+        {
+            File.AppendAllText(catalogPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
+        }
+    }
+
+    private static object BuildModelCatalogEntry(string sourcePath, UObject obj, string outputPath)
+    {
+        var isSkeletal = obj is USkeletalMesh;
+        var skeletalMesh = obj as USkeletalMesh;
+        var staticMesh = obj as UStaticMesh;
+        return new
+        {
+            kind = "Model",
+            resourceKind = InferCatalogResourceKind(sourcePath),
+            name = obj.Name,
+            sourceType = isSkeletal ? "USkeletalMesh" : "UStaticMesh",
+            source = sourcePath,
+            objectPath = obj.GetPathName(),
+            output = Path.GetFullPath(outputPath),
+            format = "glb",
+            hasSkeleton = isSkeletal,
+            boneCount = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Length ?? 0,
+            materialCount = skeletalMesh?.SkeletalMaterials?.Length ?? staticMesh?.Materials?.Length ?? 0,
+            morphTargetCount = skeletalMesh?.MorphTargets?.Length ?? 0,
+            skeletonPath = GetPackageIndexPath(skeletalMesh?.Skeleton),
+            skeletonName = skeletalMesh?.Skeleton?.Name,
+            boneNames = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Select(x => x.Name.Text).ToArray(),
+        };
+    }
+
+    private static object BuildTextureCatalogEntry(string sourcePath, UTexture2D texture, string outputPath)
+    {
+        return new
+        {
+            kind = "Texture",
+            resourceKind = "Texture2D",
+            name = texture.Name,
+            sourceType = "UTexture2D",
+            source = sourcePath,
+            objectPath = texture.GetPathName(),
+            output = Path.GetFullPath(outputPath),
+            format = "png",
+            width = texture.PlatformData?.SizeX ?? 0,
+            height = texture.PlatformData?.SizeY ?? 0,
+            pixelFormat = texture.Format.ToString(),
+            isNormalMap = texture.IsNormalMap,
+        };
+    }
+
+    private static object BuildAnimationCatalogEntry(
+        string sourcePath,
+        UObject obj,
+        string outputPath,
+        string outputType,
+        string status,
+        string? error
+    )
+    {
+        var asset = obj as UAnimationAsset;
+        var sequence = obj as UAnimSequence;
+        var sequenceBase = obj as UAnimSequenceBase;
+        var trackMap = sequence?.GetTrackMap();
+        return new
+        {
+            kind = "Animation",
+            resourceKind = "Animation",
+            name = obj.Name,
+            sourceType = obj.GetType().Name,
+            source = sourcePath,
+            objectPath = obj.GetPathName(),
+            output = Path.GetFullPath(outputPath),
+            format = outputType,
+            status,
+            error,
+            skeletonPath = GetPackageIndexPath(asset?.Skeleton),
+            skeletonName = asset?.Skeleton.Name,
+            skeletonGuid = asset?.SkeletonGuid.ToString(),
+            duration = sequenceBase?.SequenceLength,
+            frameCount = sequence?.NumFrames,
+            trackCount = sequence?.GetNumTracks(),
+            trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            compression = sequence?.CompressedDataStructure?.GetType().Name,
+            requiresAcl = NeedsAclNative(asset),
+            additiveType = sequence?.AdditiveAnimType.ToString(),
+        };
+    }
+
+    private static void AppendAnimationBinding(
+        ConfigObj config,
+        string sourcePath,
+        UAnimationAsset asset,
+        string? outputPath,
+        string status,
+        string? error
+    )
+    {
+        var sequence = asset as UAnimSequence;
+        var sequenceBase = asset as UAnimSequenceBase;
+        var trackMap = sequence?.GetTrackMap();
+        var entry = new
+        {
+            indexedAt = DateTime.UtcNow.ToString("O"),
+            gameTitle = config.GameTitle,
+            kind = "AnimationBinding",
+            status,
+            error,
+            source = sourcePath,
+            sourceType = asset.GetType().Name,
+            name = asset.Name,
+            objectPath = asset.GetPathName(),
+            output = string.IsNullOrWhiteSpace(outputPath) ? null : Path.GetFullPath(outputPath),
+            skeletonPath = GetPackageIndexPath(asset.Skeleton),
+            skeletonName = asset.Skeleton.Name,
+            skeletonGuid = asset.SkeletonGuid.ToString(),
+            duration = sequenceBase?.SequenceLength,
+            frameCount = sequence?.NumFrames,
+            trackCount = sequence?.GetNumTracks(),
+            trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            compression = sequence?.CompressedDataStructure?.GetType().Name,
+            requiresAcl = NeedsAclNative(asset),
+            additiveType = sequence?.AdditiveAnimType.ToString(),
+        };
+
+        var path = Path.Combine(Path.GetFullPath(config.OutputDir), "animation_bindings.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        lock (CatalogWriteLock)
+        {
+            File.AppendAllText(path, JsonConvert.SerializeObject(entry) + Environment.NewLine);
+        }
+    }
+
+    private static void WriteAnimationDiagnostic(
+        ConfigObj config,
+        string sourcePath,
+        UAnimationAsset asset,
+        string outputPath,
+        string status,
+        string error
+    )
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var diagnostic = new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            gameTitle = config.GameTitle,
+            kind = "AnimationDiagnostic",
+            status,
+            error,
+            source = sourcePath,
+            sourceType = asset.GetType().Name,
+            name = asset.Name,
+            objectPath = asset.GetPathName(),
+            skeletonPath = GetPackageIndexPath(asset.Skeleton),
+            skeletonName = asset.Skeleton.Name,
+            skeletonGuid = asset.SkeletonGuid.ToString(),
+        };
+        File.WriteAllText(outputPath, JsonConvert.SerializeObject(diagnostic, Formatting.Indented));
+    }
+
+    private static bool NeedsAclNative(UAnimationAsset? asset)
+    {
+        if (asset is UAnimSequence sequence)
+            return IsAclCompressed(sequence);
+
+        if (asset is UAnimMontage montage)
+            return montage.SlotAnimTracks
+                .SelectMany(x => x.AnimTrack.AnimSegments)
+                .Any(x => TryLoadAclCompressedSequence(x.AnimReference));
+
+        if (asset is UAnimComposite composite)
+            return composite.AnimationTrack.AnimSegments
+                .Any(x => TryLoadAclCompressedSequence(x.AnimReference));
+
+        return false;
+    }
+
+    private static bool TryLoadAclCompressedSequence(CUE4Parse.UE4.Objects.UObject.FPackageIndex animReference)
+    {
+        var sequence = animReference.Load<UAnimSequence>();
+        return sequence != null && IsAclCompressed(sequence);
+    }
+
+    private static bool IsAclCompressed(UAnimSequence sequence)
+    {
+        var typeName = sequence.CompressedDataStructure?.GetType().Name ?? "";
+        return typeName.Contains("ACL", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasAclNativeExports()
+    {
+        return CUE4ParseNatives.IsInitialized
+               && NativeLibrary.TryGetExport(CUE4ParseNatives.LibraryHandle, "nAllocate", out _)
+               && NativeLibrary.TryGetExport(CUE4ParseNatives.LibraryHandle, "nReadACLData", out _);
+    }
+
+    private static string? GetPackageIndexPath(CUE4Parse.UE4.Objects.UObject.FPackageIndex? index)
+    {
+        if (index == null || index.IsNull)
+            return null;
+
+        return index.ResolvedObjectNoCache?.GetPathName() ?? index.Name;
+    }
+
+    private static string InferCatalogResourceKind(string sourcePath)
+    {
+        var text = sourcePath.Replace('\\', '/').ToLowerInvariant();
+        if (text.Contains("/characters/") || text.Contains("/character/"))
+            return "Character";
+        if (text.Contains("/vehicle"))
+            return "Vehicle";
+        if (text.Contains("/weapon") || text.Contains("/gadgets/"))
+            return "Weapon";
+        if (text.Contains("/environment/") || text.Contains("/scenery/") || text.Contains("/building/") || text.Contains("/plants/"))
+            return "Environment";
+        if (text.Contains("/props/") || text.Contains("/prop/") || text.Contains("/collectable"))
+            return "Prop";
+        return "Unknown";
     }
 
     public static void SanitizeGlbForPreview(string savedFilePath)
@@ -1503,6 +1868,8 @@ public class ConfigObj
     public int DebugFileLimit { get; set; }
     public bool CreateNewCheckpoint { get; set; }
     public string? UseCheckpointFile { get; set; }
+    public bool GenerateLibraryIndexes { get; set; }
+    public bool UseSharedTextures { get; set; }
     public required List<string> Export { get; set; }
     public required List<string> Exclude { get; set; }
 }
