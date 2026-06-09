@@ -1,12 +1,20 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Assets.Exports.Component;
+using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
+using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
+using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Assets.Objects.Properties;
+using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
@@ -185,6 +193,33 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE component_asset_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                owner_object_path TEXT,
+                owner_type TEXT,
+                component_object_path TEXT,
+                component_type TEXT,
+                component_name TEXT,
+                component_variable_name TEXT,
+                relation_source TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                target_path TEXT,
+                target_name TEXT,
+                socket_name TEXT,
+                parent_component_path TEXT,
+                location_x REAL,
+                location_y REAL,
+                location_z REAL,
+                rotation_pitch REAL,
+                rotation_yaw REAL,
+                rotation_roll REAL,
+                scale_x REAL,
+                scale_y REAL,
+                scale_z REAL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE animation_tracks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -280,6 +315,9 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_skeleton ON skeleton_bones(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_mesh_sockets_owner ON mesh_sockets(owner_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_mesh_sockets_name ON mesh_sockets(socket_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_owner ON component_asset_relations(owner_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_component ON component_asset_relations(component_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_target ON component_asset_relations(relation_type, target_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_animation ON animation_tracks(animation_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_skeleton ON animation_tracks(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_segments_animation ON animation_segments(animation_object_path);");
@@ -423,7 +461,452 @@ internal static class UESourceIndexBuilder
 
         if (animSequence != null)
             InsertAnimationCurves(connection, transaction, file.Path, animSequence);
+
+        if (obj is UBlueprintGeneratedClass blueprintClass)
+            InsertBlueprintComponentRelations(connection, transaction, file.Path, blueprintClass);
+
+        if (obj is USceneComponent sceneComponent)
+            InsertComponentAssetRelations(connection, transaction, file.Path, obj.GetPathName(), obj.GetType().Name, sceneComponent, null, "ExportedComponent");
+
+        if (ShouldScanBlueprintPropertyReferences(obj))
+            InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj);
     }
+
+    private static void InsertBlueprintComponentRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UBlueprintGeneratedClass blueprintClass)
+    {
+        var ownerPath = blueprintClass.GetPathName();
+        var seenComponents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var componentIndex in blueprintClass.ComponentTemplates.Where(x => x is { IsNull: false }))
+        {
+            if (!TryLoadPackageIndex(componentIndex, out USceneComponent? component))
+                continue;
+
+            InsertComponentAssetRelations(
+                connection,
+                transaction,
+                sourcePath,
+                ownerPath,
+                blueprintClass.GetType().Name,
+                component,
+                null,
+                "BlueprintComponentTemplate",
+                seenComponents);
+        }
+
+        if (TryLoadPackageIndex(blueprintClass.SimpleConstructionScript, out USimpleConstructionScript? script))
+        {
+            foreach (var node in GetAllSCSNodesSafe(script))
+            {
+                if (!TryLoadPackageIndex(node.GetComponentTemplateAsIndex(), out USceneComponent? component))
+                    continue;
+
+                var variableName = node.InternalVariableName.Text;
+                InsertComponentAssetRelations(
+                    connection,
+                    transaction,
+                    sourcePath,
+                    ownerPath,
+                    blueprintClass.GetType().Name,
+                    component,
+                    variableName,
+                    "SimpleConstructionScript",
+                    seenComponents);
+            }
+        }
+
+        if (!TryLoadPackageIndex(blueprintClass.InheritableComponentHandler, out UInheritableComponentHandler? inheritable))
+            return;
+
+        foreach (var record in inheritable.GetRecords())
+        {
+            if (!TryLoadPackageIndex(record.ComponentTemplate, out USceneComponent? component))
+                continue;
+
+            InsertComponentAssetRelations(
+                connection,
+                transaction,
+                sourcePath,
+                ownerPath,
+                blueprintClass.GetType().Name,
+                component,
+                record.ComponentKey.SCSVariableName.Text,
+                "InheritableComponentOverride",
+                seenComponents);
+        }
+    }
+
+    private static void InsertComponentAssetRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        USceneComponent component,
+        string? componentVariableName,
+        string relationSource,
+        HashSet<string>? seenComponents = null)
+    {
+        var componentPath = component.GetPathName();
+        if (seenComponents != null && !seenComponents.Add($"{relationSource}:{componentPath}:{componentVariableName}"))
+            return;
+
+        var transform = component.GetRelativeTransform();
+        var parentPath = GetAttachParentPathSafe(component);
+        var socketName = component.GetOrDefault<FName?>("AttachSocketName")?.Text;
+        var componentName = component.Name;
+
+        InsertComponentAssetRelation(
+            connection,
+            transaction,
+            sourcePath,
+            ownerObjectPath,
+            ownerType,
+            componentPath,
+            component.GetType().Name,
+            componentName,
+            componentVariableName,
+            relationSource,
+            "Component",
+            componentPath,
+            componentName,
+            socketName,
+            parentPath,
+            transform);
+
+        foreach (var relation in BuildComponentAssetTargets(component))
+        {
+            InsertRelation(connection, transaction, sourcePath, ownerObjectPath, relation.RelationType, relation.TargetPath, relation.TargetName);
+            InsertComponentAssetRelation(
+                connection,
+                transaction,
+                sourcePath,
+                ownerObjectPath,
+                ownerType,
+                componentPath,
+                component.GetType().Name,
+                componentName,
+                componentVariableName,
+                relationSource,
+                relation.RelationType,
+                relation.TargetPath,
+                relation.TargetName,
+                socketName,
+                parentPath,
+                transform);
+        }
+    }
+
+    private static IEnumerable<ComponentAssetTarget> BuildComponentAssetTargets(USceneComponent component)
+    {
+        if (component is UStaticMeshComponent staticMeshComponent)
+        {
+            var staticMesh = staticMeshComponent.GetStaticMesh();
+            if (!staticMesh.IsNull)
+                yield return ComponentAssetTarget.FromPackageIndex("StaticMesh", staticMesh);
+        }
+
+        if (component is USkeletalMeshComponent skeletalMeshComponent)
+        {
+            var skeletalMesh = skeletalMeshComponent.GetSkeletalMesh();
+            if (!skeletalMesh.IsNull)
+                yield return ComponentAssetTarget.FromPackageIndex("SkeletalMesh", skeletalMesh);
+
+            if (skeletalMeshComponent.AnimationData is { } animationData && !animationData.AnimToPlay.IsNull)
+                yield return ComponentAssetTarget.FromPackageIndex("Animation", animationData.AnimToPlay);
+
+            foreach (var propertyName in new[] { "AnimClass", "AnimBlueprintGeneratedClass" })
+            {
+                var animClass = skeletalMeshComponent.GetOrDefault(propertyName, new FPackageIndex());
+                if (!animClass.IsNull)
+                    yield return ComponentAssetTarget.FromPackageIndex(propertyName, animClass);
+            }
+        }
+
+        foreach (var material in GetComponentMaterials(component))
+            yield return ComponentAssetTarget.FromPackageIndex("Material", material);
+    }
+
+    private static IEnumerable<FPackageIndex> GetComponentMaterials(USceneComponent component)
+    {
+        foreach (var propertyName in new[] { "OverrideMaterials", "Materials" })
+        {
+            var materials = component.GetOrDefault<FPackageIndex[]>(propertyName, []);
+            foreach (var material in materials.Where(x => !x.IsNull))
+                yield return material;
+        }
+    }
+
+    private static bool TryLoadPackageIndex<T>(FPackageIndex? packageIndex, [NotNullWhen(true)] out T? loaded)
+        where T : UObject
+    {
+        loaded = null;
+        if (packageIndex is not { IsNull: false })
+            return false;
+
+        try
+        {
+            loaded = packageIndex.Load<T>();
+            return loaded != null;
+        }
+        catch
+        {
+            // cooked 蓝图里有些组件模板会缺类或缺外部包；跳过单个引用，避免整包源索引失败。
+            return false;
+        }
+    }
+
+    private static IEnumerable<USCS_Node> GetAllSCSNodesSafe(USimpleConstructionScript script)
+    {
+        try
+        {
+            return script.GetAllNodesRecursive();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string? GetAttachParentPathSafe(USceneComponent component)
+    {
+        try
+        {
+            return component.GetAttachParent()?.GetPathName();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool ShouldScanBlueprintPropertyReferences(UObject obj)
+        => obj is UBlueprintGeneratedClass
+           || obj.Flags.HasFlag(EObjectFlags.RF_ClassDefaultObject)
+           || obj.Name.StartsWith("Default__", StringComparison.OrdinalIgnoreCase);
+
+    private static void InsertObjectPropertyAssetRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UObject obj)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in EnumeratePropertyAssetTargets(obj.Properties, "Property"))
+        {
+            if (!seen.Add($"{reference.PropertyPath}:{reference.Target.RelationType}:{reference.Target.TargetPath}"))
+                continue;
+
+            InsertRelation(connection, transaction, sourcePath, obj.GetPathName(), reference.Target.RelationType, reference.Target.TargetPath, reference.Target.TargetName);
+            InsertComponentAssetRelation(
+                connection,
+                transaction,
+                sourcePath,
+                obj.GetPathName(),
+                obj.GetType().Name,
+                obj.GetPathName(),
+                obj.GetType().Name,
+                obj.Name,
+                reference.PropertyPath,
+                "BlueprintProperty",
+                reference.Target.RelationType,
+                reference.Target.TargetPath,
+                reference.Target.TargetName,
+                null,
+                null,
+                CUE4Parse.UE4.Objects.Core.Math.FTransform.Identity);
+        }
+    }
+
+    private static IEnumerable<PropertyAssetTarget> EnumeratePropertyAssetTargets(IEnumerable<FPropertyTag> properties, string pathPrefix)
+    {
+        foreach (var property in properties)
+        {
+            var propertyPath = $"{pathPrefix}.{property.Name.Text}";
+            foreach (var target in EnumeratePropertyAssetTargets(property.Tag, propertyPath))
+                yield return target;
+        }
+    }
+
+    private static IEnumerable<PropertyAssetTarget> EnumeratePropertyAssetTargets(FPropertyTagType? tag, string propertyPath)
+    {
+        if (tag == null)
+            yield break;
+
+        foreach (var target in EnumeratePropertyAssetTargets(tag.GenericValue, propertyPath))
+            yield return target;
+    }
+
+    private static IEnumerable<PropertyAssetTarget> EnumeratePropertyAssetTargets(object? value, string propertyPath)
+    {
+        switch (value)
+        {
+            case null:
+                yield break;
+            case FPackageIndex packageIndex when TryBuildUsefulAssetTarget(packageIndex, out var target):
+                yield return new PropertyAssetTarget(propertyPath, target);
+                yield break;
+            case FStructFallback fallback:
+                foreach (var nested in EnumeratePropertyAssetTargets(fallback.Properties, propertyPath))
+                    yield return nested;
+                yield break;
+            case UScriptArray array:
+                for (var index = 0; index < array.Properties.Count; index++)
+                {
+                    foreach (var nested in EnumeratePropertyAssetTargets(array.Properties[index], $"{propertyPath}[{index}]"))
+                        yield return nested;
+                }
+                yield break;
+            case UScriptMap map:
+                var pairIndex = 0;
+                foreach (var pair in map.Properties)
+                {
+                    foreach (var nested in EnumeratePropertyAssetTargets(pair.Key, $"{propertyPath}{{{pairIndex}}}.Key"))
+                        yield return nested;
+                    foreach (var nested in EnumeratePropertyAssetTargets(pair.Value, $"{propertyPath}{{{pairIndex}}}.Value"))
+                        yield return nested;
+                    pairIndex++;
+                }
+                yield break;
+            case IEnumerable<FPackageIndex> packageIndexes:
+                var packageIndexPosition = 0;
+                foreach (var packageIndex in packageIndexes)
+                {
+                    if (TryBuildUsefulAssetTarget(packageIndex, out var target))
+                        yield return new PropertyAssetTarget($"{propertyPath}[{packageIndexPosition}]", target);
+                    packageIndexPosition++;
+                }
+                yield break;
+        }
+    }
+
+    private static bool TryBuildUsefulAssetTarget(FPackageIndex packageIndex, out ComponentAssetTarget target)
+    {
+        target = default;
+        if (packageIndex.IsNull)
+            return false;
+
+        UObject? loaded = null;
+        try
+        {
+            loaded = packageIndex.Load<UObject>();
+        }
+        catch
+        {
+            // 这里不吞导出错误，只跳过单个属性引用；坏 PPtr 不应让整个源索引中断。
+        }
+
+        var relationType = loaded switch
+        {
+            UStaticMesh => "StaticMesh",
+            USkeletalMesh => "SkeletalMesh",
+            UMaterialInterface => "Material",
+            UTexture => "Texture",
+            UAnimationAsset => "Animation",
+            USkeleton => "Skeleton",
+            _ => ClassifyLoadedAssetReference(loaded)
+        };
+
+        if (relationType == null)
+            return false;
+
+        target = new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name);
+        return true;
+    }
+
+    private static string? ClassifyLoadedAssetReference(UObject? loaded)
+    {
+        var exportType = loaded?.ExportType ?? loaded?.GetType().Name;
+        if (string.IsNullOrWhiteSpace(exportType))
+            return null;
+
+        if (exportType.Contains("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase))
+            return "AnimClass";
+        if (exportType.Contains("BlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase))
+            return "BlueprintClass";
+
+        return null;
+    }
+
+    private static void InsertComponentAssetRelation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        string componentObjectPath,
+        string componentType,
+        string? componentName,
+        string? componentVariableName,
+        string relationSource,
+        string relationType,
+        string? targetPath,
+        string? targetName,
+        string? socketName,
+        string? parentComponentPath,
+        CUE4Parse.UE4.Objects.Core.Math.FTransform transform)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO component_asset_relations (
+                source_path, owner_object_path, owner_type,
+                component_object_path, component_type, component_name, component_variable_name,
+                relation_source, relation_type, target_path, target_name,
+                socket_name, parent_component_path,
+                location_x, location_y, location_z,
+                rotation_pitch, rotation_yaw, rotation_roll,
+                scale_x, scale_y, scale_z
+            )
+            VALUES (
+                $sourcePath, $ownerObjectPath, $ownerType,
+                $componentObjectPath, $componentType, $componentName, $componentVariableName,
+                $relationSource, $relationType, $targetPath, $targetName,
+                $socketName, $parentComponentPath,
+                $locationX, $locationY, $locationZ,
+                $rotationPitch, $rotationYaw, $rotationRoll,
+                $scaleX, $scaleY, $scaleZ
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$ownerObjectPath", ownerObjectPath);
+        Add(command, "$ownerType", ownerType);
+        Add(command, "$componentObjectPath", componentObjectPath);
+        Add(command, "$componentType", componentType);
+        Add(command, "$componentName", componentName);
+        Add(command, "$componentVariableName", componentVariableName);
+        Add(command, "$relationSource", relationSource);
+        Add(command, "$relationType", relationType);
+        Add(command, "$targetPath", targetPath);
+        Add(command, "$targetName", targetName);
+        Add(command, "$socketName", socketName);
+        Add(command, "$parentComponentPath", parentComponentPath);
+        Add(command, "$locationX", transform.Translation.X);
+        Add(command, "$locationY", transform.Translation.Y);
+        Add(command, "$locationZ", transform.Translation.Z);
+        Add(command, "$rotationPitch", transform.Rotation.Rotator().Pitch);
+        Add(command, "$rotationYaw", transform.Rotation.Rotator().Yaw);
+        Add(command, "$rotationRoll", transform.Rotation.Rotator().Roll);
+        Add(command, "$scaleX", transform.Scale3D.X);
+        Add(command, "$scaleY", transform.Scale3D.Y);
+        Add(command, "$scaleZ", transform.Scale3D.Z);
+        command.ExecuteNonQuery();
+    }
+
+    private readonly record struct ComponentAssetTarget(string RelationType, string? TargetPath, string? TargetName)
+    {
+        public static ComponentAssetTarget FromPackageIndex(string relationType, FPackageIndex packageIndex)
+        {
+            var loaded = packageIndex.Load<UObject>();
+            return new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name);
+        }
+    }
+
+    private readonly record struct PropertyAssetTarget(string PropertyPath, ComponentAssetTarget Target);
 
     private static void InsertMontageSegments(
         SqliteConnection connection,

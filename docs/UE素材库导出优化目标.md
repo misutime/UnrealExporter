@@ -6,7 +6,7 @@
 
 UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用，并用于验证模型动画候选的 track 覆盖率和骨骼层级兼容性。
+本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、Mesh/Skeleton socket、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用。蓝图和组件层面开始记录 ComponentTemplate、SCS、继承组件覆盖和 cooked 蓝图/CDO 属性里的显式资源 PPtr，用于后续组合模型、挂点、任务道具和动画蓝图关系重建。
 
 ## 完整实现目标
 
@@ -45,7 +45,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox。
-   - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
+   - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
    - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
 
 ## 优化列表
@@ -63,9 +63,10 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `material_texture_slots`，记录材质名、slot 名、贴图路径、贴图对象路径和关系来源：`DirectParameter`、`ResolvedParams`、`ReferencedTexture`。
 - 已支持 `skeleton_bones` 和 `animation_tracks`，记录模型/骨架的 boneName、parentIndex，以及动画 track 到 skeleton bone index/boneName 的映射。
 - 已支持 `mesh_sockets`，记录 StaticMesh、SkeletalMesh、USkeleton 的 socket 名、绑定骨骼和相对 TRS，服务挂件、武器、特效和任务道具组合关系。
+- 已支持 `component_asset_relations`，从 BlueprintGeneratedClass 的 ComponentTemplates、SimpleConstructionScript、InheritableComponentHandler，以及 cooked 蓝图/CDO 属性里的显式 PPtr 记录 StaticMesh、SkeletalMesh、Material、Texture、Animation、Skeleton、AnimClass、BlueprintClass 关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
-- 下一步继续扩展 Import/Export、蓝图/组件引用和更完整依赖图，减少每次靠目录扫描和临时加载。
+- 下一步继续扩展 Import/Export、Level/Actor 实例引用和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路
 
