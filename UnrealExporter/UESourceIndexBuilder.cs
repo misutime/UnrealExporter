@@ -200,6 +200,8 @@ internal static class UESourceIndexBuilder
                 texture_path TEXT,
                 texture_name TEXT,
                 texture_object_path TEXT,
+                texture_class_name TEXT,
+                texture_class_path TEXT,
                 relation_source TEXT NOT NULL
             );
             """);
@@ -2160,11 +2162,13 @@ internal static class UESourceIndexBuilder
         command.CommandText = """
             INSERT INTO material_texture_slots (
                 source_path, material_object_path, material_name, slot_name,
-                texture_path, texture_name, texture_object_path, relation_source
+                texture_path, texture_name, texture_object_path,
+                texture_class_name, texture_class_path, relation_source
             )
             VALUES (
                 $sourcePath, $materialObjectPath, $materialName, $slotName,
-                $texturePath, $textureName, $textureObjectPath, $relationSource
+                $texturePath, $textureName, $textureObjectPath,
+                $textureClassName, $textureClassPath, $relationSource
             );
             """;
         Add(command, "$sourcePath", sourcePath);
@@ -2174,6 +2178,8 @@ internal static class UESourceIndexBuilder
         Add(command, "$texturePath", texturePath);
         Add(command, "$textureName", texture.Name);
         Add(command, "$textureObjectPath", textureObjectPath);
+        Add(command, "$textureClassName", texture.GetType().Name);
+        Add(command, "$textureClassPath", texture.GetType().FullName);
         Add(command, "$relationSource", relationSource);
         command.ExecuteNonQuery();
     }

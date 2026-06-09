@@ -651,13 +651,22 @@ internal static class UELibraryPostProcessor
 
     private static SourceMaterialTextureSlot[] LoadSourceMaterialTextureSlots(SqliteConnection connection)
     {
+        var hasTextureClassColumns = TableColumnExists(connection, "material_texture_slots", "texture_class_name");
         using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT source_path, material_object_path, material_name, slot_name,
-                   texture_path, texture_name, texture_object_path, relation_source
-            FROM material_texture_slots
-            ORDER BY material_object_path, slot_name, texture_object_path, relation_source;
-            """;
+        command.CommandText = hasTextureClassColumns
+            ? """
+                SELECT source_path, material_object_path, material_name, slot_name,
+                       texture_path, texture_name, texture_object_path,
+                       texture_class_name, texture_class_path, relation_source
+                FROM material_texture_slots
+                ORDER BY material_object_path, slot_name, texture_object_path, relation_source;
+                """
+            : """
+                SELECT source_path, material_object_path, material_name, slot_name,
+                       texture_path, texture_name, texture_object_path, relation_source
+                FROM material_texture_slots
+                ORDER BY material_object_path, slot_name, texture_object_path, relation_source;
+                """;
         using var reader = command.ExecuteReader();
         var result = new List<SourceMaterialTextureSlot>();
         while (reader.Read())
@@ -671,7 +680,9 @@ internal static class UELibraryPostProcessor
                 TexturePath = GetString(reader, 4),
                 TextureName = GetString(reader, 5),
                 TextureObjectPath = GetString(reader, 6),
-                RelationSource = GetString(reader, 7) ?? "",
+                TextureClassName = hasTextureClassColumns ? GetString(reader, 7) : null,
+                TextureClassPath = hasTextureClassColumns ? GetString(reader, 8) : null,
+                RelationSource = GetString(reader, hasTextureClassColumns ? 9 : 7) ?? "",
             });
         }
 
@@ -781,6 +792,20 @@ internal static class UELibraryPostProcessor
         return command.ExecuteScalar() != null;
     }
 
+    private static bool TableColumnExists(SqliteConnection connection, string tableName, string columnName)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({tableName});";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(GetString(reader, 1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     private static MaterialTextureSlotLink[] WriteMaterialTextureSlotLinks(
         string root,
         Dictionary<string, MaterialInfo> materialIndex,
@@ -844,7 +869,9 @@ internal static class UELibraryPostProcessor
             var material = FindMaterialInfo(materialIndex, slot.MaterialName);
             var textureLink = FindTextureLink(textureLinks, slot);
             var textureInfo = FindTextureObjectInfo(textureObjects, slot);
-            var missingCategory = textureLink == null ? ClassifyMissingTextureSlot(slot, textureInfo) : null;
+            var textureClassName = slot.TextureClassName ?? textureInfo?.ClassName;
+            var textureClassPath = slot.TextureClassPath ?? textureInfo?.ClassPath;
+            var missingCategory = textureLink == null ? ClassifyMissingTextureSlot(slot, textureInfo, textureClassName, textureClassPath) : null;
             result.Add(new MaterialTextureSlotLink
             {
                 MaterialName = slot.MaterialName ?? "",
@@ -854,8 +881,8 @@ internal static class UELibraryPostProcessor
                 TextureName = slot.TextureName,
                 TextureObjectPath = slot.TextureObjectPath,
                 TexturePath = slot.TexturePath,
-                TextureClassName = textureInfo?.ClassName,
-                TextureClassPath = textureInfo?.ClassPath,
+                TextureClassName = textureClassName,
+                TextureClassPath = textureClassPath,
                 MissingCategory = missingCategory,
                 ExportedTexture = textureLink?.RelativePath,
                 SharedTexture = textureLink?.SharedRelativePath,
@@ -863,7 +890,7 @@ internal static class UELibraryPostProcessor
                 HardLinked = textureLink?.HardLinked,
                 MatchStatus = textureLink == null ? BuildMissingTextureStatus(missingCategory) : "matched",
                 MatchReason = textureLink == null
-                    ? BuildMissingTextureReason(missingCategory, textureInfo)
+                    ? BuildMissingTextureReason(missingCategory, textureClassName)
                     : "通过 UE texture object path / texture name 匹配到已导出贴图，并关联共享贴图。",
                 RelationSource = slot.RelationSource,
             });
@@ -905,9 +932,13 @@ internal static class UELibraryPostProcessor
             : package + "." + package.Split('/').LastOrDefault();
     }
 
-    private static string ClassifyMissingTextureSlot(SourceMaterialTextureSlot slot, SourcePackageObjectMap? textureInfo)
+    private static string ClassifyMissingTextureSlot(
+        SourceMaterialTextureSlot slot,
+        SourcePackageObjectMap? textureInfo,
+        string? textureClassName,
+        string? textureClassPath)
     {
-        var classText = $"{textureInfo?.ClassName} {textureInfo?.ClassPath}".ToLowerInvariant();
+        var classText = $"{textureClassName} {textureClassPath}".ToLowerInvariant();
         var objectPath = (slot.TextureObjectPath ?? slot.TexturePath ?? "").Replace('\\', '/');
 
         if (classText.Contains("rendertarget"))
@@ -918,7 +949,7 @@ internal static class UELibraryPostProcessor
             return "materialDataTexture";
         if (objectPath.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase))
             return "engineScriptObject";
-        if (textureInfo == null)
+        if (textureInfo == null && string.IsNullOrWhiteSpace(textureClassName))
             return "unresolvedTexturePackage";
 
         return "exportedTextureMissing";
@@ -934,13 +965,13 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static string BuildMissingTextureReason(string? missingCategory, SourcePackageObjectMap? textureInfo)
+    private static string BuildMissingTextureReason(string? missingCategory, string? textureClassName)
     {
         return missingCategory switch
         {
             "runtimeRenderTarget" => "源索引记录的是运行时 RenderTarget，当前不能按普通 PNG 贴图导出。",
-            "unsupportedTextureType" => $"源索引记录的是 {textureInfo?.ClassName ?? "特殊贴图"}，当前贴图导出链路只稳定支持 Texture2D。",
-            "materialDataTexture" => $"源索引记录的是 {textureInfo?.ClassName ?? "材质数据资源"}，更像材质参数/曲线数据，暂不按普通贴图验收。",
+            "unsupportedTextureType" => $"源索引记录的是 {textureClassName ?? "特殊贴图"}，当前贴图导出链路只稳定支持 Texture2D。",
+            "materialDataTexture" => $"源索引记录的是 {textureClassName ?? "材质数据资源"}，更像材质参数/曲线数据，暂不按普通贴图验收。",
             "engineScriptObject" => "材质槽指向 UE 脚本默认对象，不是可直接导出的贴图资产。",
             "unresolvedTexturePackage" => "源索引记录了材质贴图槽，但没有在 UE 包 Import/Export 记录中定位到对应贴图对象。",
             _ => "源索引记录了普通材质贴图槽，但当前导出目录中没有找到对应 PNG/HDR。",
@@ -3388,6 +3419,8 @@ internal static class UELibraryPostProcessor
         public string? TexturePath { get; set; }
         public string? TextureName { get; set; }
         public string? TextureObjectPath { get; set; }
+        public string? TextureClassName { get; set; }
+        public string? TextureClassPath { get; set; }
         public string RelationSource { get; set; } = string.Empty;
     }
 
