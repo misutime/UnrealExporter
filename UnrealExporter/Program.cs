@@ -56,6 +56,7 @@ public class UnrealExporter
     private static string RootDir = AppContext.BaseDirectory;
     private static readonly object ManifestWriteLock = new();
     private static readonly object CatalogWriteLock = new();
+    private static readonly object AutoReferencedWriteLock = new();
 
     public static void Main(string[] args)
     {
@@ -790,6 +791,7 @@ public class UnrealExporter
                 // "D:\UnrealExporter\output\Hotta\Content\Resources\UI\Activity\Activity\DT_Activityquest_Balance"
                 var outputPath = outputDir + Path.DirectorySeparatorChar + fileName;
 
+                var normalizedFilePath = NormalizeAssetPath(file.Value.Path);
                 string regexMatch = config.Export.FirstOrDefault(
                     path =>
                         new Regex(
@@ -798,9 +800,10 @@ public class UnrealExporter
                         ).IsMatch(file.Value.Path),
                     ""
                 );
-                if (regexMatch.Length == 0 &&
-                    autoReferencedExportRules.TryGetValue(NormalizeAssetPath(file.Value.Path), out var autoRule))
-                    regexMatch = autoRule;
+                var matchedByConfig = regexMatch.Length > 0;
+                autoReferencedExportRules.TryGetValue(normalizedFilePath, out var autoReferencedRule);
+                if (!matchedByConfig && autoReferencedRule != null)
+                    regexMatch = autoReferencedRule.Rule;
 
                 bool isExclude = config.Exclude.Any(path =>
                     new Regex("^" + path + "$", RegexOptions.IgnoreCase).IsMatch(file.Value.Path)
@@ -824,6 +827,7 @@ public class UnrealExporter
 
                 if (regexMatch.Length > 0 && !isExclude && isChanged)
                 {
+                    var exportedThisFile = false;
                     // "uasset"
                     var fileType = file.Value.Path.SubstringAfterLast('.').ToLower();
 
@@ -900,6 +904,7 @@ public class UnrealExporter
                                                 }
                                                 AppendExportManifest(config, file.Value.Path, obj, outputPath + ".png", "Texture");
                                                 AppendAssetCatalog(config, BuildTextureCatalogEntry(file.Value.Path, texture, outputPath + ".png"));
+                                                exportedThisFile = true;
                                                 Interlocked.Increment(ref totalExportedFiles);
 
                                                 break;
@@ -933,6 +938,7 @@ public class UnrealExporter
                                     AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
                                     foreach (var material in allObjects.OfType<UMaterialInterface>())
                                         AppendAssetCatalog(config, BuildMaterialCatalogEntry(file.Value.Path, material, outputPath + ".json"));
+                                    exportedThisFile = true;
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
@@ -963,6 +969,7 @@ public class UnrealExporter
                                                     kvp.Value
                                                 );
                                                 AppendExportManifest(config, file.Value.Path, null, outputPath + "." + kvp.Key.SubstringAfterLast('.'), "RawPackage");
+                                                exportedThisFile = true;
                                                 Interlocked.Increment(ref totalExportedFiles);
                                             }
                                         );
@@ -1015,6 +1022,7 @@ public class UnrealExporter
                                                     Console.WriteLine($"=> {savedFilePath}");
                                                 AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
                                                 AppendAssetCatalog(config, BuildModelCatalogEntry(file.Value.Path, obj, savedFilePath));
+                                                exportedThisFile = true;
                                                 Interlocked.Increment(ref totalExportedFiles);
                                                 break;
                                             }
@@ -1075,6 +1083,7 @@ public class UnrealExporter
                                                 AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Animation");
                                                 AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, savedFilePath, outputType, "ok", null));
                                                 AppendAnimationBinding(config, file.Value.Path, animationAsset, savedFilePath, "ok", null);
+                                                exportedThisFile = true;
                                                 Interlocked.Increment(ref totalExportedFiles);
                                                 break;
                                             }
@@ -1191,6 +1200,22 @@ public class UnrealExporter
                         );
                     }
 
+                    if (autoReferencedRule != null)
+                    {
+                        AppendAutoReferencedExportDiagnostic(
+                            config,
+                            BuildAutoReferencedExportDiagnostic(
+                                "export",
+                                exportedThisFile ? "exported" : "notExported",
+                                autoReferencedRule.RelationType,
+                                autoReferencedRule.TargetPath,
+                                autoReferencedRule.SourcePath,
+                                autoReferencedRule.OutputType,
+                                exportedThisFile
+                                    ? (matchedByConfig ? "coveredByConfig" : null)
+                                    : "matchedPackageButNoExportedObject"));
+                    }
+
                     Interlocked.Increment(ref totalRegexMatches);
                 }
             }
@@ -1223,22 +1248,23 @@ public class UnrealExporter
         Console.WriteLine();
     }
 
-    private static Dictionary<string, string> BuildAutoReferencedExportRules(
+    private static Dictionary<string, AutoReferencedExportRule> BuildAutoReferencedExportRules(
         AbstractFileProvider provider,
         ConfigObj config)
     {
         if (!config.AutoExportReferencedAssets)
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            return new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
 
         var dbPath = Path.Combine(Path.GetFullPath(config.OutputDir), "ue_source_index.db");
         if (!File.Exists(dbPath))
         {
             Console.WriteLine($"WARN: auto referenced export skipped because source index is missing: {dbPath}");
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            return new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
         }
 
         var packageFiles = BuildPackageFileLookup(provider);
-        var rules = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var rules = new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
+        var diagnostics = new List<object>();
         var unresolved = 0;
         var ambiguous = 0;
 
@@ -1262,7 +1288,7 @@ public class UnrealExporter
             var targetPath = reader.GetString(1);
             if (relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
             {
-                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules);
+                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules, diagnostics);
                 continue;
             }
 
@@ -1274,29 +1300,34 @@ public class UnrealExporter
             if (string.IsNullOrWhiteSpace(suffix))
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", relationType, targetPath, null, outputType, "emptyPackageSuffix"));
                 continue;
             }
 
             if (!packageFiles.TryGetValue(suffix, out var matches) || matches.Length == 0)
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", relationType, targetPath, null, outputType, "sourcePackageNotFound"));
                 continue;
             }
 
             if (matches.Length > 1)
             {
                 ambiguous++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "ambiguous", relationType, targetPath, null, outputType, $"matchedPackages={matches.Length}"));
                 continue;
             }
 
             var filePath = matches[0];
-            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:{outputType}";
+            AddAutoReferencedExportRule(rules, diagnostics, relationType, targetPath, filePath, outputType);
         }
 
-        var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules);
+        var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules, diagnostics);
         unresolved += materialTextureResult.Unresolved;
         ambiguous += materialTextureResult.Ambiguous;
-        unresolved += AddAnimationSegmentExportRules(connection, provider, rules);
+        unresolved += AddAnimationSegmentExportRules(connection, provider, rules, diagnostics);
+
+        WriteAutoReferencedExportDiagnostics(config, diagnostics);
 
         Console.WriteLine(
             $"Auto referenced exports: {rules.Count} rule(s)" +
@@ -1308,7 +1339,8 @@ public class UnrealExporter
         SqliteConnection connection,
         AbstractFileProvider provider,
         string skeletonPath,
-        Dictionary<string, string> rules)
+        Dictionary<string, AutoReferencedExportRule> rules,
+        List<object> diagnostics)
     {
         var unresolved = 0;
         using var command = connection.CreateCommand();
@@ -1330,10 +1362,11 @@ public class UnrealExporter
             if (file == null)
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "Skeleton", skeletonPath, sourcePath, "glb", "skeletonMeshSourceNotFound"));
                 continue;
             }
 
-            rules[NormalizeAssetPath(file.Path)] = $"{Regex.Escape(file.Path)}:glb";
+            AddAutoReferencedExportRule(rules, diagnostics, "Skeleton", skeletonPath, file.Path, "glb");
         }
 
         return unresolved;
@@ -1342,7 +1375,8 @@ public class UnrealExporter
     private static (int Unresolved, int Ambiguous) AddMaterialTextureExportRules(
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
-        Dictionary<string, string> rules)
+        Dictionary<string, AutoReferencedExportRule> rules,
+        List<object> diagnostics)
     {
         if (!TableExists(connection, "material_texture_slots"))
             return (0, 0);
@@ -1364,23 +1398,26 @@ public class UnrealExporter
             if (string.IsNullOrWhiteSpace(suffix))
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "MaterialTextureSlot", texturePath, null, "png", "emptyPackageSuffix"));
                 continue;
             }
 
             if (!packageFiles.TryGetValue(suffix, out var matches) || matches.Length == 0)
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "MaterialTextureSlot", texturePath, null, "png", "sourcePackageNotFound"));
                 continue;
             }
 
             if (matches.Length > 1)
             {
                 ambiguous++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "ambiguous", "MaterialTextureSlot", texturePath, null, "png", $"matchedPackages={matches.Length}"));
                 continue;
             }
 
             var filePath = matches[0];
-            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:png";
+            AddAutoReferencedExportRule(rules, diagnostics, "MaterialTextureSlot", texturePath, filePath, "png");
         }
 
         return (unresolved, ambiguous);
@@ -1389,7 +1426,8 @@ public class UnrealExporter
     private static int AddAnimationSegmentExportRules(
         SqliteConnection connection,
         AbstractFileProvider provider,
-        Dictionary<string, string> rules)
+        Dictionary<string, AutoReferencedExportRule> rules,
+        List<object> diagnostics)
     {
         if (!TableExists(connection, "animation_segments"))
             return 0;
@@ -1414,13 +1452,103 @@ public class UnrealExporter
             if (filePath == null)
             {
                 unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "AnimationSegment", reader.GetString(0), null, "ueanim", "segmentAnimationSourceNotFound"));
                 continue;
             }
 
-            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:ueanim";
+            AddAutoReferencedExportRule(rules, diagnostics, "AnimationSegment", reader.GetString(0), filePath, "ueanim");
         }
 
         return unresolved;
+    }
+
+    private static void AddAutoReferencedExportRule(
+        Dictionary<string, AutoReferencedExportRule> rules,
+        List<object> diagnostics,
+        string relationType,
+        string targetPath,
+        string sourcePath,
+        string outputType)
+    {
+        var rule = new AutoReferencedExportRule(
+            sourcePath,
+            $"{Regex.Escape(sourcePath)}:{outputType}",
+            relationType,
+            targetPath,
+            outputType);
+        rules[NormalizeAssetPath(sourcePath)] = rule;
+        diagnostics.Add(BuildAutoReferencedExportDiagnostic(
+            "plan",
+            "planned",
+            relationType,
+            targetPath,
+            sourcePath,
+            outputType,
+            null));
+    }
+
+    private static object BuildAutoReferencedExportDiagnostic(
+        string stage,
+        string status,
+        string relationType,
+        string targetPath,
+        string? sourcePath,
+        string? outputType,
+        string? reason)
+        => new
+        {
+            stage,
+            status,
+            relationType,
+            targetPath,
+            source = sourcePath,
+            outputType,
+            reason,
+        };
+
+    private static void WriteAutoReferencedExportDiagnostics(ConfigObj config, List<object> diagnostics)
+    {
+        var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var lines = diagnostics.Select(JsonConvert.SerializeObject).ToArray();
+        File.WriteAllLines(path, lines);
+    }
+
+    private static void AppendAutoReferencedExportDiagnostic(ConfigObj config, object diagnostic)
+    {
+        var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        lock (AutoReferencedWriteLock)
+        {
+            File.AppendAllText(path, JsonConvert.SerializeObject(diagnostic) + Environment.NewLine);
+        }
+    }
+
+    private sealed class AutoReferencedExportRule
+    {
+        public AutoReferencedExportRule(
+            string sourcePath,
+            string rule,
+            string relationType,
+            string targetPath,
+            string outputType)
+        {
+            SourcePath = sourcePath;
+            Rule = rule;
+            RelationType = relationType;
+            TargetPath = targetPath;
+            OutputType = outputType;
+        }
+
+        public string SourcePath { get; }
+
+        public string Rule { get; }
+
+        public string RelationType { get; }
+
+        public string TargetPath { get; }
+
+        public string OutputType { get; }
     }
 
     private static bool TableExists(SqliteConnection connection, string tableName)
