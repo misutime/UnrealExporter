@@ -58,12 +58,13 @@ internal static class UELibraryPostProcessor
         var materialTextureSlots = WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex);
         var sharedGltfTextureLinks = RewriteGltfSharedTextureUris(root, reports, materialTextureSlots);
         var componentAssetRelations = WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex);
+        var packageObjectMaps = WritePackageObjectMaps(root, sourceIndex);
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         WriteSkeletonIndex(root, reports);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, modelAnimationRelations, animationValidation);
-        WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, modelAnimationRelations, animationValidation);
+        WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
     }
@@ -562,6 +563,7 @@ internal static class UELibraryPostProcessor
             snapshot.TracksByAnimation = LoadTracksByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
             snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
+            snapshot.PackageObjectMaps = LoadSourcePackageObjectMaps(connection);
         }
         catch (Exception ex)
         {
@@ -726,6 +728,50 @@ internal static class UELibraryPostProcessor
         return result.ToArray();
     }
 
+    private static SourcePackageObjectMap[] LoadSourcePackageObjectMaps(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "package_object_maps"))
+            return [];
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, package_name, map_type, map_index,
+                   object_name, object_path, class_name, class_path,
+                   outer_path, super_path, template_path, target_package,
+                   is_asset, is_optional, object_flags, serial_size, public_export_hash, raw_json
+            FROM package_object_maps
+            ORDER BY source_path, map_type, map_index;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<SourcePackageObjectMap>();
+        while (reader.Read())
+        {
+            result.Add(new SourcePackageObjectMap
+            {
+                SourcePath = GetString(reader, 0),
+                PackageName = GetString(reader, 1),
+                MapType = GetString(reader, 2) ?? "",
+                MapIndex = reader.GetInt32(3),
+                ObjectName = GetString(reader, 4),
+                ObjectPath = GetString(reader, 5),
+                ClassName = GetString(reader, 6),
+                ClassPath = GetString(reader, 7),
+                OuterPath = GetString(reader, 8),
+                SuperPath = GetString(reader, 9),
+                TemplatePath = GetString(reader, 10),
+                TargetPackage = GetString(reader, 11),
+                IsAsset = GetNullableBool(reader, 12),
+                IsOptional = GetNullableBool(reader, 13),
+                ObjectFlags = GetString(reader, 14),
+                SerialSize = reader.IsDBNull(15) ? null : reader.GetInt64(15),
+                PublicExportHash = GetString(reader, 16),
+                RawJson = GetString(reader, 17) ?? "{}",
+            });
+        }
+
+        return result.ToArray();
+    }
+
     private static bool TableExists(SqliteConnection connection, string tableName)
     {
         using var command = connection.CreateCommand();
@@ -849,6 +895,42 @@ internal static class UELibraryPostProcessor
 
         WriteComponentGroups(root, links);
         return links;
+    }
+
+    private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex)
+    {
+        var rows = sourceIndex.Available ? sourceIndex.PackageObjectMaps : [];
+        var path = Path.Combine(root, "package_object_maps.jsonl");
+        using var writer = new StreamWriter(path, false, Encoding.UTF8);
+        foreach (var row in rows.OrderBy(x => x.SourcePath, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.MapType, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.MapIndex))
+        {
+            writer.WriteLine(JsonConvert.SerializeObject(new
+            {
+                kind = "PackageObjectMap",
+                sourcePath = row.SourcePath,
+                packageName = row.PackageName,
+                mapType = row.MapType,
+                mapIndex = row.MapIndex,
+                objectName = row.ObjectName,
+                objectPath = row.ObjectPath,
+                className = row.ClassName,
+                classPath = row.ClassPath,
+                outerPath = row.OuterPath,
+                superPath = row.SuperPath,
+                templatePath = row.TemplatePath,
+                targetPackage = row.TargetPackage,
+                isAsset = row.IsAsset,
+                isOptional = row.IsOptional,
+                objectFlags = row.ObjectFlags,
+                serialSize = row.SerialSize,
+                publicExportHash = row.PublicExportHash,
+                raw = TryParseJson(row.RawJson),
+            }));
+        }
+
+        return rows;
     }
 
     private static ComponentAssetRelationLink[] BuildComponentAssetRelationLinks(
@@ -1648,6 +1730,7 @@ internal static class UELibraryPostProcessor
         MaterialTextureSlotLink[] materialTextureSlots,
         SharedGltfTextureLink[] sharedGltfTextureLinks,
         ComponentAssetRelationLink[] componentAssetRelations,
+        SourcePackageObjectMap[] packageObjectMaps,
         JObject modelAnimationRelations,
         AnimationValidationSummary animationValidation)
     {
@@ -1783,6 +1866,29 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE package_object_maps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT,
+                package_name TEXT,
+                map_type TEXT NOT NULL,
+                map_index INTEGER NOT NULL,
+                object_name TEXT,
+                object_path TEXT,
+                class_name TEXT,
+                class_path TEXT,
+                outer_path TEXT,
+                super_path TEXT,
+                template_path TEXT,
+                target_package TEXT,
+                is_asset INTEGER,
+                is_optional INTEGER,
+                object_flags TEXT,
+                serial_size INTEGER,
+                public_export_hash TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE model_animation_relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model TEXT NOT NULL,
@@ -1838,6 +1944,9 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_target ON component_asset_relations(relation_type, target_path);");
         Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_match ON component_asset_relations(match_status, target_asset_output);");
         Execute(connection, transaction, "CREATE INDEX idx_component_groups_model_refs ON component_groups(model_reference_count, exported_model_reference_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
@@ -1861,6 +1970,9 @@ internal static class UELibraryPostProcessor
             InsertComponentAssetRelation(connection, transaction, link);
 
         InsertComponentGroups(connection, transaction, componentAssetRelations);
+
+        foreach (var row in packageObjectMaps)
+            InsertPackageObjectMap(connection, transaction, row);
 
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
@@ -2095,6 +2207,48 @@ internal static class UELibraryPostProcessor
         }
     }
 
+    private static void InsertPackageObjectMap(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SourcePackageObjectMap row)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO package_object_maps (
+                source_path, package_name, map_type, map_index,
+                object_name, object_path, class_name, class_path,
+                outer_path, super_path, template_path, target_package,
+                is_asset, is_optional, object_flags, serial_size, public_export_hash, raw_json
+            )
+            VALUES (
+                $sourcePath, $packageName, $mapType, $mapIndex,
+                $objectName, $objectPath, $className, $classPath,
+                $outerPath, $superPath, $templatePath, $targetPackage,
+                $isAsset, $isOptional, $objectFlags, $serialSize, $publicExportHash, $rawJson
+            );
+            """;
+        Add(command, "$sourcePath", row.SourcePath);
+        Add(command, "$packageName", row.PackageName);
+        Add(command, "$mapType", row.MapType);
+        Add(command, "$mapIndex", row.MapIndex);
+        Add(command, "$objectName", row.ObjectName);
+        Add(command, "$objectPath", row.ObjectPath);
+        Add(command, "$className", row.ClassName);
+        Add(command, "$classPath", row.ClassPath);
+        Add(command, "$outerPath", row.OuterPath);
+        Add(command, "$superPath", row.SuperPath);
+        Add(command, "$templatePath", row.TemplatePath);
+        Add(command, "$targetPackage", row.TargetPackage);
+        Add(command, "$isAsset", row.IsAsset == null ? null : row.IsAsset.Value ? 1 : 0);
+        Add(command, "$isOptional", row.IsOptional == null ? null : row.IsOptional.Value ? 1 : 0);
+        Add(command, "$objectFlags", row.ObjectFlags);
+        Add(command, "$serialSize", row.SerialSize);
+        Add(command, "$publicExportHash", row.PublicExportHash);
+        Add(command, "$rawJson", row.RawJson);
+        command.ExecuteNonQuery();
+    }
+
     private static void InsertModelAnimationRelations(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -2238,8 +2392,26 @@ internal static class UELibraryPostProcessor
     private static string? GetString(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
 
+    private static bool? GetNullableBool(SqliteDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal) != 0;
+
     private static double? GetNullableDouble(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? null : reader.GetDouble(ordinal);
+
+    private static JToken? TryParseJson(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        try
+        {
+            return JToken.Parse(text);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static void WriteSkeletonIndex(string root, List<ModelValidationEntry> reports)
     {
@@ -2284,7 +2456,8 @@ internal static class UELibraryPostProcessor
         string root,
         List<ModelValidationEntry> reports,
         IEnumerable<MaterialInfo> materials,
-        ComponentAssetRelationLink[] componentAssetRelations)
+        ComponentAssetRelationLink[] componentAssetRelations,
+        SourcePackageObjectMap[] packageObjectMaps)
     {
         var sb = new StringBuilder();
         sb.AppendLine("# UE Asset Library");
@@ -2298,6 +2471,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine($"- 材质 JSON: `{materials.Count()}`");
         sb.AppendLine($"- 模型内动画: `{reports.Count(x => x.AnimationCount > 0)}`");
         sb.AppendLine($"- 蓝图/组件资源关系: `{componentAssetRelations.Length}`");
+        sb.AppendLine($"- UE 包 Import/Export 记录: `{packageObjectMaps.Length}`");
         sb.AppendLine();
         sb.AppendLine("## 索引文件");
         sb.AppendLine();
@@ -2305,7 +2479,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `asset_catalog.jsonl` | 模型、材质、贴图、动画主索引，一行一个资产。 |");
         sb.AppendLine("| `library_index.db` | 已导出素材库的 SQLite 索引，便于筛选模型、动画、贴图和关系。 |");
-        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
+        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
         sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配，并回填动画验证结果。 |");
@@ -2317,6 +2491,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `component_asset_relations.jsonl` | 蓝图、组件、默认对象到模型/材质/动画/Skeleton 的显式 UE 关系。 |");
         sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要。 |");
+        sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 原始依赖和导出对象记录。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
         sb.AppendLine("## 下一步");
@@ -2581,6 +2756,7 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceAnimationTrack[]> TracksByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
+        public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
     }
 
     private sealed class SourceBone
@@ -2640,6 +2816,28 @@ internal static class UELibraryPostProcessor
         public double? ScaleX { get; set; }
         public double? ScaleY { get; set; }
         public double? ScaleZ { get; set; }
+    }
+
+    private sealed class SourcePackageObjectMap
+    {
+        public string? SourcePath { get; set; }
+        public string? PackageName { get; set; }
+        public string MapType { get; set; } = string.Empty;
+        public int MapIndex { get; set; }
+        public string? ObjectName { get; set; }
+        public string? ObjectPath { get; set; }
+        public string? ClassName { get; set; }
+        public string? ClassPath { get; set; }
+        public string? OuterPath { get; set; }
+        public string? SuperPath { get; set; }
+        public string? TemplatePath { get; set; }
+        public string? TargetPackage { get; set; }
+        public bool? IsAsset { get; set; }
+        public bool? IsOptional { get; set; }
+        public string? ObjectFlags { get; set; }
+        public long? SerialSize { get; set; }
+        public string? PublicExportHash { get; set; }
+        public string RawJson { get; set; } = "{}";
     }
 
     private sealed class MaterialTextureSlotLink

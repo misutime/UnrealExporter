@@ -2,6 +2,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
+using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Actor;
 using CUE4Parse.UE4.Assets.Exports.Animation;
@@ -16,6 +17,7 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.WorldPartition;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
+using CUE4Parse.UE4.IO.Objects;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
 using Microsoft.Data.Sqlite;
@@ -60,7 +62,9 @@ internal static class UESourceIndexBuilder
             inspected++;
             try
             {
-                var exports = provider.LoadPackage(file).GetExports().ToArray();
+                var package = provider.LoadPackage(file);
+                InsertPackageObjectMaps(connection, transaction, file.Path, package);
+                var exports = package.GetExports().ToArray();
                 foreach (var obj in exports)
                     InsertSourceObject(connection, transaction, file, obj);
             }
@@ -146,6 +150,29 @@ internal static class UESourceIndexBuilder
                 relation_type TEXT NOT NULL,
                 target_path TEXT,
                 target_name TEXT
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE package_object_maps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                package_name TEXT,
+                map_type TEXT NOT NULL,
+                map_index INTEGER NOT NULL,
+                object_name TEXT,
+                object_path TEXT,
+                class_name TEXT,
+                class_path TEXT,
+                outer_path TEXT,
+                super_path TEXT,
+                template_path TEXT,
+                target_package TEXT,
+                is_asset INTEGER,
+                is_optional INTEGER,
+                object_flags TEXT,
+                serial_size INTEGER,
+                public_export_hash TEXT,
+                raw_json TEXT NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -310,6 +337,9 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_type ON source_objects(object_type);");
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_skeleton ON source_objects(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_source_relations_type ON source_relations(relation_type, target_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_slot ON material_texture_slots(slot_name);");
@@ -351,6 +381,306 @@ internal static class UESourceIndexBuilder
         Add(command, "$isPackage", file.IsUePackage ? 1 : 0);
         Add(command, "$isEncrypted", file.IsEncrypted ? 1 : 0);
         Add(command, "$compression", file.CompressionMethod.ToString());
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertPackageObjectMaps(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        IPackage package)
+    {
+        switch (package)
+        {
+            case Package legacyPackage:
+                InsertLegacyPackageObjectMaps(connection, transaction, sourcePath, legacyPackage);
+                break;
+            case IoPackage ioPackage:
+                InsertIoPackageObjectMaps(connection, transaction, sourcePath, ioPackage);
+                break;
+        }
+    }
+
+    private static void InsertLegacyPackageObjectMaps(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        Package package)
+    {
+        for (var index = 0; index < package.ImportMap.Length; index++)
+        {
+            var import = package.ImportMap[index];
+            var objectIndex = new FPackageIndex(package, -(index + 1));
+            var resolved = SafeResolvePackageIndex(package, objectIndex);
+            var raw = new
+            {
+                source = sourcePath,
+                package = package.Name,
+                mapType = "Import",
+                mapIndex = index,
+                import.ObjectName,
+                import.ClassPackage,
+                import.ClassName,
+                import.PackageName,
+                import.ImportOptional,
+                objectPath = resolved?.GetPathName(),
+                outerPath = resolved?.Outer?.GetPathName(),
+            };
+
+            InsertPackageObjectMapRow(
+                connection,
+                transaction,
+                sourcePath,
+                package.Name,
+                "Import",
+                index,
+                import.ObjectName.Text,
+                resolved?.GetPathName(),
+                import.ClassName.Text,
+                import.ClassPackage.Text,
+                resolved?.Outer?.GetPathName(),
+                null,
+                null,
+                import.PackageName.Text,
+                null,
+                import.ImportOptional,
+                null,
+                null,
+                null,
+                raw);
+        }
+
+        for (var index = 0; index < package.ExportMap.Length; index++)
+        {
+            var export = package.ExportMap[index];
+            var objectIndex = new FPackageIndex(package, index + 1);
+            var resolved = SafeResolvePackageIndex(package, objectIndex);
+            var raw = new
+            {
+                source = sourcePath,
+                package = package.Name,
+                mapType = "Export",
+                mapIndex = index,
+                export.ObjectName,
+                export.ClassName,
+                export.ObjectFlags,
+                export.SerialSize,
+                export.SerialOffset,
+                export.IsAsset,
+                publicExportHash = export.GetPublicExportHash(),
+                objectPath = resolved?.GetPathName(),
+                classPath = SafeResolvePackageIndexPath(package, export.ClassIndex),
+                outerPath = SafeResolvePackageIndexPath(package, export.OuterIndex),
+                superPath = SafeResolvePackageIndexPath(package, export.SuperIndex),
+                templatePath = SafeResolvePackageIndexPath(package, export.TemplateIndex),
+            };
+
+            InsertPackageObjectMapRow(
+                connection,
+                transaction,
+                sourcePath,
+                package.Name,
+                "Export",
+                index,
+                export.ObjectName.Text,
+                resolved?.GetPathName(),
+                export.ClassName,
+                SafeResolvePackageIndexPath(package, export.ClassIndex),
+                SafeResolvePackageIndexPath(package, export.OuterIndex),
+                SafeResolvePackageIndexPath(package, export.SuperIndex),
+                SafeResolvePackageIndexPath(package, export.TemplateIndex),
+                null,
+                export.IsAsset,
+                null,
+                $"0x{export.ObjectFlags:X}",
+                export.SerialSize,
+                export.GetPublicExportHash().ToString("X16"),
+                raw);
+        }
+    }
+
+    private static void InsertIoPackageObjectMaps(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        IoPackage package)
+    {
+        for (var index = 0; index < package.ImportMap.Length; index++)
+        {
+            var importIndex = package.ImportMap[index];
+            var resolved = SafeResolveObjectIndex(package, importIndex);
+            FPackageImportReference? packageImport = importIndex.IsPackageImport ? importIndex.AsPackageImportRef : null;
+            var raw = new
+            {
+                source = sourcePath,
+                package = package.Name,
+                mapType = "Import",
+                mapIndex = index,
+                type = importIndex.Type.ToString(),
+                value = importIndex.Value,
+                objectPath = resolved?.GetPathName(),
+                classPath = resolved?.Class?.GetPathName(),
+                outerPath = resolved?.Outer?.GetPathName(),
+                importedPackageIndex = packageImport?.ImportedPackageIndex,
+                importedPublicExportHashIndex = packageImport?.ImportedPublicExportHashIndex,
+            };
+
+            InsertPackageObjectMapRow(
+                connection,
+                transaction,
+                sourcePath,
+                package.Name,
+                "Import",
+                index,
+                resolved?.Name.Text ?? importIndex.Value.ToString(),
+                resolved?.GetPathName(),
+                resolved?.Class?.Name.Text,
+                resolved?.Class?.GetPathName(),
+                resolved?.Outer?.GetPathName(),
+                resolved?.Super?.GetPathName(),
+                null,
+                packageImport?.ImportedPackageIndex.ToString(),
+                null,
+                null,
+                null,
+                null,
+                null,
+                raw);
+        }
+
+        for (var index = 0; index < package.ExportMap.Length; index++)
+        {
+            var export = package.ExportMap[index];
+            var objectName = package.CreateFNameFromMappedName(export.ObjectName).Text;
+            var resolved = SafeResolveObjectIndex(package, new FPackageObjectIndex((ulong)index));
+            var raw = new
+            {
+                source = sourcePath,
+                package = package.Name,
+                mapType = "Export",
+                mapIndex = index,
+                objectName,
+                objectFlags = export.ObjectFlags.ToString(),
+                export.CookedSerialSize,
+                export.CookedSerialOffset,
+                export.PublicExportHash,
+                objectPath = resolved?.GetPathName(),
+                classPath = SafeResolveObjectIndexPath(package, export.ClassIndex),
+                outerPath = SafeResolveObjectIndexPath(package, export.OuterIndex),
+                superPath = SafeResolveObjectIndexPath(package, export.SuperIndex),
+                templatePath = SafeResolveObjectIndexPath(package, export.TemplateIndex),
+            };
+
+            InsertPackageObjectMapRow(
+                connection,
+                transaction,
+                sourcePath,
+                package.Name,
+                "Export",
+                index,
+                objectName,
+                resolved?.GetPathName(),
+                SafeResolveObjectIndex(package, export.ClassIndex)?.Name.Text,
+                SafeResolveObjectIndexPath(package, export.ClassIndex),
+                SafeResolveObjectIndexPath(package, export.OuterIndex),
+                SafeResolveObjectIndexPath(package, export.SuperIndex),
+                SafeResolveObjectIndexPath(package, export.TemplateIndex),
+                null,
+                export.ObjectFlags.HasFlag(EObjectFlags.RF_Public),
+                null,
+                export.ObjectFlags.ToString(),
+                (long)export.CookedSerialSize,
+                export.PublicExportHash.ToString("X16"),
+                raw);
+        }
+    }
+
+    private static ResolvedObject? SafeResolvePackageIndex(IPackage package, FPackageIndex? index)
+    {
+        try
+        {
+            return package.ResolvePackageIndex(index);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? SafeResolvePackageIndexPath(IPackage package, FPackageIndex? index)
+        => SafeResolvePackageIndex(package, index)?.GetPathName();
+
+    private static ResolvedObject? SafeResolveObjectIndex(IoPackage package, FPackageObjectIndex index)
+    {
+        try
+        {
+            return package.ResolveObjectIndex(index);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? SafeResolveObjectIndexPath(IoPackage package, FPackageObjectIndex index)
+        => SafeResolveObjectIndex(package, index)?.GetPathName();
+
+    private static void InsertPackageObjectMapRow(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string packageName,
+        string mapType,
+        int mapIndex,
+        string? objectName,
+        string? objectPath,
+        string? className,
+        string? classPath,
+        string? outerPath,
+        string? superPath,
+        string? templatePath,
+        string? targetPackage,
+        bool? isAsset,
+        bool? isOptional,
+        string? objectFlags,
+        long? serialSize,
+        string? publicExportHash,
+        object raw)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO package_object_maps (
+                source_path, package_name, map_type, map_index,
+                object_name, object_path, class_name, class_path,
+                outer_path, super_path, template_path, target_package,
+                is_asset, is_optional, object_flags, serial_size, public_export_hash, raw_json
+            )
+            VALUES (
+                $sourcePath, $packageName, $mapType, $mapIndex,
+                $objectName, $objectPath, $className, $classPath,
+                $outerPath, $superPath, $templatePath, $targetPackage,
+                $isAsset, $isOptional, $objectFlags, $serialSize, $publicExportHash, $rawJson
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$packageName", packageName);
+        Add(command, "$mapType", mapType);
+        Add(command, "$mapIndex", mapIndex);
+        Add(command, "$objectName", objectName);
+        Add(command, "$objectPath", objectPath);
+        Add(command, "$className", className);
+        Add(command, "$classPath", classPath);
+        Add(command, "$outerPath", outerPath);
+        Add(command, "$superPath", superPath);
+        Add(command, "$templatePath", templatePath);
+        Add(command, "$targetPackage", targetPackage);
+        Add(command, "$isAsset", isAsset.HasValue ? isAsset.Value ? 1 : 0 : null);
+        Add(command, "$isOptional", isOptional.HasValue ? isOptional.Value ? 1 : 0 : null);
+        Add(command, "$objectFlags", objectFlags);
+        Add(command, "$serialSize", serialSize);
+        Add(command, "$publicExportHash", publicExportHash);
+        Add(command, "$rawJson", JsonConvert.SerializeObject(raw));
         command.ExecuteNonQuery();
     }
 
