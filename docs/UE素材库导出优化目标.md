@@ -36,7 +36,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
 
 5. 模型动画关系
-   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section 和子动画引用，不能只报一个无 track 的 warning。
+   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section、子动画引用和子动画导出完整度，不能只报一个无 track 的 warning。
    - 未匹配时保留 `NoMatchingAnimationExported`，不硬猜。
    - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 

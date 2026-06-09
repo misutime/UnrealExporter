@@ -1671,6 +1671,11 @@ internal static class UELibraryPostProcessor
                 trackCoverage = x.TrackCoverage,
                 hierarchyCompatible = x.HierarchyCompatible,
                 isContainerAnimation = x.IsContainerAnimation,
+                referencedAnimationCount = x.ReferencedAnimations.Length,
+                exportedReferencedAnimationCount = x.ExportedReferencedAnimations.Length,
+                missingReferencedAnimationCount = x.MissingReferencedAnimations.Length,
+                referencedAnimations = x.ReferencedAnimations.Take(64).ToArray(),
+                missingReferencedAnimations = x.MissingReferencedAnimations.Take(64).ToArray(),
                 hierarchyMismatchCount = x.HierarchyMismatches.Length,
                 hierarchyMismatches = x.HierarchyMismatches.Take(32).ToArray(),
             })),
@@ -1693,6 +1698,7 @@ internal static class UELibraryPostProcessor
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
             .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+        var allAnimations = animations.Values.SelectMany(x => x).ToArray();
 
         var result = new List<AnimationValidationEntry>();
         foreach (var model in models)
@@ -1702,7 +1708,7 @@ internal static class UELibraryPostProcessor
                 continue;
 
             foreach (var animation in matchedAnimations)
-                result.Add(ValidateAnimationPair(model, animation, sourceIndex));
+                result.Add(ValidateAnimationPair(model, animation, allAnimations, sourceIndex));
         }
 
         return result
@@ -1714,6 +1720,7 @@ internal static class UELibraryPostProcessor
     private static AnimationValidationEntry ValidateAnimationPair(
         JObject model,
         JObject animation,
+        JObject[] allAnimations,
         SourceIndexSnapshot sourceIndex)
     {
         var skeletonPath = (string?)model["skeletonPath"];
@@ -1731,6 +1738,11 @@ internal static class UELibraryPostProcessor
         var trackCoverage = namedTrackCount == 0 ? 0 : Math.Round((double)matchedTrackBones / namedTrackCount, 4);
         var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex);
         var isContainerAnimation = IsContainerAnimation(animation);
+        var referencedAnimations = BuildReferencedAnimationPaths(animation);
+        var exportedReferencedAnimations = FindExportedReferencedAnimations(referencedAnimations, allAnimations);
+        var missingReferencedAnimations = referencedAnimations
+            .Where(x => !exportedReferencedAnimations.Contains(x, StringComparer.OrdinalIgnoreCase))
+            .ToArray();
         var status = "ok";
         var validationCategory = "directTrack";
         var reason = "Skeleton 路径一致，动画 track 骨骼被模型骨架覆盖，重叠骨骼层级兼容。";
@@ -1751,9 +1763,18 @@ internal static class UELibraryPostProcessor
         {
             if (isContainerAnimation)
             {
-                status = "ok";
-                validationCategory = "containerAnimation";
-                reason = "这是 Montage/Composite 容器动画，本身没有直接 bone track；已保留 segment/section 和引用 AnimSequence 关系。";
+                if (missingReferencedAnimations.Length > 0)
+                {
+                    status = "warning";
+                    validationCategory = "missingContainerReferences";
+                    reason = "这是 Montage/Composite 容器动画，本身没有直接 bone track；部分 segment 引用的子动画尚未导出。";
+                }
+                else
+                {
+                    status = "ok";
+                    validationCategory = "containerAnimation";
+                    reason = "这是 Montage/Composite 容器动画，本身没有直接 bone track；segment/section 引用的子动画已导出。";
+                }
             }
             else
             {
@@ -1796,6 +1817,9 @@ internal static class UELibraryPostProcessor
             TrackCoverage = trackCoverage,
             HierarchyCompatible = hierarchyMismatches.Length == 0,
             IsContainerAnimation = isContainerAnimation,
+            ReferencedAnimations = referencedAnimations,
+            ExportedReferencedAnimations = exportedReferencedAnimations,
+            MissingReferencedAnimations = missingReferencedAnimations,
             HierarchyMismatches = hierarchyMismatches,
         };
     }
@@ -1803,6 +1827,50 @@ internal static class UELibraryPostProcessor
     private static bool IsContainerAnimation(JObject animation)
         => animation["segments"] is JArray segments && segments.Count > 0
            || animation["sections"] is JArray sections && sections.Count > 0;
+
+    private static string[] BuildReferencedAnimationPaths(JObject animation)
+    {
+        return ((JArray?)animation["segments"] ?? [])
+            .Select(x => (string?)x["referencedAnimationPath"])
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string[] FindExportedReferencedAnimations(string[] referencedAnimations, JObject[] allAnimations)
+    {
+        if (referencedAnimations.Length == 0)
+            return [];
+
+        var result = new List<string>();
+        foreach (var referenced in referencedAnimations)
+        {
+            var matched = allAnimations.Any(animation =>
+                string.Equals((string?)animation["objectPath"], referenced, StringComparison.OrdinalIgnoreCase) ||
+                AnimationSourceMatchesReference((string?)animation["source"], referenced) ||
+                AnimationSourceMatchesReference((string?)animation["output"], referenced));
+            if (matched)
+                result.Add(referenced);
+        }
+
+        return result.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static bool AnimationSourceMatchesReference(string? sourceOrOutput, string referencedObjectPath)
+    {
+        var packageSuffix = BuildPackageSuffix(referencedObjectPath);
+        if (string.IsNullOrWhiteSpace(sourceOrOutput) || string.IsNullOrWhiteSpace(packageSuffix))
+            return false;
+
+        var normalized = sourceOrOutput.Replace('\\', '/');
+        var extension = Path.GetExtension(normalized);
+        if (!string.IsNullOrWhiteSpace(extension))
+            normalized = normalized[..^extension.Length];
+        return normalized.EndsWith(packageSuffix.TrimStart('/'), StringComparison.OrdinalIgnoreCase) ||
+               normalized.EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static ModelBoneLookup FindModelBones(JObject model, string? skeletonPath, SourceIndexSnapshot sourceIndex)
     {
@@ -1925,6 +1993,9 @@ internal static class UELibraryPostProcessor
                         trackCoverage = validation?.TrackCoverage,
                         hierarchyCompatible = validation?.HierarchyCompatible,
                         isContainerAnimation = validation?.IsContainerAnimation,
+                        exportedReferencedAnimationCount = validation?.ExportedReferencedAnimations.Length,
+                        missingReferencedAnimationCount = validation?.MissingReferencedAnimations.Length,
+                        missingReferencedAnimations = validation?.MissingReferencedAnimations.Take(32).ToArray(),
                         missingTrackBones = validation?.MissingTrackBones.Take(32).ToArray(),
                     };
                 })
@@ -3637,6 +3708,9 @@ internal static class UELibraryPostProcessor
         public double TrackCoverage { get; set; }
         public bool HierarchyCompatible { get; set; }
         public bool IsContainerAnimation { get; set; }
+        public string[] ReferencedAnimations { get; set; } = [];
+        public string[] ExportedReferencedAnimations { get; set; } = [];
+        public string[] MissingReferencedAnimations { get; set; } = [];
         public string[] HierarchyMismatches { get; set; } = [];
     }
 }
