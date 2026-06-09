@@ -172,6 +172,40 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE animation_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                animation_object_path TEXT,
+                skeleton_path TEXT,
+                segment_index INTEGER NOT NULL,
+                slot_name TEXT,
+                referenced_animation_path TEXT,
+                referenced_animation_name TEXT,
+                start_pos REAL NOT NULL,
+                anim_start_time REAL NOT NULL,
+                anim_end_time REAL NOT NULL,
+                play_rate REAL NOT NULL,
+                looping_count INTEGER NOT NULL,
+                length REAL NOT NULL,
+                relation_source TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                animation_object_path TEXT,
+                section_index INTEGER NOT NULL,
+                section_name TEXT,
+                next_section_name TEXT,
+                slot_index INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL,
+                segment_begin_time REAL NOT NULL,
+                link_method TEXT,
+                cached_link_method TEXT
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE source_index_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -188,6 +222,9 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_skeleton ON skeleton_bones(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_animation ON animation_tracks(animation_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_skeleton ON animation_tracks(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_segments_animation ON animation_segments(animation_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_segments_reference ON animation_segments(referenced_animation_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_sections_animation ON animation_sections(animation_object_path);");
     }
 
     private static void InsertSourceFile(SqliteConnection connection, SqliteTransaction transaction, GameFile file)
@@ -295,6 +332,145 @@ internal static class UESourceIndexBuilder
 
         if (animSequence != null)
             InsertAnimationTracks(connection, transaction, file.Path, animSequence, skeletonPath);
+
+        if (obj is UAnimMontage montage)
+            InsertMontageSegments(connection, transaction, file.Path, montage, skeletonPath);
+
+        if (obj is UAnimComposite composite)
+            InsertCompositeSegments(connection, transaction, file.Path, composite, skeletonPath);
+    }
+
+    private static void InsertMontageSegments(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UAnimMontage montage,
+        string? skeletonPath)
+    {
+        var segmentIndex = 0;
+        foreach (var slotTrack in montage.SlotAnimTracks)
+        {
+            foreach (var segment in slotTrack.AnimTrack.AnimSegments)
+            {
+                InsertAnimationSegment(
+                    connection,
+                    transaction,
+                    sourcePath,
+                    montage.GetPathName(),
+                    skeletonPath,
+                    segmentIndex++,
+                    slotTrack.SlotName.Text,
+                    segment,
+                    "MontageSlot");
+            }
+        }
+
+        for (var sectionIndex = 0; sectionIndex < montage.CompositeSections.Length; sectionIndex++)
+            InsertAnimationSection(connection, transaction, sourcePath, montage.GetPathName(), sectionIndex, montage.CompositeSections[sectionIndex]);
+    }
+
+    private static void InsertCompositeSegments(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UAnimComposite composite,
+        string? skeletonPath)
+    {
+        for (var segmentIndex = 0; segmentIndex < composite.AnimationTrack.AnimSegments.Length; segmentIndex++)
+        {
+            InsertAnimationSegment(
+                connection,
+                transaction,
+                sourcePath,
+                composite.GetPathName(),
+                skeletonPath,
+                segmentIndex,
+                null,
+                composite.AnimationTrack.AnimSegments[segmentIndex],
+                "CompositeTrack");
+        }
+    }
+
+    private static void InsertAnimationSegment(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string animationObjectPath,
+        string? skeletonPath,
+        int segmentIndex,
+        string? slotName,
+        FAnimSegment segment,
+        string relationSource)
+    {
+        var referencedAnimationPath = GetPackageIndexPath(segment.AnimReference);
+        var referencedAnimation = segment.AnimReference.Load<UAnimSequenceBase>();
+        if (!string.IsNullOrWhiteSpace(referencedAnimationPath))
+            InsertRelation(connection, transaction, sourcePath, animationObjectPath, "AnimationSegment", referencedAnimationPath, referencedAnimation?.Name);
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO animation_segments (
+                source_path, animation_object_path, skeleton_path, segment_index, slot_name,
+                referenced_animation_path, referenced_animation_name,
+                start_pos, anim_start_time, anim_end_time, play_rate, looping_count, length,
+                relation_source
+            )
+            VALUES (
+                $sourcePath, $animationObjectPath, $skeletonPath, $segmentIndex, $slotName,
+                $referencedAnimationPath, $referencedAnimationName,
+                $startPos, $animStartTime, $animEndTime, $playRate, $loopingCount, $length,
+                $relationSource
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$animationObjectPath", animationObjectPath);
+        Add(command, "$skeletonPath", skeletonPath);
+        Add(command, "$segmentIndex", segmentIndex);
+        Add(command, "$slotName", slotName);
+        Add(command, "$referencedAnimationPath", referencedAnimationPath);
+        Add(command, "$referencedAnimationName", referencedAnimation?.Name);
+        Add(command, "$startPos", segment.StartPos);
+        Add(command, "$animStartTime", segment.AnimStartTime);
+        Add(command, "$animEndTime", segment.AnimEndTime);
+        Add(command, "$playRate", segment.AnimPlayRate);
+        Add(command, "$loopingCount", segment.LoopingCount);
+        Add(command, "$length", segment.GetLength());
+        Add(command, "$relationSource", relationSource);
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertAnimationSection(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string animationObjectPath,
+        int sectionIndex,
+        FCompositeSection section)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO animation_sections (
+                source_path, animation_object_path, section_index, section_name, next_section_name,
+                slot_index, segment_index, segment_begin_time, link_method, cached_link_method
+            )
+            VALUES (
+                $sourcePath, $animationObjectPath, $sectionIndex, $sectionName, $nextSectionName,
+                $slotIndex, $segmentIndex, $segmentBeginTime, $linkMethod, $cachedLinkMethod
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$animationObjectPath", animationObjectPath);
+        Add(command, "$sectionIndex", sectionIndex);
+        Add(command, "$sectionName", section.SectionName.Text);
+        Add(command, "$nextSectionName", section.NextSectionName.Text);
+        Add(command, "$slotIndex", section.SlotIndex);
+        Add(command, "$segmentIndex", section.SegmentIndex);
+        Add(command, "$segmentBeginTime", section.SegmentBeginTime);
+        Add(command, "$linkMethod", section.LinkMethod.ToString());
+        Add(command, "$cachedLinkMethod", section.CachedLinkMethod.ToString());
+        command.ExecuteNonQuery();
     }
 
     private static void InsertSkeletonBones(

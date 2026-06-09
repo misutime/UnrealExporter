@@ -1321,6 +1321,8 @@ public class UnrealExporter
             frameCount = sequence?.NumFrames,
             trackCount = sequence?.GetNumTracks(),
             trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            segments = BuildAnimationSegmentEntries(asset),
+            sections = BuildAnimationSectionEntries(asset),
             compression = sequence?.CompressedDataStructure?.GetType().Name,
             requiresAcl = NeedsAclNative(asset),
             additiveType = sequence?.AdditiveAnimType.ToString(),
@@ -1358,6 +1360,8 @@ public class UnrealExporter
             frameCount = sequence?.NumFrames,
             trackCount = sequence?.GetNumTracks(),
             trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            segments = BuildAnimationSegmentEntries(asset),
+            sections = BuildAnimationSectionEntries(asset),
             compression = sequence?.CompressedDataStructure?.GetType().Name,
             requiresAcl = NeedsAclNative(asset),
             additiveType = sequence?.AdditiveAnimType.ToString(),
@@ -1369,6 +1373,70 @@ public class UnrealExporter
         {
             File.AppendAllText(path, JsonConvert.SerializeObject(entry) + Environment.NewLine);
         }
+    }
+
+    private static object[] BuildAnimationSegmentEntries(UAnimationAsset? asset)
+    {
+        if (asset == null)
+            return [];
+
+        var result = new List<object>();
+        if (asset is UAnimMontage montage)
+        {
+            var segmentIndex = 0;
+            foreach (var slotTrack in montage.SlotAnimTracks)
+            {
+                foreach (var segment in slotTrack.AnimTrack.AnimSegments)
+                    result.Add(BuildAnimationSegmentEntry(segmentIndex++, slotTrack.SlotName.Text, segment, "MontageSlot"));
+            }
+        }
+        else if (asset is UAnimComposite composite)
+        {
+            for (var segmentIndex = 0; segmentIndex < composite.AnimationTrack.AnimSegments.Length; segmentIndex++)
+                result.Add(BuildAnimationSegmentEntry(segmentIndex, null, composite.AnimationTrack.AnimSegments[segmentIndex], "CompositeTrack"));
+        }
+
+        return result.ToArray();
+    }
+
+    private static object BuildAnimationSegmentEntry(int segmentIndex, string? slotName, FAnimSegment segment, string relationSource)
+    {
+        var referencedAnimation = segment.AnimReference.Load<UAnimSequenceBase>();
+        return new
+        {
+            segmentIndex,
+            slotName,
+            relationSource,
+            referencedAnimationPath = GetPackageIndexPath(segment.AnimReference),
+            referencedAnimationName = referencedAnimation?.Name,
+            startPos = segment.StartPos,
+            animStartTime = segment.AnimStartTime,
+            animEndTime = segment.AnimEndTime,
+            playRate = segment.AnimPlayRate,
+            loopingCount = segment.LoopingCount,
+            length = segment.GetLength(),
+        };
+    }
+
+    private static object[] BuildAnimationSectionEntries(UAnimationAsset? asset)
+    {
+        if (asset is not UAnimMontage montage)
+            return [];
+
+        return montage.CompositeSections
+            .Select((section, sectionIndex) => new
+            {
+                sectionIndex,
+                sectionName = section.SectionName.Text,
+                nextSectionName = section.NextSectionName.Text,
+                slotIndex = section.SlotIndex,
+                segmentIndex = section.SegmentIndex,
+                segmentBeginTime = section.SegmentBeginTime,
+                linkMethod = section.LinkMethod.ToString(),
+                cachedLinkMethod = section.CachedLinkMethod.ToString(),
+            })
+            .Cast<object>()
+            .ToArray();
     }
 
     private static void WriteAnimationDiagnostic(
