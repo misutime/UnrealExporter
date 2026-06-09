@@ -14,7 +14,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 默认导出 StaticMesh 与 SkeletalMesh 为 GLB/glTF。
    - SkeletalMesh 必须保留 skin、joint、骨骼名、材质槽和 UE Skeleton 引用。
    - StaticMesh 也要进入素材库，不因“没有骨骼”被排除；建筑、环境、道具、车辆都属于有效 3D 游戏素材。
-   - 模型 catalog 必须记录 UE 源包路径、对象路径、输出路径、资源分类、材质数量、骨骼数量、bbox 和验证状态。
+   - 模型 catalog 必须记录 UE 源包路径、对象路径、输出路径、资源分类、材质数量、UE 原始材质槽、骨骼数量、bbox 和验证状态。
 
 2. 贴图与材质
    - PNG/HDR sidecar 继续导出，但要统一进入 `Textures/_Shared`，原目录使用硬链接减少重复。

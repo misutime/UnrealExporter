@@ -1727,6 +1727,7 @@ public class UnrealExporter
             hasSkeleton = isSkeletal,
             boneCount = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Length ?? 0,
             materialCount = skeletalMesh?.SkeletalMaterials?.Length ?? staticMesh?.Materials?.Length ?? 0,
+            materialSlots = BuildModelMaterialSlots(staticMesh, skeletalMesh),
             morphTargetCount = skeletalMesh?.MorphTargets?.Length ?? 0,
             socketCount = CountModelSockets(staticMesh, skeletalMesh),
             socketNames = BuildModelSocketNames(staticMesh, skeletalMesh),
@@ -1734,6 +1735,41 @@ public class UnrealExporter
             skeletonName = skeletalMesh?.Skeleton?.Name,
             boneNames = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Select(x => x.Name.Text).ToArray(),
         };
+    }
+
+    private static object[] BuildModelMaterialSlots(UStaticMesh? staticMesh, USkeletalMesh? skeletalMesh)
+    {
+        if (skeletalMesh != null)
+        {
+            return skeletalMesh.SkeletalMaterials
+                .Select((slot, index) => new
+                {
+                    index,
+                    slotName = slot.MaterialSlotName.Text,
+                    importedSlotName = slot.ImportedMaterialSlotName?.Text,
+                    materialName = slot.Material?.Name.Text,
+                    materialObjectPath = slot.Material?.GetPathName(),
+                })
+                .Cast<object>()
+                .ToArray();
+        }
+
+        if (staticMesh?.StaticMaterials != null)
+        {
+            return staticMesh.StaticMaterials
+                .Select((slot, index) => new
+                {
+                    index,
+                    slotName = slot.MaterialSlotName.Text,
+                    importedSlotName = slot.ImportedMaterialSlotName.Text,
+                    materialName = slot.MaterialInterface?.Name.Text,
+                    materialObjectPath = slot.MaterialInterface?.GetPathName(),
+                })
+                .Cast<object>()
+                .ToArray();
+        }
+
+        return [];
     }
 
     private static int CountModelSockets(UStaticMesh? staticMesh, USkeletalMesh? skeletalMesh)
