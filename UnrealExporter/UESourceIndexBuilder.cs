@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Actor;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.Component;
 using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
@@ -465,14 +466,22 @@ internal static class UESourceIndexBuilder
         if (obj is UBlueprintGeneratedClass blueprintClass)
             InsertBlueprintComponentRelations(connection, transaction, file.Path, blueprintClass);
 
+        if (obj is ULevel level)
+            InsertLevelActorRelations(connection, transaction, file.Path, level);
+
+        if (obj is AActor actor)
+            InsertActorComponentRelations(connection, transaction, file.Path, actor, "ActorComponent");
+
         if (obj is USceneComponent sceneComponent)
         {
             var ownerPath = GetComponentOwnerObjectPath(sceneComponent);
             InsertComponentAssetRelations(connection, transaction, file.Path, ownerPath, "ComponentOuter", sceneComponent, null, "ExportedComponent");
         }
 
-        if (ShouldScanBlueprintPropertyReferences(obj))
-            InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj);
+        if (obj is AActor)
+            InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj, "ActorProperty");
+        else if (ShouldScanBlueprintPropertyReferences(obj))
+            InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj, "BlueprintProperty");
     }
 
     private static void InsertBlueprintComponentRelations(
@@ -555,6 +564,68 @@ internal static class UESourceIndexBuilder
             return componentPath[..dotSeparator];
 
         return componentPath;
+    }
+
+    private static void InsertLevelActorRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        ULevel level)
+    {
+        var ownerPath = level.GetPathName();
+        if (level.Actors == null)
+            return;
+
+        for (var actorIndex = 0; actorIndex < level.Actors.Length; actorIndex++)
+        {
+            if (!TryLoadPackageIndex(level.Actors[actorIndex], out AActor? actor))
+                continue;
+
+            InsertComponentAssetRelation(
+                connection,
+                transaction,
+                sourcePath,
+                ownerPath,
+                level.GetType().Name,
+                actor.GetPathName(),
+                actor.GetType().Name,
+                actor.Name,
+                $"Actors[{actorIndex}]",
+                "LevelActor",
+                "Actor",
+                actor.GetPathName(),
+                actor.Name,
+                null,
+                null,
+                CUE4Parse.UE4.Objects.Core.Math.FTransform.Identity);
+        }
+    }
+
+    private static void InsertActorComponentRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        AActor actor,
+        string relationSource)
+    {
+        var ownerPath = actor.GetPathName();
+        var seenComponents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in EnumerateComponentReferences(actor.Properties, "Property"))
+        {
+            if (!seenComponents.Add($"{reference.PropertyPath}:{reference.Component.GetPathName()}"))
+                continue;
+
+            InsertComponentAssetRelations(
+                connection,
+                transaction,
+                sourcePath,
+                ownerPath,
+                actor.GetType().Name,
+                reference.Component,
+                reference.PropertyPath,
+                relationSource,
+                seenComponents: null);
+        }
     }
 
     private static void InsertComponentAssetRelations(
@@ -710,7 +781,8 @@ internal static class UESourceIndexBuilder
         SqliteConnection connection,
         SqliteTransaction transaction,
         string sourcePath,
-        UObject obj)
+        UObject obj,
+        string relationSource)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var reference in EnumeratePropertyAssetTargets(obj.Properties, "Property"))
@@ -729,7 +801,7 @@ internal static class UESourceIndexBuilder
                 obj.GetType().Name,
                 obj.Name,
                 reference.PropertyPath,
-                "BlueprintProperty",
+                relationSource,
                 reference.Target.RelationType,
                 reference.Target.TargetPath,
                 reference.Target.TargetName,
@@ -746,6 +818,68 @@ internal static class UESourceIndexBuilder
             var propertyPath = $"{pathPrefix}.{property.Name.Text}";
             foreach (var target in EnumeratePropertyAssetTargets(property.Tag, propertyPath))
                 yield return target;
+        }
+    }
+
+    private static IEnumerable<ComponentReference> EnumerateComponentReferences(IEnumerable<FPropertyTag> properties, string pathPrefix)
+    {
+        foreach (var property in properties)
+        {
+            var propertyPath = $"{pathPrefix}.{property.Name.Text}";
+            foreach (var target in EnumerateComponentReferences(property.Tag, propertyPath))
+                yield return target;
+        }
+    }
+
+    private static IEnumerable<ComponentReference> EnumerateComponentReferences(FPropertyTagType? tag, string propertyPath)
+    {
+        if (tag == null)
+            yield break;
+
+        foreach (var target in EnumerateComponentReferences(tag.GenericValue, propertyPath))
+            yield return target;
+    }
+
+    private static IEnumerable<ComponentReference> EnumerateComponentReferences(object? value, string propertyPath)
+    {
+        switch (value)
+        {
+            case null:
+                yield break;
+            case FPackageIndex packageIndex when TryLoadPackageIndex(packageIndex, out USceneComponent? component):
+                yield return new ComponentReference(propertyPath, component);
+                yield break;
+            case FStructFallback fallback:
+                foreach (var nested in EnumerateComponentReferences(fallback.Properties, propertyPath))
+                    yield return nested;
+                yield break;
+            case UScriptArray array:
+                for (var index = 0; index < array.Properties.Count; index++)
+                {
+                    foreach (var nested in EnumerateComponentReferences(array.Properties[index], $"{propertyPath}[{index}]"))
+                        yield return nested;
+                }
+                yield break;
+            case UScriptMap map:
+                var pairIndex = 0;
+                foreach (var pair in map.Properties)
+                {
+                    foreach (var nested in EnumerateComponentReferences(pair.Key, $"{propertyPath}{{{pairIndex}}}.Key"))
+                        yield return nested;
+                    foreach (var nested in EnumerateComponentReferences(pair.Value, $"{propertyPath}{{{pairIndex}}}.Value"))
+                        yield return nested;
+                    pairIndex++;
+                }
+                yield break;
+            case IEnumerable<FPackageIndex> packageIndexes:
+                var packageIndexPosition = 0;
+                foreach (var packageIndex in packageIndexes)
+                {
+                    if (TryLoadPackageIndex(packageIndex, out USceneComponent? component))
+                        yield return new ComponentReference($"{propertyPath}[{packageIndexPosition}]", component);
+                    packageIndexPosition++;
+                }
+                yield break;
         }
     }
 
@@ -922,6 +1056,8 @@ internal static class UESourceIndexBuilder
             return new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name);
         }
     }
+
+    private readonly record struct ComponentReference(string PropertyPath, USceneComponent Component);
 
     private readonly record struct PropertyAssetTarget(string PropertyPath, ComponentAssetTarget Target);
 
