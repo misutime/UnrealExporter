@@ -3,8 +3,10 @@ using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
+using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Objects.UObject;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
@@ -134,6 +136,19 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE material_texture_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                material_object_path TEXT,
+                material_name TEXT,
+                slot_name TEXT,
+                texture_path TEXT,
+                texture_name TEXT,
+                texture_object_path TEXT,
+                relation_source TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE source_index_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -143,6 +158,9 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_type ON source_objects(object_type);");
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_skeleton ON source_objects(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_source_relations_type ON source_relations(relation_type, target_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_slot ON material_texture_slots(slot_name);");
     }
 
     private static void InsertSourceFile(SqliteConnection connection, SqliteTransaction transaction, GameFile file)
@@ -238,6 +256,128 @@ internal static class UESourceIndexBuilder
             foreach (var material in staticMesh.Materials.Where(x => x != null))
                 InsertRelation(connection, transaction, file.Path, obj.GetPathName(), "Material", material!.GetPathName(), material.Name.Text);
         }
+
+        if (obj is UMaterialInterface materialInterface)
+            InsertMaterialTextureSlots(connection, transaction, file.Path, materialInterface);
+    }
+
+    private static void InsertMaterialTextureSlots(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UMaterialInterface material)
+    {
+        var materialObjectPath = material.GetPathName();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (material is UMaterialInstanceConstant materialInstance)
+        {
+            foreach (var parameter in materialInstance.TextureParameterValues)
+            {
+                var texture = parameter.ParameterValue.Load<UTexture>();
+                if (texture == null)
+                    continue;
+
+                InsertMaterialTextureSlot(
+                    connection,
+                    transaction,
+                    seen,
+                    sourcePath,
+                    materialObjectPath,
+                    material.Name,
+                    parameter.Name,
+                    GetPackageIndexPath(parameter.ParameterValue),
+                    texture,
+                    "DirectParameter");
+            }
+        }
+
+        try
+        {
+            var parameters = new CMaterialParams2();
+            material.GetParams(parameters, EMaterialFormat.AllLayers);
+            foreach (var (slotName, textureMaterial) in parameters.Textures)
+            {
+                if (textureMaterial is not UTexture texture)
+                    continue;
+
+                InsertMaterialTextureSlot(
+                    connection,
+                    transaction,
+                    seen,
+                    sourcePath,
+                    materialObjectPath,
+                    material.Name,
+                    slotName,
+                    texture.GetPathName(),
+                    texture,
+                    "ResolvedParams");
+            }
+        }
+        catch (Exception ex)
+        {
+            InsertError(connection, transaction, sourcePath, $"Material texture slots failed: {materialObjectPath}: {ex.Message}");
+        }
+
+        if (material is not UMaterial baseMaterial)
+            return;
+
+        foreach (var texture in baseMaterial.ReferencedTextures.Where(x => x != null))
+        {
+            InsertMaterialTextureSlot(
+                connection,
+                transaction,
+                seen,
+                sourcePath,
+                materialObjectPath,
+                material.Name,
+                texture.Name,
+                texture.GetPathName(),
+                texture,
+                "ReferencedTexture");
+        }
+    }
+
+    private static void InsertMaterialTextureSlot(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        HashSet<string> seen,
+        string sourcePath,
+        string materialObjectPath,
+        string materialName,
+        string slotName,
+        string? texturePath,
+        UTexture texture,
+        string relationSource)
+    {
+        var textureObjectPath = texture.GetPathName();
+        var key = $"{slotName}\n{textureObjectPath}\n{relationSource}";
+        if (!seen.Add(key))
+            return;
+
+        InsertRelation(connection, transaction, sourcePath, materialObjectPath, "Texture", textureObjectPath, texture.Name);
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO material_texture_slots (
+                source_path, material_object_path, material_name, slot_name,
+                texture_path, texture_name, texture_object_path, relation_source
+            )
+            VALUES (
+                $sourcePath, $materialObjectPath, $materialName, $slotName,
+                $texturePath, $textureName, $textureObjectPath, $relationSource
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$materialObjectPath", materialObjectPath);
+        Add(command, "$materialName", materialName);
+        Add(command, "$slotName", slotName);
+        Add(command, "$texturePath", texturePath);
+        Add(command, "$textureName", texture.Name);
+        Add(command, "$textureObjectPath", textureObjectPath);
+        Add(command, "$relationSource", relationSource);
+        command.ExecuteNonQuery();
     }
 
     private static void InsertRelation(
