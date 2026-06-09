@@ -56,6 +56,8 @@ internal static class UELibraryPostProcessor
         var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
         var sourceIndex = LoadSourceIndex(root);
         var materialTextureSlots = WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex);
+        ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots);
+        mergedCatalogRows = WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList());
         var sharedGltfTextureLinks = RewriteGltfSharedTextureUris(root, reports, materialTextureSlots);
         var componentAssetRelations = WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex);
         var packageObjectMaps = WritePackageObjectMaps(root, sourceIndex);
@@ -413,6 +415,8 @@ internal static class UELibraryPostProcessor
             skeletonHash = report.SkeletonHash,
             materialNames = report.MaterialNames,
             materialSidecars = report.MatchedMaterialSidecars,
+            externalMaterialNames = report.ExternalMaterialNames,
+            externalMaterialTextureCount = report.ExternalMaterialTextureCount,
             validationStatus = report.Status,
             notes = report.Notes,
             bbox = report.BBox,
@@ -898,6 +902,115 @@ internal static class UELibraryPostProcessor
 
         return result.ToArray();
     }
+
+    private static void ApplyExternalMaterialValidation(
+        string root,
+        List<ModelValidationEntry> reports,
+        List<JObject> catalogRows,
+        MaterialTextureSlotLink[] materialTextureSlots)
+    {
+        var modelRowsByOutput = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["output"]))
+            .GroupBy(x => NormalizeCatalogOutput(root, (string)x["output"]!), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+
+        var slotsByMaterial = materialTextureSlots
+            .Where(x => !string.IsNullOrWhiteSpace(x.MaterialName))
+            .GroupBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var report in reports)
+        {
+            if (!modelRowsByOutput.TryGetValue(NormalizeCatalogOutput(root, report.RelativePath), out var modelRow))
+                continue;
+
+            var materialNames = BuildModelMaterialCandidates(report, modelRow);
+            var matchedMaterials = materialNames
+                .Where(name => slotsByMaterial.TryGetValue(name, out var slots) &&
+                               slots.Any(slot => string.Equals(slot.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase)))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var matchedTextureCount = matchedMaterials
+                .SelectMany(name => slotsByMaterial[name])
+                .Count(slot => string.Equals(slot.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase));
+
+            report.ExternalMaterialNames = matchedMaterials;
+            report.ExternalMaterialTextureCount = matchedTextureCount;
+            var hasExternalMaterial = matchedTextureCount > 0 || report.MatchedMaterialSidecars.Length > 0;
+            if (!hasExternalMaterial)
+                continue;
+
+            report.Notes = report.Notes
+                .Where(note => !string.Equals(note, "No embedded or referenced image was written.", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+
+            var stillMissingSidecars = report.MissingMaterialSidecars
+                .Where(name => !matchedMaterials.Contains(name, StringComparer.OrdinalIgnoreCase) &&
+                               !(IsGenericGltfMaterialName(name) && matchedMaterials.Length > 0))
+                .ToArray();
+            if (stillMissingSidecars.Length != report.MissingMaterialSidecars.Length)
+            {
+                report.MissingMaterialSidecars = stillMissingSidecars;
+                report.Notes = report.Notes
+                    .Where(note => !note.StartsWith("Missing sidecar material JSON for ", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (stillMissingSidecars.Length > 0)
+                    report.Notes = report.Notes.Concat([$"Missing sidecar material JSON for {stillMissingSidecars.Length} material(s)."]).ToArray();
+            }
+
+            report.Status = report.Notes.Length == 0 ? "ok" : report.Status;
+        }
+    }
+
+    private static string NormalizeCatalogOutput(string root, string path)
+    {
+        var text = path.Replace('\\', '/');
+        if (Path.IsPathRooted(text))
+            text = MakeRelative(root, text).Replace('\\', '/');
+        return text.TrimStart('/').ToLowerInvariant();
+    }
+
+    private static string[] BuildModelMaterialCandidates(ModelValidationEntry report, JObject modelRow)
+    {
+        var result = new List<string>();
+        result.AddRange(report.MaterialNames);
+
+        foreach (var slot in (JArray?)modelRow["materialSlots"] ?? [])
+        {
+            AddIfNotEmpty(result, (string?)slot["materialName"]);
+            AddIfNotEmpty(result, (string?)slot["slotName"]);
+            AddIfNotEmpty(result, (string?)slot["importedSlotName"]);
+        }
+
+        var sourcePath = ((string?)modelRow["source"] ?? report.RelativePath).Replace('\\', '/');
+        var modelBaseName = Path.GetFileNameWithoutExtension(sourcePath);
+        foreach (var materialName in report.MissingMaterialSidecars)
+        {
+            if (string.Equals(materialName, "White", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(materialName, "Material", StringComparison.OrdinalIgnoreCase))
+            {
+                AddIfNotEmpty(result, "MI_" + modelBaseName.Replace("SK_", "").Replace("SM_", ""));
+            }
+        }
+
+        return result
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static void AddIfNotEmpty(List<string> result, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value) && !string.Equals(value, "None", StringComparison.OrdinalIgnoreCase))
+            result.Add(value);
+    }
+
+    private static bool IsGenericGltfMaterialName(string name)
+        => string.Equals(name, "White", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(name, "Material", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(name, "DefaultMaterial", StringComparison.OrdinalIgnoreCase);
 
     private static SourcePackageObjectMap? FindTextureObjectInfo(
         Dictionary<string, SourcePackageObjectMap> textureObjects,
@@ -2075,6 +2188,8 @@ internal static class UELibraryPostProcessor
                 materialNames = x.MaterialNames,
                 matchedMaterialSidecars = x.MatchedMaterialSidecars,
                 missingMaterialSidecars = x.MissingMaterialSidecars,
+                externalMaterialNames = x.ExternalMaterialNames,
+                externalMaterialTextureCount = x.ExternalMaterialTextureCount,
                 skeletonHash = x.SkeletonHash,
                 bbox = x.BBox,
                 notes = x.Notes,
@@ -3473,6 +3588,8 @@ internal static class UELibraryPostProcessor
         public string[] MaterialNames { get; set; } = [];
         public string[] MatchedMaterialSidecars { get; set; } = [];
         public string[] MissingMaterialSidecars { get; set; } = [];
+        public string[] ExternalMaterialNames { get; set; } = [];
+        public int ExternalMaterialTextureCount { get; set; }
         public object? BBox { get; set; }
         public string[] Notes { get; set; } = [];
     }

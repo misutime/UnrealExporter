@@ -45,7 +45,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations 和 animation_validation。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `auto_referenced_exports.jsonl` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因。
-   - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox。
+   - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox，并结合材质 sidecar 与 `material_texture_slots` 判断外部材质贴图关系，避免把未内嵌贴图但关系完整的模型误报为异常。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
    - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations 和 animation_validation。
 
