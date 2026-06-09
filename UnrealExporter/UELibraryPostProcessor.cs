@@ -974,7 +974,9 @@ internal static class UELibraryPostProcessor
                 MatchStatus = matched == null ? "missingExportedAsset" : "matched",
                 MatchReason = matched == null
                     ? "源索引记录了 UE 组件/蓝图资源关系，但当前导出目录没有找到对应资产。"
-                    : "通过 UE object path 或包路径后缀匹配到已导出素材。",
+                    : relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
+                        ? "通过 UE Skeleton 原始引用匹配到同 skeletonPath 的已导出模型。"
+                        : "通过 UE object path 或包路径后缀匹配到已导出素材。",
                 SocketName = relation.SocketName,
                 ParentComponentPath = relation.ParentComponentPath,
                 Transform = BuildTransformObject(relation),
@@ -1002,6 +1004,11 @@ internal static class UELibraryPostProcessor
             var skeletonMatches = exportedAssets
                 .Where(x => string.Equals((string?)x["skeletonPath"], relation.TargetPath, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
+            var modelMatches = skeletonMatches
+                .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (modelMatches.Length == 1)
+                return modelMatches[0];
             if (skeletonMatches.Length == 1)
                 return skeletonMatches[0];
         }
