@@ -27,6 +27,7 @@ using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.Utils;
 using JSBeautifyLib;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using SkiaSharp;
@@ -761,6 +762,7 @@ public class UnrealExporter
                 ? config.MaxDegreeOfParallelism
                 : DefaultMaxDegreeOfParallelism;
         Console.WriteLine($"Max parallel exports: {maxDegreeOfParallelism}");
+        var autoReferencedExportRules = BuildAutoReferencedExportRules(provider, config);
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
@@ -796,6 +798,9 @@ public class UnrealExporter
                         ).IsMatch(file.Value.Path),
                     ""
                 );
+                if (regexMatch.Length == 0 &&
+                    autoReferencedExportRules.TryGetValue(NormalizeAssetPath(file.Value.Path), out var autoRule))
+                    regexMatch = autoRule;
 
                 bool isExclude = config.Exclude.Any(path =>
                     new Regex("^" + path + "$", RegexOptions.IgnoreCase).IsMatch(file.Value.Path)
@@ -926,6 +931,8 @@ public class UnrealExporter
                                         Directory.CreateDirectory(outputDir);
                                     File.WriteAllText(outputPath + ".json", json);
                                     AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
+                                    foreach (var material in allObjects.OfType<UMaterialInterface>())
+                                        AppendAssetCatalog(config, BuildMaterialCatalogEntry(file.Value.Path, material, outputPath + ".json"));
                                     Interlocked.Increment(ref totalExportedFiles);
                                 }
                                 // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
@@ -1216,6 +1223,164 @@ public class UnrealExporter
         Console.WriteLine();
     }
 
+    private static Dictionary<string, string> BuildAutoReferencedExportRules(
+        AbstractFileProvider provider,
+        ConfigObj config)
+    {
+        if (!config.AutoExportReferencedAssets)
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var dbPath = Path.Combine(Path.GetFullPath(config.OutputDir), "ue_source_index.db");
+        if (!File.Exists(dbPath))
+        {
+            Console.WriteLine($"WARN: auto referenced export skipped because source index is missing: {dbPath}");
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var packageFiles = BuildPackageFileLookup(provider);
+        var rules = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var unresolved = 0;
+        var ambiguous = 0;
+
+        using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT relation_type, target_path
+            FROM component_asset_relations
+            WHERE target_path IS NOT NULL
+              AND target_path != ''
+              AND relation_type IN (
+                  'StaticMesh', 'SkeletalMesh', 'Material', 'Texture',
+                  'Animation', 'AnimClass', 'AnimBlueprintGeneratedClass'
+              );
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var relationType = reader.GetString(0);
+            var targetPath = reader.GetString(1);
+            var outputType = InferOutputTypeForReferencedAsset(relationType, targetPath);
+            if (outputType == null)
+                continue;
+
+            var suffix = BuildPackageFileSuffix(targetPath);
+            if (string.IsNullOrWhiteSpace(suffix))
+            {
+                unresolved++;
+                continue;
+            }
+
+            if (!packageFiles.TryGetValue(suffix, out var matches) || matches.Length == 0)
+            {
+                unresolved++;
+                continue;
+            }
+
+            if (matches.Length > 1)
+            {
+                ambiguous++;
+                continue;
+            }
+
+            var filePath = matches[0];
+            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:{outputType}";
+        }
+
+        Console.WriteLine(
+            $"Auto referenced exports: {rules.Count} rule(s)" +
+            (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : ""));
+        return rules;
+    }
+
+    private static Dictionary<string, string[]> BuildPackageFileLookup(AbstractFileProvider provider)
+    {
+        var rows = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in provider.Files.Values)
+        {
+            if (!file.Path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+                !file.Path.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var withoutExtension = NormalizeAssetPath(Path.ChangeExtension(file.Path, null));
+            foreach (var suffix in BuildProviderFileSuffixes(withoutExtension))
+            {
+                if (!rows.TryGetValue(suffix, out var list))
+                {
+                    list = [];
+                    rows[suffix] = list;
+                }
+
+                list.Add(file.Path);
+            }
+        }
+
+        return rows.ToDictionary(
+            x => x.Key,
+            x => x.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> BuildProviderFileSuffixes(string withoutExtension)
+    {
+        yield return withoutExtension;
+
+        var contentIndex = withoutExtension.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+        if (contentIndex >= 0)
+            yield return withoutExtension[contentIndex..].TrimStart('/');
+
+        if (withoutExtension.StartsWith("Engine/Content/", StringComparison.OrdinalIgnoreCase))
+            yield return withoutExtension;
+    }
+
+    private static string? InferOutputTypeForReferencedAsset(string relationType, string targetPath)
+    {
+        if (relationType.Equals("StaticMesh", StringComparison.OrdinalIgnoreCase) ||
+            relationType.Equals("SkeletalMesh", StringComparison.OrdinalIgnoreCase))
+            return "glb";
+
+        if (relationType.Equals("Material", StringComparison.OrdinalIgnoreCase))
+            return "json";
+
+        if (relationType.Equals("Texture", StringComparison.OrdinalIgnoreCase))
+            return "png";
+
+        if (relationType.Equals("Animation", StringComparison.OrdinalIgnoreCase))
+            return "ueanim";
+
+        // AnimClass/AnimBlueprintGeneratedClass 是运行时类或蓝图，不是可直接播放动画；保留 JSON 便于后续重建动画蓝图关系。
+        if (relationType.Equals("AnimClass", StringComparison.OrdinalIgnoreCase) ||
+            relationType.Equals("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase))
+            return "json";
+
+        return null;
+    }
+
+    private static string? BuildPackageFileSuffix(string objectPath)
+    {
+        var path = NormalizeObjectPath(objectPath);
+        if (string.IsNullOrWhiteSpace(path) || path.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var dotIndex = path.LastIndexOf('.');
+        if (dotIndex > 0)
+            path = path[..dotIndex];
+
+        if (path.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase))
+            return "Content/" + path["/Game/".Length..];
+
+        if (path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
+            return "Engine/Content/" + path["/Engine/".Length..];
+
+        return path.TrimStart('/');
+    }
+
+    private static string NormalizeObjectPath(string path)
+        => path.Replace('\\', '/').Trim();
+
+    private static string NormalizeAssetPath(string path)
+        => path.Replace('\\', '/').Trim();
+
     private static void AppendExportManifest(
         ConfigObj config,
         string sourcePath,
@@ -1333,6 +1498,21 @@ public class UnrealExporter
             height = texture.PlatformData?.SizeY ?? 0,
             pixelFormat = texture.Format.ToString(),
             isNormalMap = texture.IsNormalMap,
+        };
+    }
+
+    private static object BuildMaterialCatalogEntry(string sourcePath, UMaterialInterface material, string outputPath)
+    {
+        return new
+        {
+            kind = "Material",
+            resourceKind = "Material",
+            name = material.Name,
+            sourceType = material.GetType().Name,
+            source = sourcePath,
+            objectPath = material.GetPathName(),
+            output = Path.GetFullPath(outputPath),
+            format = "json",
         };
     }
 
@@ -2125,6 +2305,7 @@ public class ConfigObj
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
     public bool GenerateSourceIndex { get; set; }
+    public bool AutoExportReferencedAssets { get; set; }
     public List<string>? SourceIndexRegex { get; set; }
     public int SourceIndexLimit { get; set; }
     public required List<string> Export { get; set; }

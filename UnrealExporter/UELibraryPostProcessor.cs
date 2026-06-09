@@ -1073,8 +1073,14 @@ internal static class UELibraryPostProcessor
                         .Count(),
                     modelReferenceCount = group.Count(x => IsModelRelation(x.RelationType)),
                     exportedModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && x.MatchStatus == "matched"),
+                    missingModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && x.MatchStatus != "matched"),
                     animationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType)),
+                    exportedAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && x.MatchStatus == "matched"),
+                    missingAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && x.MatchStatus != "matched"),
                     materialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)),
+                    exportedMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && x.MatchStatus == "matched"),
+                    missingMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && x.MatchStatus != "matched"),
+                    missingReferenceCount = group.Count(x => IsTrackedAssetRelation(x.RelationType) && x.MatchStatus != "matched"),
                     relationSources = group.Select(x => x.RelationSource)
                         .Where(x => !string.IsNullOrWhiteSpace(x))
                         .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1109,6 +1115,66 @@ internal static class UELibraryPostProcessor
                             x.ComponentVariableName,
                         })
                         .ToArray(),
+                    materials = group
+                        .Where(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase))
+                        .DistinctBy(x => $"{x.RelationType}|{x.TargetPath}|{x.ComponentObjectPath}", StringComparer.OrdinalIgnoreCase)
+                        .Select(x => new
+                        {
+                            x.RelationType,
+                            x.TargetName,
+                            x.TargetPath,
+                            x.TargetAssetOutput,
+                            x.MatchStatus,
+                            x.ComponentName,
+                            x.ComponentVariableName,
+                        })
+                        .ToArray(),
+                    skeletons = group
+                        .Where(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase))
+                        .DistinctBy(x => $"{x.RelationType}|{x.TargetPath}|{x.ComponentObjectPath}", StringComparer.OrdinalIgnoreCase)
+                        .Select(x => new
+                        {
+                            x.RelationType,
+                            x.TargetName,
+                            x.TargetPath,
+                            x.TargetAssetOutput,
+                            x.MatchStatus,
+                            x.ComponentName,
+                            x.ComponentVariableName,
+                        })
+                        .ToArray(),
+                    otherReferences = group
+                        .Where(x => IsTrackedAssetRelation(x.RelationType) &&
+                                    !IsModelRelation(x.RelationType) &&
+                                    !IsAnimationRelation(x.RelationType) &&
+                                    !string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) &&
+                                    !string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase))
+                        .DistinctBy(x => $"{x.RelationType}|{x.TargetPath}|{x.ComponentObjectPath}", StringComparer.OrdinalIgnoreCase)
+                        .Select(x => new
+                        {
+                            x.RelationType,
+                            x.TargetName,
+                            x.TargetPath,
+                            x.TargetAssetOutput,
+                            x.MatchStatus,
+                            x.ComponentName,
+                            x.ComponentVariableName,
+                        })
+                        .ToArray(),
+                    missingReferences = group
+                        .Where(x => IsTrackedAssetRelation(x.RelationType) && x.MatchStatus != "matched")
+                        .DistinctBy(x => $"{x.RelationType}|{x.TargetPath}|{x.ComponentObjectPath}", StringComparer.OrdinalIgnoreCase)
+                        .Select(x => new
+                        {
+                            x.RelationType,
+                            x.TargetName,
+                            x.TargetPath,
+                            x.MatchStatus,
+                            x.MatchReason,
+                            x.ComponentName,
+                            x.ComponentVariableName,
+                        })
+                        .ToArray(),
                 });
 
                 return new ComponentGroupRow
@@ -1120,8 +1186,14 @@ internal static class UELibraryPostProcessor
                     ComponentCount = (int)json["componentCount"]!,
                     ModelReferenceCount = (int)json["modelReferenceCount"]!,
                     ExportedModelReferenceCount = (int)json["exportedModelReferenceCount"]!,
+                    MissingModelReferenceCount = (int)json["missingModelReferenceCount"]!,
                     AnimationReferenceCount = (int)json["animationReferenceCount"]!,
+                    ExportedAnimationReferenceCount = (int)json["exportedAnimationReferenceCount"]!,
+                    MissingAnimationReferenceCount = (int)json["missingAnimationReferenceCount"]!,
                     MaterialReferenceCount = (int)json["materialReferenceCount"]!,
+                    ExportedMaterialReferenceCount = (int)json["exportedMaterialReferenceCount"]!,
+                    MissingMaterialReferenceCount = (int)json["missingMaterialReferenceCount"]!,
+                    MissingReferenceCount = (int)json["missingReferenceCount"]!,
                     RawJson = json.ToString(Formatting.None),
                 };
             })
@@ -1135,6 +1207,15 @@ internal static class UELibraryPostProcessor
     private static bool IsAnimationRelation(string relationType)
         => relationType.Equals("Animation", StringComparison.OrdinalIgnoreCase)
            || relationType.Equals("AnimClass", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsTrackedAssetRelation(string relationType)
+        => IsModelRelation(relationType)
+           || IsAnimationRelation(relationType)
+           || relationType.Equals("Material", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("Texture", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("BlueprintClass", StringComparison.OrdinalIgnoreCase);
 
     private static SharedGltfTextureLink[] RewriteGltfSharedTextureUris(
         string root,
@@ -1861,8 +1942,14 @@ internal static class UELibraryPostProcessor
                 component_count INTEGER NOT NULL,
                 model_reference_count INTEGER NOT NULL,
                 exported_model_reference_count INTEGER NOT NULL,
+                missing_model_reference_count INTEGER NOT NULL,
                 animation_reference_count INTEGER NOT NULL,
+                exported_animation_reference_count INTEGER NOT NULL,
+                missing_animation_reference_count INTEGER NOT NULL,
                 material_reference_count INTEGER NOT NULL,
+                exported_material_reference_count INTEGER NOT NULL,
+                missing_material_reference_count INTEGER NOT NULL,
+                missing_reference_count INTEGER NOT NULL,
                 raw_json TEXT NOT NULL
             );
             """);
@@ -1958,6 +2045,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_target ON component_asset_relations(relation_type, target_path);");
         Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_match ON component_asset_relations(match_status, target_asset_output);");
         Execute(connection, transaction, "CREATE INDEX idx_component_groups_model_refs ON component_groups(model_reference_count, exported_model_reference_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_groups_missing ON component_groups(missing_reference_count, missing_model_reference_count, missing_material_reference_count);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
@@ -2202,12 +2290,16 @@ internal static class UELibraryPostProcessor
                 INSERT INTO component_groups (
                     owner_object_path, owner_type, source_path, relation_count, component_count,
                     model_reference_count, exported_model_reference_count, animation_reference_count,
-                    material_reference_count, raw_json
+                    missing_model_reference_count, exported_animation_reference_count, missing_animation_reference_count,
+                    material_reference_count, exported_material_reference_count, missing_material_reference_count,
+                    missing_reference_count, raw_json
                 )
                 VALUES (
                     $ownerObjectPath, $ownerType, $sourcePath, $relationCount, $componentCount,
                     $modelReferenceCount, $exportedModelReferenceCount, $animationReferenceCount,
-                    $materialReferenceCount, $rawJson
+                    $missingModelReferenceCount, $exportedAnimationReferenceCount, $missingAnimationReferenceCount,
+                    $materialReferenceCount, $exportedMaterialReferenceCount, $missingMaterialReferenceCount,
+                    $missingReferenceCount, $rawJson
                 );
                 """;
             Add(command, "$ownerObjectPath", group.OwnerObjectPath);
@@ -2217,8 +2309,14 @@ internal static class UELibraryPostProcessor
             Add(command, "$componentCount", group.ComponentCount);
             Add(command, "$modelReferenceCount", group.ModelReferenceCount);
             Add(command, "$exportedModelReferenceCount", group.ExportedModelReferenceCount);
+            Add(command, "$missingModelReferenceCount", group.MissingModelReferenceCount);
             Add(command, "$animationReferenceCount", group.AnimationReferenceCount);
+            Add(command, "$exportedAnimationReferenceCount", group.ExportedAnimationReferenceCount);
+            Add(command, "$missingAnimationReferenceCount", group.MissingAnimationReferenceCount);
             Add(command, "$materialReferenceCount", group.MaterialReferenceCount);
+            Add(command, "$exportedMaterialReferenceCount", group.ExportedMaterialReferenceCount);
+            Add(command, "$missingMaterialReferenceCount", group.MissingMaterialReferenceCount);
+            Add(command, "$missingReferenceCount", group.MissingReferenceCount);
             Add(command, "$rawJson", group.RawJson);
             command.ExecuteNonQuery();
         }
@@ -3046,8 +3144,14 @@ internal static class UELibraryPostProcessor
         public int ComponentCount { get; set; }
         public int ModelReferenceCount { get; set; }
         public int ExportedModelReferenceCount { get; set; }
+        public int MissingModelReferenceCount { get; set; }
         public int AnimationReferenceCount { get; set; }
+        public int ExportedAnimationReferenceCount { get; set; }
+        public int MissingAnimationReferenceCount { get; set; }
         public int MaterialReferenceCount { get; set; }
+        public int ExportedMaterialReferenceCount { get; set; }
+        public int MissingMaterialReferenceCount { get; set; }
+        public int MissingReferenceCount { get; set; }
         public string RawJson { get; set; } = string.Empty;
     }
 
