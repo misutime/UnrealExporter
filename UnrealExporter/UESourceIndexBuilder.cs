@@ -466,7 +466,10 @@ internal static class UESourceIndexBuilder
             InsertBlueprintComponentRelations(connection, transaction, file.Path, blueprintClass);
 
         if (obj is USceneComponent sceneComponent)
-            InsertComponentAssetRelations(connection, transaction, file.Path, obj.GetPathName(), obj.GetType().Name, sceneComponent, null, "ExportedComponent");
+        {
+            var ownerPath = GetComponentOwnerObjectPath(sceneComponent);
+            InsertComponentAssetRelations(connection, transaction, file.Path, ownerPath, "ComponentOuter", sceneComponent, null, "ExportedComponent");
+        }
 
         if (ShouldScanBlueprintPropertyReferences(obj))
             InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj);
@@ -538,6 +541,20 @@ internal static class UESourceIndexBuilder
                 "InheritableComponentOverride",
                 seenComponents);
         }
+    }
+
+    private static string GetComponentOwnerObjectPath(USceneComponent component)
+    {
+        var componentPath = component.GetPathName();
+        var subObjectSeparator = componentPath.LastIndexOf(':');
+        if (subObjectSeparator > 0)
+            return componentPath[..subObjectSeparator];
+
+        var dotSeparator = componentPath.LastIndexOf('.');
+        if (dotSeparator > 0)
+            return componentPath[..dotSeparator];
+
+        return componentPath;
     }
 
     private static void InsertComponentAssetRelations(
