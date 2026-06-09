@@ -62,8 +62,8 @@ internal static class UELibraryPostProcessor
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
-        WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, modelAnimationRelations, animationValidation);
+        var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -1731,6 +1731,7 @@ internal static class UELibraryPostProcessor
         SharedGltfTextureLink[] sharedGltfTextureLinks,
         ComponentAssetRelationLink[] componentAssetRelations,
         SourcePackageObjectMap[] packageObjectMaps,
+        JArray skeletonGroups,
         JObject modelAnimationRelations,
         AnimationValidationSummary animationValidation)
     {
@@ -1902,6 +1903,19 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE skeleton_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_id TEXT NOT NULL,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                model_count INTEGER NOT NULL,
+                animation_count INTEGER NOT NULL,
+                bone_count INTEGER NOT NULL,
+                source_object_count INTEGER NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE relation_animations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 relation_id INTEGER NOT NULL,
@@ -1947,6 +1961,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
@@ -1974,6 +1990,7 @@ internal static class UELibraryPostProcessor
         foreach (var row in packageObjectMaps)
             InsertPackageObjectMap(connection, transaction, row);
 
+        InsertSkeletonGroups(connection, transaction, skeletonGroups);
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
 
@@ -2249,6 +2266,37 @@ internal static class UELibraryPostProcessor
         command.ExecuteNonQuery();
     }
 
+    private static void InsertSkeletonGroups(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        JArray skeletonGroups)
+    {
+        foreach (var token in skeletonGroups.OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_groups (
+                    skeleton_id, skeleton_path, skeleton_name,
+                    model_count, animation_count, bone_count, source_object_count, raw_json
+                )
+                VALUES (
+                    $skeletonId, $skeletonPath, $skeletonName,
+                    $modelCount, $animationCount, $boneCount, $sourceObjectCount, $rawJson
+                );
+                """;
+            Add(command, "$skeletonId", (string?)token["skeletonId"] ?? "");
+            Add(command, "$skeletonPath", (string?)token["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)token["skeletonName"]);
+            Add(command, "$modelCount", (int?)token["modelCount"] ?? 0);
+            Add(command, "$animationCount", (int?)token["animationCount"] ?? 0);
+            Add(command, "$boneCount", (int?)token["boneCount"] ?? 0);
+            Add(command, "$sourceObjectCount", token["skeletonSourceObjects"] is JArray sources ? sources.Count : 0);
+            Add(command, "$rawJson", token.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+    }
+
     private static void InsertModelAnimationRelations(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -2413,7 +2461,7 @@ internal static class UELibraryPostProcessor
         }
     }
 
-    private static void WriteSkeletonIndex(
+    private static JArray WriteSkeletonIndex(
         string root,
         List<ModelValidationEntry> reports,
         List<JObject> catalogRows,
@@ -2510,23 +2558,26 @@ internal static class UELibraryPostProcessor
                 };
             })
             .ToArray();
+        var skeletonArray = JArray.FromObject(skeletons);
 
         File.WriteAllText(
             Path.Combine(root, "skeletons.json"),
-            JsonConvert.SerializeObject(new
+            new JObject
             {
-                generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "骨架分组以已导出 GLB/glTF skin joints 为预览基准，同时合并 UE Skeleton 原始路径、源索引骨架对象和同 Skeleton 动画列表。",
-                sourceIndex = new
+                ["generatedAt"] = DateTime.UtcNow.ToString("O"),
+                ["rule"] = "骨架分组以已导出 GLB/glTF skin joints 为预览基准，同时合并 UE Skeleton 原始路径、源索引骨架对象和同 Skeleton 动画列表。",
+                ["sourceIndex"] = JObject.FromObject(new
                 {
                     available = sourceIndex.Available,
                     path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
                     error = sourceIndex.Error,
-                },
-                skeletonCount = skeletons.Length,
-                skeletons,
-            }, Formatting.Indented),
+                }),
+                ["skeletonCount"] = skeletons.Length,
+                ["skeletons"] = skeletonArray,
+            }.ToString(Formatting.Indented),
             Encoding.UTF8);
+
+        return skeletonArray;
     }
 
     private static void WriteLibraryReadme(
@@ -2562,7 +2613,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配，并回填动画验证结果。 |");
         sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
-        sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组。 |");
+        sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组，并合并 UE Skeleton、源骨架对象和同 Skeleton 动画。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
