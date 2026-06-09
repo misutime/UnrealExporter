@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -52,9 +53,10 @@ internal static class UELibraryPostProcessor
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
         var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
-        WriteModelAnimationRelations(root, mergedCatalogRows);
+        var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows);
         WriteModelValidation(root, reports);
         WriteSkeletonIndex(root, reports);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, modelAnimationRelations);
         WriteLibraryReadme(root, reports, materialIndex.Values);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -506,7 +508,7 @@ internal static class UELibraryPostProcessor
         return $"{kind}|{objectPath}";
     }
 
-    private static void WriteModelAnimationRelations(string root, List<JObject> catalogRows)
+    private static JObject WriteModelAnimationRelations(string root, List<JObject> catalogRows)
     {
         var models = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -564,6 +566,7 @@ internal static class UELibraryPostProcessor
         };
 
         File.WriteAllText(Path.Combine(root, "model_animations.json"), summary.ToString(Formatting.Indented));
+        return summary;
     }
 
     private static void WriteModelValidation(string root, List<ModelValidationEntry> reports)
@@ -607,6 +610,276 @@ internal static class UELibraryPostProcessor
             Path.Combine(root, "model_validation.json"),
             JsonConvert.SerializeObject(summary, Formatting.Indented),
             Encoding.UTF8);
+    }
+
+    private static void WriteLibraryIndexDb(
+        string root,
+        List<JObject> catalogRows,
+        List<ModelValidationEntry> reports,
+        List<TextureLinkInfo> textureLinks,
+        JObject modelAnimationRelations)
+    {
+        var dbPath = Path.Combine(root, "library_index.db");
+        if (File.Exists(dbPath))
+            File.Delete(dbPath);
+
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        Execute(connection, "PRAGMA journal_mode = WAL;");
+        Execute(connection, "PRAGMA synchronous = NORMAL;");
+        using var transaction = connection.BeginTransaction();
+        Execute(connection, transaction, """
+            CREATE TABLE assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                resource_kind TEXT,
+                name TEXT,
+                source_type TEXT,
+                source TEXT,
+                object_path TEXT,
+                output TEXT,
+                format TEXT,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                validation_status TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE texture_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                shared TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                extension TEXT NOT NULL,
+                hard_linked INTEGER NOT NULL,
+                link_error TEXT
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_validation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                name TEXT,
+                resource_kind TEXT,
+                status TEXT NOT NULL,
+                mesh_count INTEGER NOT NULL,
+                material_count INTEGER NOT NULL,
+                texture_count INTEGER NOT NULL,
+                skin_count INTEGER NOT NULL,
+                bone_count INTEGER NOT NULL,
+                animation_count INTEGER NOT NULL,
+                skeleton_hash TEXT,
+                bbox_json TEXT,
+                notes_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_animation_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                model_name TEXT,
+                model_source TEXT,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                confidence TEXT NOT NULL,
+                animation_count INTEGER NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_id INTEGER NOT NULL,
+                name TEXT,
+                source TEXT,
+                output TEXT,
+                status TEXT,
+                duration REAL,
+                frame_count INTEGER,
+                track_count INTEGER,
+                FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
+            );
+            """);
+        Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
+        Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
+
+        foreach (var row in catalogRows)
+            InsertAsset(connection, transaction, row);
+
+        foreach (var link in textureLinks)
+            InsertTextureLink(connection, transaction, link);
+
+        foreach (var report in reports)
+            InsertModelValidation(connection, transaction, report);
+
+        InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
+
+        transaction.Commit();
+    }
+
+    private static void InsertAsset(SqliteConnection connection, SqliteTransaction transaction, JObject row)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO assets (
+                kind, resource_kind, name, source_type, source, object_path, output, format,
+                skeleton_path, skeleton_name, validation_status, raw_json
+            )
+            VALUES (
+                $kind, $resourceKind, $name, $sourceType, $source, $objectPath, $output, $format,
+                $skeletonPath, $skeletonName, $validationStatus, $rawJson
+            );
+            """;
+        Add(command, "$kind", (string?)row["kind"] ?? "Asset");
+        Add(command, "$resourceKind", (string?)row["resourceKind"]);
+        Add(command, "$name", (string?)row["name"]);
+        Add(command, "$sourceType", (string?)row["sourceType"]);
+        Add(command, "$source", (string?)row["source"]);
+        Add(command, "$objectPath", (string?)row["objectPath"]);
+        Add(command, "$output", (string?)row["output"]);
+        Add(command, "$format", (string?)row["format"]);
+        Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
+        Add(command, "$skeletonName", (string?)row["skeletonName"]);
+        Add(command, "$validationStatus", (string?)row["validationStatus"] ?? (string?)row["status"]);
+        Add(command, "$rawJson", row.ToString(Formatting.None));
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertTextureLink(SqliteConnection connection, SqliteTransaction transaction, TextureLinkInfo link)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO texture_links (source, shared, sha256, size_bytes, extension, hard_linked, link_error)
+            VALUES ($source, $shared, $sha256, $sizeBytes, $extension, $hardLinked, $linkError);
+            """;
+        Add(command, "$source", link.RelativePath);
+        Add(command, "$shared", link.SharedRelativePath);
+        Add(command, "$sha256", link.Hash);
+        Add(command, "$sizeBytes", link.SizeBytes);
+        Add(command, "$extension", link.Extension);
+        Add(command, "$hardLinked", link.HardLinked ? 1 : 0);
+        Add(command, "$linkError", link.LinkError);
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertModelValidation(SqliteConnection connection, SqliteTransaction transaction, ModelValidationEntry report)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO model_validation (
+                path, name, resource_kind, status, mesh_count, material_count, texture_count,
+                skin_count, bone_count, animation_count, skeleton_hash, bbox_json, notes_json
+            )
+            VALUES (
+                $path, $name, $resourceKind, $status, $meshCount, $materialCount, $textureCount,
+                $skinCount, $boneCount, $animationCount, $skeletonHash, $bboxJson, $notesJson
+            );
+            """;
+        Add(command, "$path", report.RelativePath);
+        Add(command, "$name", report.Name);
+        Add(command, "$resourceKind", report.ResourceKind);
+        Add(command, "$status", report.Status);
+        Add(command, "$meshCount", report.MeshCount);
+        Add(command, "$materialCount", report.MaterialCount);
+        Add(command, "$textureCount", report.ImageCount);
+        Add(command, "$skinCount", report.SkinCount);
+        Add(command, "$boneCount", report.BoneCount);
+        Add(command, "$animationCount", report.AnimationCount);
+        Add(command, "$skeletonHash", report.SkeletonHash);
+        Add(command, "$bboxJson", report.BBox == null ? null : JsonConvert.SerializeObject(report.BBox));
+        Add(command, "$notesJson", JsonConvert.SerializeObject(report.Notes));
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertModelAnimationRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        JObject modelAnimationRelations)
+    {
+        foreach (var relation in (JArray?)modelAnimationRelations["relations"] ?? [])
+        {
+            var relationObj = (JObject)relation;
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO model_animation_relations (
+                    model, model_name, model_source, skeleton_path, skeleton_name,
+                    confidence, animation_count, raw_json
+                )
+                VALUES (
+                    $model, $modelName, $modelSource, $skeletonPath, $skeletonName,
+                    $confidence, $animationCount, $rawJson
+                );
+                SELECT last_insert_rowid();
+                """;
+            var animations = (JArray?)relationObj["animations"] ?? [];
+            Add(command, "$model", (string?)relationObj["model"] ?? "");
+            Add(command, "$modelName", (string?)relationObj["modelName"]);
+            Add(command, "$modelSource", (string?)relationObj["modelSource"]);
+            Add(command, "$skeletonPath", (string?)relationObj["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)relationObj["skeletonName"]);
+            Add(command, "$confidence", (string?)relationObj["confidence"] ?? "Unknown");
+            Add(command, "$animationCount", animations.Count);
+            Add(command, "$rawJson", relationObj.ToString(Formatting.None));
+            var relationId = (long)command.ExecuteScalar()!;
+
+            foreach (var animation in animations.OfType<JObject>())
+                InsertRelationAnimation(connection, transaction, relationId, animation);
+        }
+    }
+
+    private static void InsertRelationAnimation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long relationId,
+        JObject animation)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO relation_animations (
+                relation_id, name, source, output, status, duration, frame_count, track_count
+            )
+            VALUES (
+                $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount
+            );
+            """;
+        Add(command, "$relationId", relationId);
+        Add(command, "$name", (string?)animation["name"]);
+        Add(command, "$source", (string?)animation["source"]);
+        Add(command, "$output", (string?)animation["output"]);
+        Add(command, "$status", (string?)animation["status"]);
+        Add(command, "$duration", (double?)animation["duration"]);
+        Add(command, "$frameCount", (int?)animation["frameCount"]);
+        Add(command, "$trackCount", (int?)animation["trackCount"]);
+        command.ExecuteNonQuery();
+    }
+
+    private static void Execute(SqliteConnection connection, SqliteTransaction transaction, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static void Execute(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static void Add(SqliteCommand command, string name, object? value)
+    {
+        command.Parameters.AddWithValue(name, value ?? DBNull.Value);
     }
 
     private static void WriteSkeletonIndex(string root, List<ModelValidationEntry> reports)
@@ -670,6 +943,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| 文件 | 用途 |");
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `asset_catalog.jsonl` | 模型、材质、贴图、动画主索引，一行一个资产。 |");
+        sb.AppendLine("| `library_index.db` | 已导出素材库的 SQLite 索引，便于筛选模型、动画、贴图和关系。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
         sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配。 |");
