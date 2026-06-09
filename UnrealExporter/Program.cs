@@ -1329,11 +1329,17 @@ public class UnrealExporter
             frameCount = sequence?.NumFrames,
             trackCount = sequence?.GetNumTracks(),
             trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            notifyCount = sequenceBase?.Notifies.Length ?? 0,
+            notifies = BuildAnimationNotifyEntries(sequenceBase),
+            curveCount = CountAnimationCurves(sequence),
+            curves = BuildAnimationCurveEntries(sequence),
             segments = BuildAnimationSegmentEntries(asset),
             sections = BuildAnimationSectionEntries(asset),
             compression = sequence?.CompressedDataStructure?.GetType().Name,
             requiresAcl = NeedsAclNative(asset),
             additiveType = sequence?.AdditiveAnimType.ToString(),
+            additiveBasePoseType = sequence?.RefPoseType.ToString(),
+            retargetSource = sequence?.RetargetSource.Text,
         };
     }
 
@@ -1368,11 +1374,17 @@ public class UnrealExporter
             frameCount = sequence?.NumFrames,
             trackCount = sequence?.GetNumTracks(),
             trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            notifyCount = sequenceBase?.Notifies.Length ?? 0,
+            notifies = BuildAnimationNotifyEntries(sequenceBase),
+            curveCount = CountAnimationCurves(sequence),
+            curves = BuildAnimationCurveEntries(sequence),
             segments = BuildAnimationSegmentEntries(asset),
             sections = BuildAnimationSectionEntries(asset),
             compression = sequence?.CompressedDataStructure?.GetType().Name,
             requiresAcl = NeedsAclNative(asset),
             additiveType = sequence?.AdditiveAnimType.ToString(),
+            additiveBasePoseType = sequence?.RefPoseType.ToString(),
+            retargetSource = sequence?.RetargetSource.Text,
         };
 
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "animation_bindings.jsonl");
@@ -1442,6 +1454,60 @@ public class UnrealExporter
                 segmentBeginTime = section.SegmentBeginTime,
                 linkMethod = section.LinkMethod.ToString(),
                 cachedLinkMethod = section.CachedLinkMethod.ToString(),
+            })
+            .Cast<object>()
+            .ToArray();
+    }
+
+    private static object[] BuildAnimationNotifyEntries(UAnimSequenceBase? sequence)
+    {
+        if (sequence == null || sequence.Notifies.Length == 0)
+            return [];
+
+        return sequence.Notifies
+            .Select((notify, notifyIndex) => new
+            {
+                notifyIndex,
+                notifyName = notify.NotifyName.Text,
+                notifyObjectPath = GetPackageIndexPath(notify.Notify),
+                notifyStateObjectPath = GetPackageIndexPath(notify.NotifyStateClass),
+                linkValue = notify.LinkValue,
+                duration = notify.Duration,
+                trackIndex = notify.TrackIndex,
+                triggerChance = notify.NotifyTriggerChance,
+                montageTickType = notify.MontageTickType.ToString(),
+                linkMethod = notify.LinkMethod.ToString(),
+                segmentIndex = notify.SegmentIndex,
+                slotIndex = notify.SlotIndex,
+            })
+            .Cast<object>()
+            .ToArray();
+    }
+
+    private static int CountAnimationCurves(UAnimSequence? sequence)
+        => sequence?.CompressedCurveData?.FloatCurves?.Length ?? 0;
+
+    private static object[] BuildAnimationCurveEntries(UAnimSequence? sequence)
+    {
+        var curves = sequence?.CompressedCurveData?.FloatCurves;
+        if (curves is not { Length: > 0 })
+            return [];
+
+        return curves
+            .Select((curve, curveIndex) =>
+            {
+                var keys = curve.FloatCurve.Keys ?? [];
+                return new
+                {
+                    curveIndex,
+                    curveName = curve.CurveName.Text,
+                    curveTypeFlags = curve.CurveTypeFlags,
+                    keyCount = keys.Length,
+                    minTime = keys.Length == 0 ? (float?)null : keys.Min(x => x.Time),
+                    maxTime = keys.Length == 0 ? (float?)null : keys.Max(x => x.Time),
+                    minValue = keys.Length == 0 ? (float?)null : keys.Min(x => x.Value),
+                    maxValue = keys.Length == 0 ? (float?)null : keys.Max(x => x.Value),
+                };
             })
             .Cast<object>()
             .ToArray();

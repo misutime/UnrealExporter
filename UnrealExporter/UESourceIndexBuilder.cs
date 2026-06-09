@@ -121,6 +121,8 @@ internal static class UESourceIndexBuilder
                 duration REAL,
                 frame_count INTEGER,
                 track_count INTEGER,
+                notify_count INTEGER,
+                curve_count INTEGER,
                 compression TEXT,
                 raw_json TEXT NOT NULL
             );
@@ -206,6 +208,40 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE animation_notifies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                animation_object_path TEXT,
+                notify_index INTEGER NOT NULL,
+                notify_name TEXT,
+                notify_object_path TEXT,
+                notify_state_object_path TEXT,
+                link_value REAL NOT NULL,
+                duration REAL NOT NULL,
+                track_index INTEGER NOT NULL,
+                trigger_chance REAL NOT NULL,
+                montage_tick_type TEXT,
+                link_method TEXT,
+                segment_index INTEGER NOT NULL,
+                slot_index INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_curves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                animation_object_path TEXT,
+                curve_index INTEGER NOT NULL,
+                curve_name TEXT,
+                curve_type_flags INTEGER NOT NULL,
+                key_count INTEGER NOT NULL,
+                min_time REAL,
+                max_time REAL,
+                min_value REAL,
+                max_value REAL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE source_index_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -225,6 +261,10 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_animation_segments_animation ON animation_segments(animation_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_segments_reference ON animation_segments(referenced_animation_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_sections_animation ON animation_sections(animation_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_notifies_animation ON animation_notifies(animation_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_notifies_name ON animation_notifies(notify_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_curves_animation ON animation_curves(animation_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_curves_name ON animation_curves(curve_name);");
     }
 
     private static void InsertSourceFile(SqliteConnection connection, SqliteTransaction transaction, GameFile file)
@@ -273,6 +313,8 @@ internal static class UESourceIndexBuilder
             objectPath = obj.GetPathName(),
             skeletonPath,
             skeletonName,
+            notifyCount = sequenceBase?.Notifies.Length,
+            curveCount = animSequence?.CompressedCurveData?.FloatCurves?.Length,
         };
 
         using var command = connection.CreateCommand();
@@ -281,12 +323,12 @@ internal static class UESourceIndexBuilder
             INSERT INTO source_objects (
                 source_path, object_type, export_type, name, object_path,
                 skeleton_path, skeleton_name, skeleton_guid, bone_count, material_count,
-                morph_target_count, duration, frame_count, track_count, compression, raw_json
+                morph_target_count, duration, frame_count, track_count, notify_count, curve_count, compression, raw_json
             )
             VALUES (
                 $sourcePath, $objectType, $exportType, $name, $objectPath,
                 $skeletonPath, $skeletonName, $skeletonGuid, $boneCount, $materialCount,
-                $morphTargetCount, $duration, $frameCount, $trackCount, $compression, $rawJson
+                $morphTargetCount, $duration, $frameCount, $trackCount, $notifyCount, $curveCount, $compression, $rawJson
             );
             """;
         Add(command, "$sourcePath", file.Path);
@@ -303,6 +345,8 @@ internal static class UESourceIndexBuilder
         Add(command, "$duration", sequenceBase?.SequenceLength);
         Add(command, "$frameCount", animSequence?.NumFrames);
         Add(command, "$trackCount", animSequence?.GetNumTracks());
+        Add(command, "$notifyCount", sequenceBase?.Notifies.Length);
+        Add(command, "$curveCount", animSequence?.CompressedCurveData?.FloatCurves?.Length);
         Add(command, "$compression", animSequence?.CompressedDataStructure?.GetType().Name);
         Add(command, "$rawJson", JsonConvert.SerializeObject(raw));
         command.ExecuteNonQuery();
@@ -338,6 +382,12 @@ internal static class UESourceIndexBuilder
 
         if (obj is UAnimComposite composite)
             InsertCompositeSegments(connection, transaction, file.Path, composite, skeletonPath);
+
+        if (sequenceBase != null)
+            InsertAnimationNotifies(connection, transaction, file.Path, sequenceBase);
+
+        if (animSequence != null)
+            InsertAnimationCurves(connection, transaction, file.Path, animSequence);
     }
 
     private static void InsertMontageSegments(
@@ -542,6 +592,86 @@ internal static class UESourceIndexBuilder
             Add(command, "$trackIndex", trackIndex);
             Add(command, "$boneIndex", boneIndex);
             Add(command, "$boneName", boneName);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAnimationNotifies(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UAnimSequenceBase sequence)
+    {
+        for (var notifyIndex = 0; notifyIndex < sequence.Notifies.Length; notifyIndex++)
+        {
+            var notify = sequence.Notifies[notifyIndex];
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_notifies (
+                    source_path, animation_object_path, notify_index, notify_name,
+                    notify_object_path, notify_state_object_path, link_value, duration,
+                    track_index, trigger_chance, montage_tick_type, link_method,
+                    segment_index, slot_index
+                )
+                VALUES (
+                    $sourcePath, $animationObjectPath, $notifyIndex, $notifyName,
+                    $notifyObjectPath, $notifyStateObjectPath, $linkValue, $duration,
+                    $trackIndex, $triggerChance, $montageTickType, $linkMethod,
+                    $segmentIndex, $slotIndex
+                );
+                """;
+            Add(command, "$sourcePath", sourcePath);
+            Add(command, "$animationObjectPath", sequence.GetPathName());
+            Add(command, "$notifyIndex", notifyIndex);
+            Add(command, "$notifyName", notify.NotifyName.Text);
+            Add(command, "$notifyObjectPath", GetPackageIndexPath(notify.Notify));
+            Add(command, "$notifyStateObjectPath", GetPackageIndexPath(notify.NotifyStateClass));
+            Add(command, "$linkValue", notify.LinkValue);
+            Add(command, "$duration", notify.Duration);
+            Add(command, "$trackIndex", notify.TrackIndex);
+            Add(command, "$triggerChance", notify.NotifyTriggerChance);
+            Add(command, "$montageTickType", notify.MontageTickType.ToString());
+            Add(command, "$linkMethod", notify.LinkMethod.ToString());
+            Add(command, "$segmentIndex", notify.SegmentIndex);
+            Add(command, "$slotIndex", notify.SlotIndex);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAnimationCurves(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UAnimSequence sequence)
+    {
+        var curves = sequence.CompressedCurveData?.FloatCurves ?? [];
+        for (var curveIndex = 0; curveIndex < curves.Length; curveIndex++)
+        {
+            var curve = curves[curveIndex];
+            var keys = curve.FloatCurve.Keys ?? [];
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_curves (
+                    source_path, animation_object_path, curve_index, curve_name,
+                    curve_type_flags, key_count, min_time, max_time, min_value, max_value
+                )
+                VALUES (
+                    $sourcePath, $animationObjectPath, $curveIndex, $curveName,
+                    $curveTypeFlags, $keyCount, $minTime, $maxTime, $minValue, $maxValue
+                );
+                """;
+            Add(command, "$sourcePath", sourcePath);
+            Add(command, "$animationObjectPath", sequence.GetPathName());
+            Add(command, "$curveIndex", curveIndex);
+            Add(command, "$curveName", curve.CurveName.Text);
+            Add(command, "$curveTypeFlags", curve.CurveTypeFlags);
+            Add(command, "$keyCount", keys.Length);
+            Add(command, "$minTime", keys.Length == 0 ? null : keys.Min(x => x.Time));
+            Add(command, "$maxTime", keys.Length == 0 ? null : keys.Max(x => x.Time));
+            Add(command, "$minValue", keys.Length == 0 ? null : keys.Min(x => x.Value));
+            Add(command, "$maxValue", keys.Length == 0 ? null : keys.Max(x => x.Value));
             command.ExecuteNonQuery();
         }
     }
