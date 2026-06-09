@@ -1841,8 +1841,7 @@ internal static class UELibraryPostProcessor
         AnimationValidationSummary animationValidation)
     {
         var dbPath = Path.Combine(root, "library_index.db");
-        if (File.Exists(dbPath))
-            File.Delete(dbPath);
+        DeleteSqliteOutput(dbPath);
 
         using var connection = new SqliteConnection($"Data Source={dbPath}");
         connection.Open();
@@ -2118,6 +2117,15 @@ internal static class UELibraryPostProcessor
     {
         Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
         Execute(connection, "PRAGMA journal_mode = DELETE;");
+    }
+
+    private static void DeleteSqliteOutput(string dbPath)
+    {
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 
     private static void InsertAsset(SqliteConnection connection, SqliteTransaction transaction, JObject row)

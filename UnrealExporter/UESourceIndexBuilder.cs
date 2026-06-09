@@ -32,8 +32,7 @@ internal static class UESourceIndexBuilder
         var outputRoot = Path.GetFullPath(config.OutputDir);
         Directory.CreateDirectory(outputRoot);
         var dbPath = Path.Combine(outputRoot, "ue_source_index.db");
-        if (File.Exists(dbPath))
-            File.Delete(dbPath);
+        DeleteSqliteOutput(dbPath);
 
         var packagePatterns = BuildPackagePatterns(config);
         var packageFiles = provider.Files.Values
@@ -86,6 +85,15 @@ internal static class UESourceIndexBuilder
     {
         Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
         Execute(connection, "PRAGMA journal_mode = DELETE;");
+    }
+
+    private static void DeleteSqliteOutput(string dbPath)
+    {
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 
     private static Regex[] BuildPackagePatterns(ConfigObj config)

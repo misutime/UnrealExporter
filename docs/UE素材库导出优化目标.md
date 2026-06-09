@@ -104,5 +104,5 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 对至少一个 SkeletalMesh，能导出同 Skeleton 的动画，并在 `model_animations.json` 中建立 ExplicitSkeleton 匹配。
 - `asset_catalog.jsonl` 同时包含模型、贴图、材质、动画，并保留 UE 源路径和对象路径。
 - 共享贴图库能减少重复 PNG/HDR 文件，原路径可继续被旧流程访问。
-- SQLite 输出完成后应截断 WAL，避免 `ue_source_index.db-wal` / `library_index.db-wal` 长期重复占用磁盘空间。
+- SQLite 重建前应清理旧 `.db-wal/.db-shm`，输出完成后应截断 WAL，避免 `ue_source_index.db-wal` / `library_index.db-wal` 长期重复占用磁盘空间。
 - 任何不能导出的动画或模型都有明确 blocked/error 原因，而不是静默缺失。
