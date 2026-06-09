@@ -54,11 +54,12 @@ internal static class UELibraryPostProcessor
 
         var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
         var sourceIndex = LoadSourceIndex(root);
+        var materialTextureSlots = WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex);
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         WriteSkeletonIndex(root, reports);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, modelAnimationRelations, animationValidation);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -528,6 +529,7 @@ internal static class UELibraryPostProcessor
                 .GroupBy(x => x.SkeletonPath!, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
             snapshot.TracksByAnimation = LoadTracksByAnimation(connection);
+            snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
         }
         catch (Exception ex)
         {
@@ -610,6 +612,168 @@ internal static class UELibraryPostProcessor
         }
 
         return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static SourceMaterialTextureSlot[] LoadSourceMaterialTextureSlots(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, material_object_path, material_name, slot_name,
+                   texture_path, texture_name, texture_object_path, relation_source
+            FROM material_texture_slots
+            ORDER BY material_object_path, slot_name, texture_object_path, relation_source;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<SourceMaterialTextureSlot>();
+        while (reader.Read())
+        {
+            result.Add(new SourceMaterialTextureSlot
+            {
+                SourcePath = GetString(reader, 0),
+                MaterialObjectPath = GetString(reader, 1),
+                MaterialName = GetString(reader, 2),
+                SlotName = GetString(reader, 3),
+                TexturePath = GetString(reader, 4),
+                TextureName = GetString(reader, 5),
+                TextureObjectPath = GetString(reader, 6),
+                RelationSource = GetString(reader, 7) ?? "",
+            });
+        }
+
+        return result.ToArray();
+    }
+
+    private static MaterialTextureSlotLink[] WriteMaterialTextureSlotLinks(
+        string root,
+        Dictionary<string, MaterialInfo> materialIndex,
+        List<TextureLinkInfo> textureLinks,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var links = BuildMaterialTextureSlotLinks(materialIndex, textureLinks, sourceIndex);
+        var path = Path.Combine(root, "material_texture_slots.jsonl");
+        using var writer = new StreamWriter(path, false, Encoding.UTF8);
+        foreach (var link in links.OrderBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.SlotName, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.TextureObjectPath, StringComparer.OrdinalIgnoreCase))
+        {
+            writer.WriteLine(JsonConvert.SerializeObject(new
+            {
+                kind = "MaterialTextureSlot",
+                link.MaterialName,
+                link.MaterialPath,
+                link.MaterialObjectPath,
+                link.SlotName,
+                link.TextureName,
+                link.TextureObjectPath,
+                link.TexturePath,
+                link.ExportedTexture,
+                link.SharedTexture,
+                link.Sha256,
+                link.HardLinked,
+                link.MatchStatus,
+                link.MatchReason,
+                link.RelationSource,
+            }));
+        }
+
+        return links;
+    }
+
+    private static MaterialTextureSlotLink[] BuildMaterialTextureSlotLinks(
+        Dictionary<string, MaterialInfo> materialIndex,
+        List<TextureLinkInfo> textureLinks,
+        SourceIndexSnapshot sourceIndex)
+    {
+        if (!sourceIndex.Available || sourceIndex.MaterialTextureSlots.Length == 0)
+            return [];
+
+        var result = new List<MaterialTextureSlotLink>();
+        foreach (var slot in sourceIndex.MaterialTextureSlots)
+        {
+            var material = FindMaterialInfo(materialIndex, slot.MaterialName);
+            var textureLink = FindTextureLink(textureLinks, slot);
+            result.Add(new MaterialTextureSlotLink
+            {
+                MaterialName = slot.MaterialName ?? "",
+                MaterialPath = material?.RelativePath,
+                MaterialObjectPath = slot.MaterialObjectPath,
+                SlotName = slot.SlotName ?? "",
+                TextureName = slot.TextureName,
+                TextureObjectPath = slot.TextureObjectPath,
+                TexturePath = slot.TexturePath,
+                ExportedTexture = textureLink?.RelativePath,
+                SharedTexture = textureLink?.SharedRelativePath,
+                Sha256 = textureLink?.Hash,
+                HardLinked = textureLink?.HardLinked,
+                MatchStatus = textureLink == null ? "missingExportedTexture" : "matched",
+                MatchReason = textureLink == null
+                    ? "源索引记录了材质贴图槽，但当前导出目录中没有找到对应 PNG/HDR。"
+                    : "通过 UE texture object path / texture name 匹配到已导出贴图，并关联共享贴图。",
+                RelationSource = slot.RelationSource,
+            });
+        }
+
+        return result.ToArray();
+    }
+
+    private static MaterialInfo? FindMaterialInfo(Dictionary<string, MaterialInfo> materialIndex, string? materialName)
+    {
+        if (string.IsNullOrWhiteSpace(materialName))
+            return null;
+
+        if (materialIndex.TryGetValue(materialName, out var exact))
+            return exact;
+
+        return materialIndex.Values.FirstOrDefault(x => string.Equals(x.Name, materialName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static TextureLinkInfo? FindTextureLink(List<TextureLinkInfo> textureLinks, SourceMaterialTextureSlot slot)
+    {
+        var objectPath = slot.TextureObjectPath ?? slot.TexturePath;
+        if (!string.IsNullOrWhiteSpace(objectPath))
+        {
+            var packageSuffix = BuildPackageSuffix(objectPath);
+            if (!string.IsNullOrWhiteSpace(packageSuffix))
+            {
+                var exactSuffixMatches = textureLinks
+                    .Where(x => TextureRelativeWithoutExtension(x.RelativePath).EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (exactSuffixMatches.Length == 1)
+                    return exactSuffixMatches[0];
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(slot.TextureName))
+            return null;
+
+        var nameMatches = textureLinks
+            .Where(x => string.Equals(Path.GetFileNameWithoutExtension(x.RelativePath), slot.TextureName, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return nameMatches.Length == 1 ? nameMatches[0] : null;
+    }
+
+    private static string BuildPackageSuffix(string objectPath)
+    {
+        var packagePath = objectPath.Replace('\\', '/');
+        var dot = packagePath.LastIndexOf('.');
+        if (dot > 0)
+            packagePath = packagePath[..dot];
+
+        if (packagePath.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase))
+            return "/Content/" + packagePath["/Game/".Length..];
+        if (packagePath.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
+            return "Engine/Content/" + packagePath["/Engine/".Length..];
+        if (packagePath.StartsWith("/", StringComparison.OrdinalIgnoreCase))
+            return packagePath.TrimStart('/');
+
+        return packagePath;
+    }
+
+    private static string TextureRelativeWithoutExtension(string relativePath)
+    {
+        var text = relativePath.Replace('\\', '/');
+        var extension = Path.GetExtension(text);
+        return string.IsNullOrWhiteSpace(extension) ? text : text[..^extension.Length];
     }
 
     private static AnimationValidationSummary WriteAnimationValidation(
@@ -969,6 +1133,7 @@ internal static class UELibraryPostProcessor
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
         List<TextureLinkInfo> textureLinks,
+        MaterialTextureSlotLink[] materialTextureSlots,
         JObject modelAnimationRelations,
         AnimationValidationSummary animationValidation)
     {
@@ -1029,6 +1194,25 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE material_texture_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_name TEXT NOT NULL,
+                material_path TEXT,
+                material_object_path TEXT,
+                slot_name TEXT NOT NULL,
+                texture_name TEXT,
+                texture_object_path TEXT,
+                texture_path TEXT,
+                exported_texture TEXT,
+                shared_texture TEXT,
+                sha256 TEXT,
+                hard_linked INTEGER,
+                match_status TEXT NOT NULL,
+                match_reason TEXT,
+                relation_source TEXT
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE model_animation_relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model TEXT NOT NULL,
@@ -1076,6 +1260,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
@@ -1088,6 +1274,9 @@ internal static class UELibraryPostProcessor
 
         foreach (var report in reports)
             InsertModelValidation(connection, transaction, report);
+
+        foreach (var slot in materialTextureSlots)
+            InsertMaterialTextureSlot(connection, transaction, slot);
 
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
@@ -1169,6 +1358,44 @@ internal static class UELibraryPostProcessor
         Add(command, "$skeletonHash", report.SkeletonHash);
         Add(command, "$bboxJson", report.BBox == null ? null : JsonConvert.SerializeObject(report.BBox));
         Add(command, "$notesJson", JsonConvert.SerializeObject(report.Notes));
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertMaterialTextureSlot(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        MaterialTextureSlotLink slot)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO material_texture_slots (
+                material_name, material_path, material_object_path, slot_name,
+                texture_name, texture_object_path, texture_path,
+                exported_texture, shared_texture, sha256, hard_linked,
+                match_status, match_reason, relation_source
+            )
+            VALUES (
+                $materialName, $materialPath, $materialObjectPath, $slotName,
+                $textureName, $textureObjectPath, $texturePath,
+                $exportedTexture, $sharedTexture, $sha256, $hardLinked,
+                $matchStatus, $matchReason, $relationSource
+            );
+            """;
+        Add(command, "$materialName", slot.MaterialName);
+        Add(command, "$materialPath", slot.MaterialPath);
+        Add(command, "$materialObjectPath", slot.MaterialObjectPath);
+        Add(command, "$slotName", slot.SlotName);
+        Add(command, "$textureName", slot.TextureName);
+        Add(command, "$textureObjectPath", slot.TextureObjectPath);
+        Add(command, "$texturePath", slot.TexturePath);
+        Add(command, "$exportedTexture", slot.ExportedTexture);
+        Add(command, "$sharedTexture", slot.SharedTexture);
+        Add(command, "$sha256", slot.Sha256);
+        Add(command, "$hardLinked", slot.HardLinked == null ? null : slot.HardLinked.Value ? 1 : 0);
+        Add(command, "$matchStatus", slot.MatchStatus);
+        Add(command, "$matchReason", slot.MatchReason);
+        Add(command, "$relationSource", slot.RelationSource);
         command.ExecuteNonQuery();
     }
 
@@ -1385,6 +1612,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `model_validation.json` | GLB 静态结构、材质、贴图、skin 验证报告。 |");
         sb.AppendLine("| `skeletons.json` | 按 GLB skin joints 生成的骨架分组。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
+        sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
         sb.AppendLine("## 下一步");
@@ -1642,6 +1870,7 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceBone[]> BonesByOwner { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SourceBone[]> BonesBySkeleton { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SourceAnimationTrack[]> TracksByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
     }
 
     private sealed class SourceBone
@@ -1663,6 +1892,36 @@ internal static class UELibraryPostProcessor
         public int TrackIndex { get; set; }
         public int BoneIndex { get; set; }
         public string? BoneName { get; set; }
+    }
+
+    private sealed class SourceMaterialTextureSlot
+    {
+        public string? SourcePath { get; set; }
+        public string? MaterialObjectPath { get; set; }
+        public string? MaterialName { get; set; }
+        public string? SlotName { get; set; }
+        public string? TexturePath { get; set; }
+        public string? TextureName { get; set; }
+        public string? TextureObjectPath { get; set; }
+        public string RelationSource { get; set; } = string.Empty;
+    }
+
+    private sealed class MaterialTextureSlotLink
+    {
+        public string MaterialName { get; set; } = string.Empty;
+        public string? MaterialPath { get; set; }
+        public string? MaterialObjectPath { get; set; }
+        public string SlotName { get; set; } = string.Empty;
+        public string? TextureName { get; set; }
+        public string? TextureObjectPath { get; set; }
+        public string? TexturePath { get; set; }
+        public string? ExportedTexture { get; set; }
+        public string? SharedTexture { get; set; }
+        public string? Sha256 { get; set; }
+        public bool? HardLinked { get; set; }
+        public string MatchStatus { get; set; } = string.Empty;
+        public string? MatchReason { get; set; }
+        public string RelationSource { get; set; } = string.Empty;
     }
 
     private sealed class ModelBoneLookup
