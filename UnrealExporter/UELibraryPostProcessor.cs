@@ -24,7 +24,8 @@ internal static class UELibraryPostProcessor
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
         Console.WriteLine($"UE Library postprocess root: {root}");
-        var glbFiles = Directory.EnumerateFiles(root, "*.glb", SearchOption.AllDirectories)
+        var modelFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
+            .Where(IsSupportedGltfModel)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var materialJsonFiles = Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories)
@@ -32,12 +33,12 @@ internal static class UELibraryPostProcessor
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        Console.WriteLine($"Scanning {glbFiles.Length} GLB model(s), {materialJsonFiles.Length} material JSON file(s).");
+        Console.WriteLine($"Scanning {modelFiles.Length} glTF model(s), {materialJsonFiles.Length} material JSON file(s).");
         var materialIndex = LoadMaterialIndex(root, materialJsonFiles);
-        var reports = new List<ModelValidationEntry>(glbFiles.Length);
-        var catalogRows = new List<JObject>(glbFiles.Length + materialIndex.Count);
+        var reports = new List<ModelValidationEntry>(modelFiles.Length);
+        var catalogRows = new List<JObject>(modelFiles.Length + materialIndex.Count);
 
-        foreach (var glbPath in glbFiles)
+        foreach (var glbPath in modelFiles)
         {
             var report = InspectModel(root, glbPath, materialIndex);
             reports.Add(report);
@@ -78,6 +79,13 @@ internal static class UELibraryPostProcessor
         {
             return false;
         }
+    }
+
+    private static bool IsSupportedGltfModel(string path)
+    {
+        var ext = Path.GetExtension(path);
+        return ext.Equals(".glb", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".gltf", StringComparison.OrdinalIgnoreCase);
     }
 
     private static Dictionary<string, MaterialInfo> LoadMaterialIndex(string root, string[] materialJsonFiles)
@@ -129,7 +137,7 @@ internal static class UELibraryPostProcessor
         byte[] binData;
         try
         {
-            (gltf, binData) = ReadGlb(glbPath);
+            (gltf, binData) = ReadGltfModel(glbPath);
         }
         catch (Exception ex)
         {
@@ -139,7 +147,7 @@ internal static class UELibraryPostProcessor
                 Path = glbPath,
                 RelativePath = MakeRelative(root, glbPath),
                 Name = Path.GetFileNameWithoutExtension(glbPath),
-                Notes = [$"GLB parse failed: {ex.Message}"],
+                Notes = [$"glTF parse failed: {ex.Message}"],
             };
         }
 
@@ -231,6 +239,27 @@ internal static class UELibraryPostProcessor
         var binLength = reader.ReadInt32();
         _ = reader.ReadBytes(4);
         var binData = reader.ReadBytes(binLength);
+        return (gltf, binData);
+    }
+
+    private static (JObject Gltf, byte[] BinData) ReadGltfModel(string path)
+    {
+        if (path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
+            return ReadGlb(path);
+
+        var gltf = JObject.Parse(File.ReadAllText(path));
+        byte[] binData = [];
+        if (gltf["buffers"] is JArray buffers && buffers.First is JObject buffer)
+        {
+            var uri = buffer["uri"]?.Value<string>();
+            if (!string.IsNullOrWhiteSpace(uri) && !uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                var binPath = Path.Combine(Path.GetDirectoryName(path)!, Uri.UnescapeDataString(uri));
+                if (File.Exists(binPath))
+                    binData = File.ReadAllBytes(binPath);
+            }
+        }
+
         return (gltf, binData);
     }
 
@@ -367,10 +396,10 @@ internal static class UELibraryPostProcessor
             kind = "Model",
             resourceKind = report.ResourceKind,
             name = report.Name,
-            sourceType = report.SkinCount > 0 ? "SkeletalOrSkinnedMeshGLB" : "StaticMeshGLB",
+            sourceType = report.SkinCount > 0 ? "SkeletalOrSkinnedMeshGltf" : "StaticMeshGltf",
             source = report.RelativePath,
             output = report.RelativePath,
-            format = "glb",
+            format = Path.GetExtension(report.RelativePath).TrimStart('.').ToLowerInvariant(),
             meshCount = report.MeshCount,
             materialCount = report.MaterialCount,
             textureCount = report.ImageCount,
@@ -1090,7 +1119,7 @@ internal static class UELibraryPostProcessor
         var summary = new
         {
             generatedAt = DateTime.UtcNow.ToString("O"),
-            rule = "验证 GLB 静态结构、材质、贴图和 skin。动画正确性需要后续 UE 动画索引和预览验证。",
+            rule = "验证 GLB/glTF 静态结构、材质、贴图和 skin。动画正确性需要后续 UE 动画索引和预览验证。",
             totals = new
             {
                 models = reports.Count,
@@ -1574,7 +1603,7 @@ internal static class UELibraryPostProcessor
             JsonConvert.SerializeObject(new
             {
                 generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "骨架分组来自已导出 GLB skin joints。后续应由 UE 源索引补充 USkeleton 路径和动画关系。",
+                rule = "骨架分组来自已导出 GLB/glTF skin joints。后续应由 UE 源索引补充 USkeleton 路径和动画关系。",
                 skeletonCount = skeletons.Length,
                 skeletons,
             }, Formatting.Indented),
@@ -1589,14 +1618,14 @@ internal static class UELibraryPostProcessor
         var sb = new StringBuilder();
         sb.AppendLine("# UE Asset Library");
         sb.AppendLine();
-        sb.AppendLine("这份目录由 UnrealExporter 导出主链路和素材库索引步骤生成。当前阶段重点验证 GLB、材质 JSON、贴图硬链接、骨骼、动画和 UE 原始关系。");
+        sb.AppendLine("这份目录由 UnrealExporter 导出主链路和素材库索引步骤生成。当前阶段重点验证 GLB/glTF、材质 JSON、贴图硬链接、骨骼、动画和 UE 原始关系。");
         sb.AppendLine();
         sb.AppendLine("## 统计");
         sb.AppendLine();
         sb.AppendLine($"- 模型: `{reports.Count}`");
         sb.AppendLine($"- 带 skin/骨骼模型: `{reports.Count(x => x.SkinCount > 0)}`");
         sb.AppendLine($"- 材质 JSON: `{materials.Count()}`");
-        sb.AppendLine($"- GLB 内动画: `{reports.Count(x => x.AnimationCount > 0)}`");
+        sb.AppendLine($"- 模型内动画: `{reports.Count(x => x.AnimationCount > 0)}`");
         sb.AppendLine();
         sb.AppendLine("## 索引文件");
         sb.AppendLine();
@@ -1609,8 +1638,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
         sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配，并回填动画验证结果。 |");
         sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
-        sb.AppendLine("| `model_validation.json` | GLB 静态结构、材质、贴图、skin 验证报告。 |");
-        sb.AppendLine("| `skeletons.json` | 按 GLB skin joints 生成的骨架分组。 |");
+        sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
+        sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
@@ -1713,12 +1742,12 @@ internal static class UELibraryPostProcessor
             JsonConvert.SerializeObject(new
             {
                 generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "重复 PNG/HDR 统一复制到 Textures/_Shared，再把重复文件替换为硬链接。GLB 内嵌贴图暂不改写。",
+                rule = "重复 PNG/HDR 统一复制到 Textures/_Shared，再把重复文件替换为硬链接。模型容器内嵌贴图暂不改写。",
                 scanned = textureFiles.Length,
                 unique = byHash.Count,
                 copiedToShared = copied,
                 hardLinkedFiles = linked,
-                note = "所有原 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 内嵌贴图暂不改写。",
+                note = "所有原 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；模型容器内嵌贴图暂不改写。",
             }, Formatting.Indented),
             Encoding.UTF8);
         Console.WriteLine($"Texture dedupe finished: scanned={textureFiles.Length}, unique={byHash.Count}, linked={linked}");

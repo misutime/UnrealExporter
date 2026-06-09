@@ -971,6 +971,7 @@ public class UnrealExporter
                                         var options = new ExporterOptions
                                         {
                                             LodFormat = ELodFormat.FirstLod,
+                                            // CUE4Parse 当前只直接写 GLB；gltf 在导出成功后拆成文本容器和 bin。
                                             MeshFormat = EMeshFormat.Gltf2,
                                             MaterialFormat = EMaterialFormat.AllLayersNoRef,
                                             TextureFormat = ETextureFormat.Png,
@@ -995,7 +996,14 @@ public class UnrealExporter
                                                 )
                                             )
                                             {
-                                                SanitizeGlbForPreview(savedFilePath);
+                                                if (outputType == "gltf")
+                                                {
+                                                    savedFilePath = ConvertGlbToGltf(savedFilePath, deleteSourceGlb: true);
+                                                }
+                                                else
+                                                {
+                                                    SanitizeGlbForPreview(savedFilePath);
+                                                }
                                                 if (config.LogOutputs)
                                                     Console.WriteLine($"=> {savedFilePath}");
                                                 AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
@@ -1006,7 +1014,7 @@ public class UnrealExporter
 
                                             string meshFailure = DescribeMeshExportFailure(obj, options);
                                             Console.WriteLine(
-                                                $"ERROR: Failed to export {file.Value.Path} as GLB{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}{(meshFailure.Length > 0 ? $" [{meshFailure}]" : "")}."
+                                                $"ERROR: Failed to export {file.Value.Path} as {outputType.ToUpperInvariant()}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}{(meshFailure.Length > 0 ? $" [{meshFailure}]" : "")}."
                                             );
                                         }
                                         catch (Exception ex)
@@ -1259,7 +1267,7 @@ public class UnrealExporter
             source = sourcePath,
             objectPath = obj.GetPathName(),
             output = Path.GetFullPath(outputPath),
-            format = "glb",
+            format = Path.GetExtension(outputPath).TrimStart('.').ToLowerInvariant(),
             hasSkeleton = isSkeletal,
             boneCount = skeletalMesh?.ReferenceSkeleton?.FinalRefBoneInfo?.Length ?? 0,
             materialCount = skeletalMesh?.SkeletalMaterials?.Length ?? staticMesh?.Materials?.Length ?? 0,
@@ -1525,6 +1533,60 @@ public class UnrealExporter
         if (text.Contains("/props/") || text.Contains("/prop/") || text.Contains("/collectable"))
             return "Prop";
         return "Unknown";
+    }
+
+    public static string ConvertGlbToGltf(string savedFilePath, bool deleteSourceGlb)
+    {
+        if (!savedFilePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
+            return savedFilePath;
+
+        byte[] data = File.ReadAllBytes(savedFilePath);
+        if (data.Length < 28 || System.Text.Encoding.ASCII.GetString(data, 0, 4) != "glTF")
+            throw new InvalidDataException($"Not a GLB file: {savedFilePath}");
+
+        uint version = BitConverter.ToUInt32(data, 4);
+        if (version != 2)
+            throw new InvalidDataException($"Unsupported GLB version {version}: {savedFilePath}");
+
+        int offset = 12;
+        string? jsonText = null;
+        byte[]? binData = null;
+        while (offset + 8 <= data.Length)
+        {
+            int chunkLength = BitConverter.ToInt32(data, offset);
+            uint chunkType = BitConverter.ToUInt32(data, offset + 4);
+            int chunkStart = offset + 8;
+            if (chunkLength < 0 || chunkStart + chunkLength > data.Length)
+                throw new InvalidDataException($"Invalid GLB chunk: {savedFilePath}");
+
+            if (chunkType == 0x4E4F534A)
+                jsonText = System.Text.Encoding.UTF8.GetString(data, chunkStart, chunkLength).TrimEnd('\0', ' ', '\r', '\n', '\t');
+            else if (chunkType == 0x004E4942)
+            {
+                binData = new byte[chunkLength];
+                Buffer.BlockCopy(data, chunkStart, binData, 0, chunkLength);
+            }
+
+            offset = chunkStart + chunkLength;
+        }
+
+        if (string.IsNullOrWhiteSpace(jsonText))
+            throw new InvalidDataException($"GLB JSON chunk is missing: {savedFilePath}");
+
+        var gltf = JObject.Parse(jsonText);
+        string gltfPath = Path.ChangeExtension(savedFilePath, ".gltf");
+        if (binData is { Length: > 0 })
+        {
+            string binName = Path.GetFileNameWithoutExtension(gltfPath) + ".bin";
+            File.WriteAllBytes(Path.Combine(Path.GetDirectoryName(gltfPath)!, binName), binData);
+            if (gltf["buffers"] is JArray buffers && buffers.First is JObject buffer)
+                buffer["uri"] = binName;
+        }
+
+        File.WriteAllText(gltfPath, gltf.ToString(Formatting.Indented));
+        if (deleteSourceGlb)
+            File.Delete(savedFilePath);
+        return gltfPath;
     }
 
     public static void SanitizeGlbForPreview(string savedFilePath)
