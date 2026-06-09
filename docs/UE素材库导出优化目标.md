@@ -65,7 +65,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `skeleton_bones` 和 `animation_tracks`，记录模型/骨架的 boneName、parentIndex，以及动画 track 到 skeleton bone index/boneName 的映射。
 - 已支持 `mesh_sockets`，记录 StaticMesh、SkeletalMesh、USkeleton 的 socket 名、绑定骨骼和相对 TRS，服务挂件、武器、特效和任务道具组合关系。
 - 已支持 `component_asset_relations`，从 BlueprintGeneratedClass 的 ComponentTemplates、SimpleConstructionScript、InheritableComponentHandler、World/Level/LevelStreaming/WorldPartition/RuntimeCell、Level Actors、Actor 组件属性、导出组件，以及 cooked 蓝图/CDO 属性里的显式 PPtr 记录 StaticMesh、SkeletalMesh、Material、Texture、Animation、Skeleton、AnimClass、BlueprintClass、Actor、关卡和分区关系。
-- 已支持素材库侧 `component_asset_relations.jsonl`、`component_groups.json` 和 `library_index.db` 同名表，把源索引中的蓝图/组件关系匹配到已导出资产；匹配不到的引用保留为 `missingExportedAsset`，组件组会额外写模型、材质、动画等缺口计数和 `missingReferences` 明细，用于判断任务模型还缺哪些部件。
+- 已支持素材库侧 `component_asset_relations.jsonl`、`component_groups.json` 和 `library_index.db` 同名表，把源索引中的蓝图/组件关系匹配到已导出资产；组件实例/模板节点标记为 `componentOnly`，不再当作缺失素材；组件组会写出组件节点、父子关系、socket、transform、模型/材质/动画缺口计数和 `missingReferences` 明细，用于判断任务模型还缺哪些部件。
 - 已支持 `autoExportReferencedAssets`，在源索引完成后按显式组件/蓝图 PPtr 自动补导被引用的 StaticMesh、SkeletalMesh、Material、Texture、Animation 和 AnimBlueprint JSON；遇到 Skeleton 引用时，会从源索引骨骼表反查同 Skeleton 的 SkeletalMesh 补导，避免任务道具只导出主模型而漏掉组合部件。
 - 已支持 `package_object_maps`，在源索引阶段记录 UE 包 ImportMap/ExportMap，并同步生成素材库侧 `package_object_maps.jsonl` 和 `library_index.db.package_object_maps`，用于分析包级依赖、导出对象、class/outer/super/template 关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。

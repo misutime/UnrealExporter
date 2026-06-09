@@ -1080,6 +1080,7 @@ internal static class UELibraryPostProcessor
         foreach (var relation in sourceIndex.ComponentAssetRelations)
         {
             var matched = FindExportedAssetForTarget(root, relation, exportedAssets, byObjectPath);
+            var isComponentOnly = relation.RelationType.Equals("Component", StringComparison.OrdinalIgnoreCase);
             result.Add(new ComponentAssetRelationLink
             {
                 SourcePath = relation.SourcePath,
@@ -1096,9 +1097,13 @@ internal static class UELibraryPostProcessor
                 TargetAssetName = (string?)matched?["name"],
                 TargetAssetKind = (string?)matched?["kind"],
                 TargetAssetOutput = (string?)matched?["output"] ?? (string?)matched?["source"],
-                MatchStatus = matched == null ? "missingExportedAsset" : "matched",
+                MatchStatus = matched == null
+                    ? (isComponentOnly ? "componentOnly" : "missingExportedAsset")
+                    : "matched",
                 MatchReason = matched == null
-                    ? "源索引记录了 UE 组件/蓝图资源关系，但当前导出目录没有找到对应资产。"
+                    ? (isComponentOnly
+                        ? "这是 UE 组件实例/模板节点，用于组合结构和 transform，不是需要导出的独立素材。"
+                        : "源索引记录了 UE 组件/蓝图资源关系，但当前导出目录没有找到对应资产。")
                     : relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
                         ? "通过 UE Skeleton 原始引用匹配到同 skeletonPath 的已导出模型。"
                         : "通过 UE object path 或包路径后缀匹配到已导出素材。",
@@ -1226,6 +1231,20 @@ internal static class UELibraryPostProcessor
                         .Where(x => !string.IsNullOrWhiteSpace(x))
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                        .ToArray(),
+                    components = group
+                        .Where(x => string.Equals(x.RelationType, "Component", StringComparison.OrdinalIgnoreCase))
+                        .DistinctBy(x => x.ComponentObjectPath ?? x.TargetPath ?? x.ComponentName ?? "", StringComparer.OrdinalIgnoreCase)
+                        .Select(x => new
+                        {
+                            x.ComponentObjectPath,
+                            x.ComponentType,
+                            x.ComponentName,
+                            x.ComponentVariableName,
+                            x.ParentComponentPath,
+                            x.SocketName,
+                            x.Transform,
+                        })
                         .ToArray(),
                     models = group
                         .Where(x => IsModelRelation(x.RelationType))
@@ -3119,7 +3138,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `component_asset_relations.jsonl` | 蓝图、组件、默认对象到模型/材质/动画/Skeleton 的显式 UE 关系。 |");
-        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要。 |");
+        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要，包含组件节点、父子关系、socket 和 transform。 |");
         sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 原始依赖和导出对象记录。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
