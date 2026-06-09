@@ -801,12 +801,15 @@ internal static class UELibraryPostProcessor
                 link.MaterialPath,
                 link.MaterialObjectPath,
                 link.SlotName,
-                link.TextureName,
-                link.TextureObjectPath,
-                link.TexturePath,
-                link.ExportedTexture,
-                link.SharedTexture,
-                link.Sha256,
+                    link.TextureName,
+                    link.TextureObjectPath,
+                    link.TexturePath,
+                    link.TextureClassName,
+                    link.TextureClassPath,
+                    link.MissingCategory,
+                    link.ExportedTexture,
+                    link.SharedTexture,
+                    link.Sha256,
                 link.HardLinked,
                 link.MatchStatus,
                 link.MatchReason,
@@ -825,11 +828,23 @@ internal static class UELibraryPostProcessor
         if (!sourceIndex.Available || sourceIndex.MaterialTextureSlots.Length == 0)
             return [];
 
+        var textureObjects = sourceIndex.PackageObjectMaps
+            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+            .GroupBy(x => x.ObjectPath!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => x.OrderBy(y => string.Equals(y.MapType, "Export", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(y => y.IsAsset == true ? 0 : 1)
+                    .First(),
+                StringComparer.OrdinalIgnoreCase);
+
         var result = new List<MaterialTextureSlotLink>();
         foreach (var slot in sourceIndex.MaterialTextureSlots)
         {
             var material = FindMaterialInfo(materialIndex, slot.MaterialName);
             var textureLink = FindTextureLink(textureLinks, slot);
+            var textureInfo = FindTextureObjectInfo(textureObjects, slot);
+            var missingCategory = textureLink == null ? ClassifyMissingTextureSlot(slot, textureInfo) : null;
             result.Add(new MaterialTextureSlotLink
             {
                 MaterialName = slot.MaterialName ?? "",
@@ -839,19 +854,97 @@ internal static class UELibraryPostProcessor
                 TextureName = slot.TextureName,
                 TextureObjectPath = slot.TextureObjectPath,
                 TexturePath = slot.TexturePath,
+                TextureClassName = textureInfo?.ClassName,
+                TextureClassPath = textureInfo?.ClassPath,
+                MissingCategory = missingCategory,
                 ExportedTexture = textureLink?.RelativePath,
                 SharedTexture = textureLink?.SharedRelativePath,
                 Sha256 = textureLink?.Hash,
                 HardLinked = textureLink?.HardLinked,
-                MatchStatus = textureLink == null ? "missingExportedTexture" : "matched",
+                MatchStatus = textureLink == null ? BuildMissingTextureStatus(missingCategory) : "matched",
                 MatchReason = textureLink == null
-                    ? "源索引记录了材质贴图槽，但当前导出目录中没有找到对应 PNG/HDR。"
+                    ? BuildMissingTextureReason(missingCategory, textureInfo)
                     : "通过 UE texture object path / texture name 匹配到已导出贴图，并关联共享贴图。",
                 RelationSource = slot.RelationSource,
             });
         }
 
         return result.ToArray();
+    }
+
+    private static SourcePackageObjectMap? FindTextureObjectInfo(
+        Dictionary<string, SourcePackageObjectMap> textureObjects,
+        SourceMaterialTextureSlot slot)
+    {
+        foreach (var path in new[] { slot.TextureObjectPath, slot.TexturePath })
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                continue;
+            if (textureObjects.TryGetValue(path, out var exact))
+                return exact;
+
+            var packagePath = NormalizePackageObjectPath(path);
+            if (!string.IsNullOrWhiteSpace(packagePath) && textureObjects.TryGetValue(packagePath, out var packageMatch))
+                return packageMatch;
+        }
+
+        return null;
+    }
+
+    private static string NormalizePackageObjectPath(string objectPath)
+    {
+        var path = objectPath.Replace('\\', '/').Trim();
+        var dot = path.LastIndexOf('.');
+        if (dot <= 0)
+            return path;
+
+        var package = path[..dot];
+        var name = path[(dot + 1)..];
+        return string.Equals(package.Split('/').LastOrDefault(), name, StringComparison.OrdinalIgnoreCase)
+            ? path
+            : package + "." + package.Split('/').LastOrDefault();
+    }
+
+    private static string ClassifyMissingTextureSlot(SourceMaterialTextureSlot slot, SourcePackageObjectMap? textureInfo)
+    {
+        var classText = $"{textureInfo?.ClassName} {textureInfo?.ClassPath}".ToLowerInvariant();
+        var objectPath = (slot.TextureObjectPath ?? slot.TexturePath ?? "").Replace('\\', '/');
+
+        if (classText.Contains("rendertarget"))
+            return "runtimeRenderTarget";
+        if (classText.Contains("volumetexture") || classText.Contains("texturecube") || classText.Contains("texture2darray"))
+            return "unsupportedTextureType";
+        if (classText.Contains("curve") || classText.Contains("atlas"))
+            return "materialDataTexture";
+        if (objectPath.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase))
+            return "engineScriptObject";
+        if (textureInfo == null)
+            return "unresolvedTexturePackage";
+
+        return "exportedTextureMissing";
+    }
+
+    private static string BuildMissingTextureStatus(string? missingCategory)
+    {
+        return missingCategory switch
+        {
+            "runtimeRenderTarget" or "unsupportedTextureType" or "materialDataTexture" or "engineScriptObject" => "nonExportableTexture",
+            "unresolvedTexturePackage" => "unresolvedTexturePackage",
+            _ => "missingExportedTexture",
+        };
+    }
+
+    private static string BuildMissingTextureReason(string? missingCategory, SourcePackageObjectMap? textureInfo)
+    {
+        return missingCategory switch
+        {
+            "runtimeRenderTarget" => "源索引记录的是运行时 RenderTarget，当前不能按普通 PNG 贴图导出。",
+            "unsupportedTextureType" => $"源索引记录的是 {textureInfo?.ClassName ?? "特殊贴图"}，当前贴图导出链路只稳定支持 Texture2D。",
+            "materialDataTexture" => $"源索引记录的是 {textureInfo?.ClassName ?? "材质数据资源"}，更像材质参数/曲线数据，暂不按普通贴图验收。",
+            "engineScriptObject" => "材质槽指向 UE 脚本默认对象，不是可直接导出的贴图资产。",
+            "unresolvedTexturePackage" => "源索引记录了材质贴图槽，但没有在 UE 包 Import/Export 记录中定位到对应贴图对象。",
+            _ => "源索引记录了普通材质贴图槽，但当前导出目录中没有找到对应 PNG/HDR。",
+        };
     }
 
     private static ComponentAssetRelationLink[] WriteComponentAssetRelations(
@@ -1498,10 +1591,12 @@ internal static class UELibraryPostProcessor
                 ok = validations.Count(x => x.Status == "ok"),
                 warning = validations.Count(x => x.Status == "warning"),
                 error = validations.Count(x => x.Status == "error"),
+                containerAnimations = validations.Count(x => x.IsContainerAnimation),
             }),
             ["validations"] = JArray.FromObject(validations.Select(x => new
             {
                 status = x.Status,
+                validationCategory = x.ValidationCategory,
                 reason = x.Reason,
                 model = x.ModelOutput,
                 modelName = x.ModelName,
@@ -1518,6 +1613,7 @@ internal static class UELibraryPostProcessor
                 missingTrackBones = x.MissingTrackBones.Take(64).ToArray(),
                 trackCoverage = x.TrackCoverage,
                 hierarchyCompatible = x.HierarchyCompatible,
+                isContainerAnimation = x.IsContainerAnimation,
                 hierarchyMismatchCount = x.HierarchyMismatches.Length,
                 hierarchyMismatches = x.HierarchyMismatches.Take(32).ToArray(),
             })),
@@ -1577,32 +1673,48 @@ internal static class UELibraryPostProcessor
         var matchedTrackBones = Math.Max(0, namedTrackCount - missingTrackBones.Length);
         var trackCoverage = namedTrackCount == 0 ? 0 : Math.Round((double)matchedTrackBones / namedTrackCount, 4);
         var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex);
+        var isContainerAnimation = IsContainerAnimation(animation);
         var status = "ok";
+        var validationCategory = "directTrack";
         var reason = "Skeleton 路径一致，动画 track 骨骼被模型骨架覆盖，重叠骨骼层级兼容。";
 
         if (!sourceIndex.Available)
         {
             status = "warning";
+            validationCategory = "missingSourceIndex";
             reason = "缺少 ue_source_index.db，无法验证骨骼覆盖和动画 track。";
         }
         else if (modelBones.Bones.Length == 0)
         {
             status = "warning";
+            validationCategory = "missingModelBones";
             reason = "源索引中没有找到模型骨骼，暂时只能依赖 UE Skeleton 路径。";
         }
         else if (animationTracks.Length == 0)
         {
-            status = "warning";
-            reason = "源索引中没有找到动画 track，暂时只能依赖 UE Skeleton 路径。";
+            if (isContainerAnimation)
+            {
+                status = "ok";
+                validationCategory = "containerAnimation";
+                reason = "这是 Montage/Composite 容器动画，本身没有直接 bone track；已保留 segment/section 和引用 AnimSequence 关系。";
+            }
+            else
+            {
+                status = "warning";
+                validationCategory = "missingAnimationTracks";
+                reason = "源索引中没有找到动画 track，暂时只能依赖 UE Skeleton 路径。";
+            }
         }
         else if (missingTrackBones.Length > 0)
         {
             status = "error";
+            validationCategory = "missingTrackBones";
             reason = "动画 track 引用了模型骨架中不存在的骨骼。";
         }
         else if (hierarchyMismatches.Length > 0)
         {
             status = "warning";
+            validationCategory = "hierarchyMismatch";
             reason = "动画和模型的部分重叠骨骼父级不一致，需要人工复核。";
         }
 
@@ -1610,6 +1722,7 @@ internal static class UELibraryPostProcessor
         {
             PairKey = BuildPairKey(model, animation),
             Status = status,
+            ValidationCategory = validationCategory,
             Reason = reason,
             ModelOutput = (string?)model["output"] ?? "",
             ModelName = (string?)model["name"] ?? "",
@@ -1625,9 +1738,14 @@ internal static class UELibraryPostProcessor
             MissingTrackBones = missingTrackBones,
             TrackCoverage = trackCoverage,
             HierarchyCompatible = hierarchyMismatches.Length == 0,
+            IsContainerAnimation = isContainerAnimation,
             HierarchyMismatches = hierarchyMismatches,
         };
     }
+
+    private static bool IsContainerAnimation(JObject animation)
+        => animation["segments"] is JArray segments && segments.Count > 0
+           || animation["sections"] is JArray sections && sections.Count > 0;
 
     private static ModelBoneLookup FindModelBones(JObject model, string? skeletonPath, SourceIndexSnapshot sourceIndex)
     {
@@ -1745,9 +1863,11 @@ internal static class UELibraryPostProcessor
                         sectionCount = x["sections"] is JArray sections ? sections.Count : 0,
                         sections = x["sections"],
                         validationStatus = validation?.Status,
+                        validationCategory = validation?.ValidationCategory,
                         validationReason = validation?.Reason,
                         trackCoverage = validation?.TrackCoverage,
                         hierarchyCompatible = validation?.HierarchyCompatible,
+                        isContainerAnimation = validation?.IsContainerAnimation,
                         missingTrackBones = validation?.MissingTrackBones.Take(32).ToArray(),
                     };
                 })
@@ -1913,6 +2033,9 @@ internal static class UELibraryPostProcessor
                 texture_name TEXT,
                 texture_object_path TEXT,
                 texture_path TEXT,
+                texture_class_name TEXT,
+                texture_class_path TEXT,
+                missing_category TEXT,
                 exported_texture TEXT,
                 shared_texture TEXT,
                 sha256 TEXT,
@@ -2058,12 +2181,14 @@ internal static class UELibraryPostProcessor
                 animation TEXT NOT NULL,
                 skeleton_path TEXT,
                 status TEXT NOT NULL,
+                validation_category TEXT,
                 reason TEXT,
                 model_bone_count INTEGER NOT NULL,
                 animation_track_count INTEGER NOT NULL,
                 matched_track_bones INTEGER NOT NULL,
                 track_coverage REAL NOT NULL,
                 hierarchy_compatible INTEGER NOT NULL,
+                is_container_animation INTEGER NOT NULL,
                 missing_track_bones_json TEXT NOT NULL,
                 hierarchy_mismatches_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
@@ -2223,13 +2348,13 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO material_texture_slots (
                 material_name, material_path, material_object_path, slot_name,
-                texture_name, texture_object_path, texture_path,
+                texture_name, texture_object_path, texture_path, texture_class_name, texture_class_path, missing_category,
                 exported_texture, shared_texture, sha256, hard_linked,
                 match_status, match_reason, relation_source
             )
             VALUES (
                 $materialName, $materialPath, $materialObjectPath, $slotName,
-                $textureName, $textureObjectPath, $texturePath,
+                $textureName, $textureObjectPath, $texturePath, $textureClassName, $textureClassPath, $missingCategory,
                 $exportedTexture, $sharedTexture, $sha256, $hardLinked,
                 $matchStatus, $matchReason, $relationSource
             );
@@ -2241,6 +2366,9 @@ internal static class UELibraryPostProcessor
         Add(command, "$textureName", slot.TextureName);
         Add(command, "$textureObjectPath", slot.TextureObjectPath);
         Add(command, "$texturePath", slot.TexturePath);
+        Add(command, "$textureClassName", slot.TextureClassName);
+        Add(command, "$textureClassPath", slot.TextureClassPath);
+        Add(command, "$missingCategory", slot.MissingCategory);
         Add(command, "$exportedTexture", slot.ExportedTexture);
         Add(command, "$sharedTexture", slot.SharedTexture);
         Add(command, "$sha256", slot.Sha256);
@@ -2526,6 +2654,7 @@ internal static class UELibraryPostProcessor
             var rawJson = JObject.FromObject(new
             {
                 validation.Status,
+                validation.ValidationCategory,
                 validation.Reason,
                 model = validation.ModelOutput,
                 animation = validation.AnimationOutput,
@@ -2535,6 +2664,7 @@ internal static class UELibraryPostProcessor
                 validation.MatchedTrackBones,
                 validation.TrackCoverage,
                 validation.HierarchyCompatible,
+                validation.IsContainerAnimation,
                 validation.MissingTrackBones,
                 validation.HierarchyMismatches,
             });
@@ -2544,14 +2674,16 @@ internal static class UELibraryPostProcessor
             command.CommandText = """
                 INSERT INTO animation_validation (
                     model, animation, skeleton_path, status, reason,
+                    validation_category,
                     model_bone_count, animation_track_count, matched_track_bones,
-                    track_coverage, hierarchy_compatible,
+                    track_coverage, hierarchy_compatible, is_container_animation,
                     missing_track_bones_json, hierarchy_mismatches_json, raw_json
                 )
                 VALUES (
                     $model, $animation, $skeletonPath, $status, $reason,
+                    $validationCategory,
                     $modelBoneCount, $animationTrackCount, $matchedTrackBones,
-                    $trackCoverage, $hierarchyCompatible,
+                    $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
                     $missingTrackBonesJson, $hierarchyMismatchesJson, $rawJson
                 );
                 """;
@@ -2560,11 +2692,13 @@ internal static class UELibraryPostProcessor
             Add(command, "$skeletonPath", validation.SkeletonPath);
             Add(command, "$status", validation.Status);
             Add(command, "$reason", validation.Reason);
+            Add(command, "$validationCategory", validation.ValidationCategory);
             Add(command, "$modelBoneCount", validation.ModelBoneCount);
             Add(command, "$animationTrackCount", validation.AnimationTrackCount);
             Add(command, "$matchedTrackBones", validation.MatchedTrackBones);
             Add(command, "$trackCoverage", validation.TrackCoverage);
             Add(command, "$hierarchyCompatible", validation.HierarchyCompatible ? 1 : 0);
+            Add(command, "$isContainerAnimation", validation.IsContainerAnimation ? 1 : 0);
             Add(command, "$missingTrackBonesJson", JsonConvert.SerializeObject(validation.MissingTrackBones));
             Add(command, "$hierarchyMismatchesJson", JsonConvert.SerializeObject(validation.HierarchyMismatches));
             Add(command, "$rawJson", rawJson.ToString(Formatting.None));
@@ -2756,7 +2890,10 @@ internal static class UELibraryPostProcessor
         var componentGroups = BuildComponentGroupRows(componentAssetRelations);
         var animationRelations = (JArray?)modelAnimationRelations["relations"] ?? [];
         var matchedModelAnimationRelations = animationRelations.Count(x => ((JArray?)x["animations"] ?? []).Count > 0);
-        var missingMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "missingExportedTexture", StringComparison.OrdinalIgnoreCase));
+        var unmatchedMaterialSlots = materialTextureSlots.Count(x => !string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase));
+        var actionableMissingMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "missingExportedTexture", StringComparison.OrdinalIgnoreCase));
+        var nonExportableMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "nonExportableTexture", StringComparison.OrdinalIgnoreCase));
+        var unresolvedMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "unresolvedTexturePackage", StringComparison.OrdinalIgnoreCase));
         var missingComponentRefs = componentGroups.Sum(x => x.MissingReferenceCount);
         var modelWarnings = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
         var modelErrors = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
@@ -2766,7 +2903,7 @@ internal static class UELibraryPostProcessor
 
         var healthStatus =
             modelErrors > 0 || validationErrors > 0 ? "error" :
-            modelWarnings > 0 || missingComponentRefs > 0 || missingMaterialSlots > 0 || linkErrors > 0 || validationWarnings > 0 ? "warning" :
+            modelWarnings > 0 || missingComponentRefs > 0 || actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 || linkErrors > 0 || validationWarnings > 0 ? "warning" :
             "ok";
 
         var issues = new JArray();
@@ -2782,8 +2919,13 @@ internal static class UELibraryPostProcessor
             issues.Add(new JObject { ["level"] = "error", ["area"] = "models", ["message"] = $"有 {modelErrors} 个模型结构验证失败。" });
         if (modelWarnings > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "models", ["message"] = $"有 {modelWarnings} 个模型存在结构或材质侧车验证警告。" });
-        if (missingMaterialSlots > 0)
-            issues.Add(new JObject { ["level"] = "warning", ["area"] = "materials", ["message"] = $"有 {missingMaterialSlots} 个材质贴图槽没有匹配到已导出贴图。" });
+        if (unmatchedMaterialSlots > 0)
+            issues.Add(new JObject
+            {
+                ["level"] = actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 ? "warning" : "info",
+                ["area"] = "materials",
+                ["message"] = $"有 {unmatchedMaterialSlots} 个材质贴图槽没有匹配到已导出贴图，其中普通贴图缺失 {actionableMissingMaterialSlots} 个、源包未定位 {unresolvedMaterialSlots} 个、暂不可按 PNG 导出 {nonExportableMaterialSlots} 个。",
+            });
         if (missingComponentRefs > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "components", ["message"] = $"有 {missingComponentRefs} 个蓝图/组件显式资源引用没有匹配到已导出素材。" });
         if (validationErrors > 0 || validationWarnings > 0)
@@ -2833,7 +2975,17 @@ internal static class UELibraryPostProcessor
                 total = materials.Length,
                 textureSlots = materialTextureSlots.Length,
                 matchedTextureSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase)),
-                missingTextureSlots = missingMaterialSlots,
+                missingTextureSlots = unmatchedMaterialSlots,
+                actionableMissingTextureSlots = actionableMissingMaterialSlots,
+                unresolvedTextureSlots = unresolvedMaterialSlots,
+                nonExportableTextureSlots = nonExportableMaterialSlots,
+                missingCategories = materialTextureSlots
+                    .Where(x => !string.IsNullOrWhiteSpace(x.MissingCategory))
+                    .GroupBy(x => x.MissingCategory, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new { name = x.Key, count = x.Count() })
+                    .ToArray(),
             }),
             ["components"] = JObject.FromObject(new
             {
@@ -2866,6 +3018,13 @@ internal static class UELibraryPostProcessor
                 validationOk = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
                 validationWarning = validationWarnings,
                 validationError = validationErrors,
+                containerAnimations = animationValidation.Validations.Count(x => x.IsContainerAnimation),
+                validationCategories = animationValidation.Validations
+                    .GroupBy(x => x.ValidationCategory, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new { name = x.Key, count = x.Count() })
+                    .ToArray(),
             }),
             ["sourceObjects"] = JObject.FromObject(new
             {
@@ -3289,6 +3448,9 @@ internal static class UELibraryPostProcessor
         public string? TextureName { get; set; }
         public string? TextureObjectPath { get; set; }
         public string? TexturePath { get; set; }
+        public string? TextureClassName { get; set; }
+        public string? TextureClassPath { get; set; }
+        public string? MissingCategory { get; set; }
         public string? ExportedTexture { get; set; }
         public string? SharedTexture { get; set; }
         public string? Sha256 { get; set; }
@@ -3395,6 +3557,7 @@ internal static class UELibraryPostProcessor
     {
         public string PairKey { get; set; } = string.Empty;
         public string Status { get; set; } = "unknown";
+        public string ValidationCategory { get; set; } = "unknown";
         public string Reason { get; set; } = string.Empty;
         public string ModelOutput { get; set; } = string.Empty;
         public string ModelName { get; set; } = string.Empty;
@@ -3410,6 +3573,7 @@ internal static class UELibraryPostProcessor
         public string[] MissingTrackBones { get; set; } = [];
         public double TrackCoverage { get; set; }
         public bool HierarchyCompatible { get; set; }
+        public bool IsContainerAnimation { get; set; }
         public string[] HierarchyMismatches { get; set; } = [];
     }
 }
