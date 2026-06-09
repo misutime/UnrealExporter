@@ -78,7 +78,14 @@ internal static class UESourceIndexBuilder
         }
 
         transaction.Commit();
+        FinalizeSqliteOutput(connection);
         Console.WriteLine($"UE source index written: {dbPath}");
+    }
+
+    private static void FinalizeSqliteOutput(SqliteConnection connection)
+    {
+        Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+        Execute(connection, "PRAGMA journal_mode = DELETE;");
     }
 
     private static Regex[] BuildPackagePatterns(ConfigObj config)

@@ -83,7 +83,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 - 在 UE Skeleton 引用匹配后，增加骨骼名覆盖率、track bone index 覆盖率和骨架层级检查。
 - 当前源索引已具备骨骼层级和 track 映射数据，并已接入 `model_animations.json` 的兼容验证和 `animation_validation.json` 报告。
-- 已对 Montage/Composite 展开 segment，保留 slot、section、segment 时间范围；后续要把组合动画 segment 纳入导出/验证候选。
+- 已对 Montage/Composite 展开 segment，保留 slot、section、segment 时间范围；`autoExportReferencedAssets` 已把组合动画自身和子动画纳入导出候选。
 - 已输出 `animation_validation.json`，区分 ok、warning、error，并记录缺源索引、缺模型骨骼、缺动画 track、骨骼缺失和层级不一致等原因。
 
 ### P2：素材库浏览质量
@@ -104,4 +104,5 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 对至少一个 SkeletalMesh，能导出同 Skeleton 的动画，并在 `model_animations.json` 中建立 ExplicitSkeleton 匹配。
 - `asset_catalog.jsonl` 同时包含模型、贴图、材质、动画，并保留 UE 源路径和对象路径。
 - 共享贴图库能减少重复 PNG/HDR 文件，原路径可继续被旧流程访问。
+- SQLite 输出完成后应截断 WAL，避免 `ue_source_index.db-wal` / `library_index.db-wal` 长期重复占用磁盘空间。
 - 任何不能导出的动画或模型都有明确 blocked/error 原因，而不是静默缺失。

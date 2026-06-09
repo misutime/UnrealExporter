@@ -2111,6 +2111,13 @@ internal static class UELibraryPostProcessor
         InsertAnimationValidation(connection, transaction, animationValidation);
 
         transaction.Commit();
+        FinalizeSqliteOutput(connection);
+    }
+
+    private static void FinalizeSqliteOutput(SqliteConnection connection)
+    {
+        Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+        Execute(connection, "PRAGMA journal_mode = DELETE;");
     }
 
     private static void InsertAsset(SqliteConnection connection, SqliteTransaction transaction, JObject row)
