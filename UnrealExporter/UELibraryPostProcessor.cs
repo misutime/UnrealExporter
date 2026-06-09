@@ -997,6 +997,15 @@ internal static class UELibraryPostProcessor
         if (string.IsNullOrWhiteSpace(relation.TargetPath))
             return null;
 
+        if (relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
+        {
+            var skeletonMatches = exportedAssets
+                .Where(x => string.Equals((string?)x["skeletonPath"], relation.TargetPath, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (skeletonMatches.Length == 1)
+                return skeletonMatches[0];
+        }
+
         var packageSuffix = BuildPackageSuffix(relation.TargetPath);
         if (string.IsNullOrWhiteSpace(packageSuffix))
             return null;

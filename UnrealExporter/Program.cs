@@ -1252,7 +1252,7 @@ public class UnrealExporter
               AND target_path != ''
               AND relation_type IN (
                   'StaticMesh', 'SkeletalMesh', 'Material', 'Texture',
-                  'Animation', 'AnimClass', 'AnimBlueprintGeneratedClass'
+                  'Animation', 'AnimClass', 'AnimBlueprintGeneratedClass', 'Skeleton'
               );
             """;
         using var reader = command.ExecuteReader();
@@ -1260,6 +1260,12 @@ public class UnrealExporter
         {
             var relationType = reader.GetString(0);
             var targetPath = reader.GetString(1);
+            if (relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
+            {
+                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules);
+                continue;
+            }
+
             var outputType = InferOutputTypeForReferencedAsset(relationType, targetPath);
             if (outputType == null)
                 continue;
@@ -1291,6 +1297,41 @@ public class UnrealExporter
             $"Auto referenced exports: {rules.Count} rule(s)" +
             (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : ""));
         return rules;
+    }
+
+    private static int AddSkeletonMeshExportRules(
+        SqliteConnection connection,
+        AbstractFileProvider provider,
+        string skeletonPath,
+        Dictionary<string, string> rules)
+    {
+        var unresolved = 0;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT source_path
+            FROM skeleton_bones
+            WHERE skeleton_path = $skeletonPath
+              AND owner_type = 'SkeletalMesh'
+              AND source_path IS NOT NULL
+              AND source_path != '';
+            """;
+        command.Parameters.AddWithValue("$skeletonPath", skeletonPath);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var sourcePath = NormalizeAssetPath(reader.GetString(0));
+            var file = provider.Files.Values.FirstOrDefault(x =>
+                NormalizeAssetPath(x.Path).Equals(sourcePath, StringComparison.OrdinalIgnoreCase));
+            if (file == null)
+            {
+                unresolved++;
+                continue;
+            }
+
+            rules[NormalizeAssetPath(file.Path)] = $"{Regex.Escape(file.Path)}:glb";
+        }
+
+        return unresolved;
     }
 
     private static Dictionary<string, string[]> BuildPackageFileLookup(AbstractFileProvider provider)
