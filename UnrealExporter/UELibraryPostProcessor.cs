@@ -2661,15 +2661,11 @@ internal static class UELibraryPostProcessor
     private static string InferResourceKind(string path)
     {
         var text = path.Replace('\\', '/').ToLowerInvariant();
+        if (IsTaskOrPropLikePath(text))
+            return "Prop";
         if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/") ||
             text.Contains("/grappling/") || text.Contains("/grapplegun/"))
             return "Weapon";
-        if (text.Contains("/item/") || text.Contains("/items/") ||
-            text.Contains("/props/") || text.Contains("/prop/") ||
-            text.Contains("/collectable") || text.Contains("/targets/") ||
-            text.Contains("/abilities/") || text.Contains("/coreabilities/") ||
-            text.Contains("/anomaly/"))
-            return "Prop";
         if (text.Contains("/environment/") || text.Contains("/scenery/") || text.Contains("/building/") || text.Contains("/plants/"))
             return "Environment";
         if (text.Contains("/vehicle") || text.Contains("/vehicles/"))
@@ -2678,6 +2674,22 @@ internal static class UELibraryPostProcessor
             return "Character";
         return "Unknown";
     }
+
+    private static bool IsTaskOrPropLikePath(string normalizedLowerPath)
+        => normalizedLowerPath.Contains("/item/") ||
+           normalizedLowerPath.Contains("/items/") ||
+           normalizedLowerPath.Contains("/props/") ||
+           normalizedLowerPath.Contains("/prop/") ||
+           normalizedLowerPath.Contains("/collectable") ||
+           normalizedLowerPath.Contains("/collectible") ||
+           normalizedLowerPath.Contains("/targets/") ||
+           normalizedLowerPath.Contains("/target/") ||
+           normalizedLowerPath.Contains("/quest") ||
+           normalizedLowerPath.Contains("/mission") ||
+           normalizedLowerPath.Contains("/objective") ||
+           normalizedLowerPath.Contains("/interact") ||
+           normalizedLowerPath.Contains("/pickup") ||
+           normalizedLowerPath.Contains("/anomaly/");
 
     private static string MakeRelative(string root, string path)
         => Path.GetRelativePath(root, path).Replace('\\', '/');

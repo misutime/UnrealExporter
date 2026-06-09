@@ -1627,18 +1627,35 @@ public class UnrealExporter
     private static string InferCatalogResourceKind(string sourcePath)
     {
         var text = sourcePath.Replace('\\', '/').ToLowerInvariant();
-        if (text.Contains("/characters/") || text.Contains("/character/"))
-            return "Character";
-        if (text.Contains("/vehicle"))
-            return "Vehicle";
-        if (text.Contains("/weapon") || text.Contains("/gadgets/"))
+        if (IsTaskOrPropLikePath(text))
+            return "Prop";
+        if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/") ||
+            text.Contains("/grappling/") || text.Contains("/grapplegun/"))
             return "Weapon";
         if (text.Contains("/environment/") || text.Contains("/scenery/") || text.Contains("/building/") || text.Contains("/plants/"))
             return "Environment";
-        if (text.Contains("/props/") || text.Contains("/prop/") || text.Contains("/collectable"))
-            return "Prop";
+        if (text.Contains("/vehicle") || text.Contains("/vehicles/"))
+            return "Vehicle";
+        if (text.Contains("/characters/") || text.Contains("/character/"))
+            return "Character";
         return "Unknown";
     }
+
+    private static bool IsTaskOrPropLikePath(string normalizedLowerPath)
+        => normalizedLowerPath.Contains("/item/") ||
+           normalizedLowerPath.Contains("/items/") ||
+           normalizedLowerPath.Contains("/props/") ||
+           normalizedLowerPath.Contains("/prop/") ||
+           normalizedLowerPath.Contains("/collectable") ||
+           normalizedLowerPath.Contains("/collectible") ||
+           normalizedLowerPath.Contains("/targets/") ||
+           normalizedLowerPath.Contains("/target/") ||
+           normalizedLowerPath.Contains("/quest") ||
+           normalizedLowerPath.Contains("/mission") ||
+           normalizedLowerPath.Contains("/objective") ||
+           normalizedLowerPath.Contains("/interact") ||
+           normalizedLowerPath.Contains("/pickup") ||
+           normalizedLowerPath.Contains("/anomaly/");
 
     public static string ConvertGlbToGltf(string savedFilePath, bool deleteSourceGlb)
     {
