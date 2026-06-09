@@ -1580,7 +1580,14 @@ internal static class UELibraryPostProcessor
         if (packagePath.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
             return "Engine/Content/" + packagePath["/Engine/".Length..];
         if (packagePath.StartsWith("/", StringComparison.OrdinalIgnoreCase))
-            return packagePath.TrimStart('/');
+        {
+            var pluginPath = packagePath.TrimStart('/');
+            var slashIndex = pluginPath.IndexOf('/');
+            // 和导出阶段保持一致：插件 mount point 需要映射到 PluginName/Content/...。
+            if (slashIndex > 0 && !pluginPath.Contains("/Content/", StringComparison.OrdinalIgnoreCase))
+                return pluginPath[..slashIndex] + "/Content/" + pluginPath[(slashIndex + 1)..];
+            return pluginPath;
+        }
 
         return packagePath;
     }

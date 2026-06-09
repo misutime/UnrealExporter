@@ -1478,7 +1478,13 @@ public class UnrealExporter
 
         var contentIndex = withoutExtension.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
         if (contentIndex >= 0)
+        {
             yield return withoutExtension[contentIndex..].TrimStart('/');
+            // UE 插件资源的虚拟路径通常是 /PluginName/...，pak 内实际路径会带 PluginName/Content/...
+            var ownerStart = withoutExtension.LastIndexOf('/', Math.Max(0, contentIndex - 1));
+            if (ownerStart >= 0 && ownerStart + 1 < contentIndex)
+                yield return withoutExtension[(ownerStart + 1)..];
+        }
 
         if (withoutExtension.StartsWith("Engine/Content/", StringComparison.OrdinalIgnoreCase))
             yield return withoutExtension;
@@ -1523,7 +1529,13 @@ public class UnrealExporter
         if (path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
             return "Engine/Content/" + path["/Engine/".Length..];
 
-        return path.TrimStart('/');
+        var pluginPath = path.TrimStart('/');
+        var slashIndex = pluginPath.IndexOf('/');
+        // 非 /Game、/Engine 的 mount point 按 UE 插件 Content 路径尝试匹配。
+        if (slashIndex > 0 && !pluginPath.Contains("/Content/", StringComparison.OrdinalIgnoreCase))
+            return pluginPath[..slashIndex] + "/Content/" + pluginPath[(slashIndex + 1)..];
+
+        return pluginPath;
     }
 
     private static string NormalizeObjectPath(string path)
