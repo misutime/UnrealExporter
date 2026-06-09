@@ -13,6 +13,7 @@ using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse.UE4.Assets.Exports.WorldPartition;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Engine;
@@ -466,8 +467,23 @@ internal static class UESourceIndexBuilder
         if (obj is UBlueprintGeneratedClass blueprintClass)
             InsertBlueprintComponentRelations(connection, transaction, file.Path, blueprintClass);
 
+        if (obj is UWorld world)
+            InsertWorldRelations(connection, transaction, file.Path, world);
+
         if (obj is ULevel level)
-            InsertLevelActorRelations(connection, transaction, file.Path, level);
+            InsertLevelRelations(connection, transaction, file.Path, level);
+
+        if (obj is ULevelStreaming levelStreaming)
+            InsertLevelStreamingRelations(connection, transaction, file.Path, levelStreaming);
+
+        if (obj is AWorldSettings worldSettings)
+            InsertWorldSettingsRelations(connection, transaction, file.Path, worldSettings);
+
+        if (obj is UWorldPartition worldPartition)
+            InsertWorldPartitionRelations(connection, transaction, file.Path, worldPartition);
+
+        if (obj is UWorldPartitionRuntimeCell runtimeCell)
+            InsertWorldPartitionRuntimeCellRelations(connection, transaction, file.Path, runtimeCell);
 
         if (obj is AActor actor)
             InsertActorComponentRelations(connection, transaction, file.Path, actor, "ActorComponent");
@@ -566,38 +582,179 @@ internal static class UESourceIndexBuilder
         return componentPath;
     }
 
-    private static void InsertLevelActorRelations(
+    private static void InsertWorldRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UWorld world)
+    {
+        InsertPackageIndexObjectRelation(connection, transaction, sourcePath, world, world.PersistentLevel, "WorldPersistentLevel", "Level", "PersistentLevel");
+
+        if (world.ExtraReferencedObjects != null)
+        {
+            for (var index = 0; index < world.ExtraReferencedObjects.Length; index++)
+            {
+                InsertPackageIndexObjectRelation(
+                    connection,
+                    transaction,
+                    sourcePath,
+                    world,
+                    world.ExtraReferencedObjects[index],
+                    "WorldExtraReference",
+                    "WorldReference",
+                    $"ExtraReferencedObjects[{index}]");
+            }
+        }
+
+        if (world.StreamingLevels == null)
+            return;
+
+        for (var index = 0; index < world.StreamingLevels.Length; index++)
+        {
+            InsertPackageIndexObjectRelation(
+                connection,
+                transaction,
+                sourcePath,
+                world,
+                world.StreamingLevels[index],
+                "WorldStreamingLevel",
+                "LevelStreaming",
+                $"StreamingLevels[{index}]");
+        }
+    }
+
+    private static void InsertLevelRelations(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string sourcePath,
         ULevel level)
     {
-        var ownerPath = level.GetPathName();
+        InsertPackageIndexObjectRelation(connection, transaction, sourcePath, level, level.WorldSettings, "LevelWorldSettings", "WorldSettings", "WorldSettings");
+        InsertPackageIndexObjectRelation(connection, transaction, sourcePath, level, level.WorldDataLayers, "LevelWorldDataLayers", "WorldDataLayers", "WorldDataLayers");
+        InsertSoftObjectPathRelation(connection, transaction, sourcePath, level, level.WorldPartitionRuntimeCell, "LevelWorldPartitionRuntimeCell", "WorldPartitionRuntimeCell", "WorldPartitionRuntimeCell");
+        InsertPackageIndexObjectRelation(connection, transaction, sourcePath, level, level.Model, "LevelModel", "Model", "Model");
+        InsertPackageIndexObjectRelation(connection, transaction, sourcePath, level, level.LevelScriptActor, "LevelScriptActor", "LevelScriptActor", "LevelScriptActor");
+
+        if (level.ModelComponents != null)
+        {
+            for (var index = 0; index < level.ModelComponents.Length; index++)
+            {
+                InsertPackageIndexObjectRelation(
+                    connection,
+                    transaction,
+                    sourcePath,
+                    level,
+                    level.ModelComponents[index],
+                    "LevelModelComponent",
+                    "ModelComponent",
+                    $"ModelComponents[{index}]");
+            }
+        }
+
         if (level.Actors == null)
             return;
 
         for (var actorIndex = 0; actorIndex < level.Actors.Length; actorIndex++)
         {
-            if (!TryLoadPackageIndex(level.Actors[actorIndex], out AActor? actor))
-                continue;
-
-            InsertComponentAssetRelation(
+            InsertPackageIndexObjectRelation(
                 connection,
                 transaction,
                 sourcePath,
-                ownerPath,
-                level.GetType().Name,
-                actor.GetPathName(),
-                actor.GetType().Name,
-                actor.Name,
-                $"Actors[{actorIndex}]",
+                level,
+                level.Actors[actorIndex],
                 "LevelActor",
                 "Actor",
-                actor.GetPathName(),
-                actor.Name,
-                null,
-                null,
-                CUE4Parse.UE4.Objects.Core.Math.FTransform.Identity);
+                $"Actors[{actorIndex}]");
+        }
+    }
+
+    private static void InsertLevelStreamingRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        ULevelStreaming levelStreaming)
+    {
+        InsertSoftObjectPathRelation(
+            connection,
+            transaction,
+            sourcePath,
+            levelStreaming,
+            levelStreaming.WorldAsset,
+            "LevelStreamingWorldAsset",
+            "WorldAsset",
+            "WorldAsset");
+    }
+
+    private static void InsertWorldSettingsRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        AWorldSettings worldSettings)
+    {
+        InsertPackageIndexObjectRelation(
+            connection,
+            transaction,
+            sourcePath,
+            worldSettings,
+            worldSettings.WorldPartition,
+            "WorldSettingsPartition",
+            "WorldPartition",
+            "WorldPartition");
+    }
+
+    private static void InsertWorldPartitionRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UWorldPartition worldPartition)
+    {
+        InsertPackageIndexObjectRelation(
+            connection,
+            transaction,
+            sourcePath,
+            worldPartition,
+            worldPartition.RuntimeHash,
+            "WorldPartitionRuntimeHash",
+            "RuntimeHash",
+            "RuntimeHash");
+        InsertPackageIndexObjectRelation(
+            connection,
+            transaction,
+            sourcePath,
+            worldPartition,
+            worldPartition.StreamingPolicy,
+            "WorldPartitionStreamingPolicy",
+            "StreamingPolicy",
+            "StreamingPolicy");
+    }
+
+    private static void InsertWorldPartitionRuntimeCellRelations(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UWorldPartitionRuntimeCell runtimeCell)
+    {
+        InsertPackageIndexObjectRelation(
+            connection,
+            transaction,
+            sourcePath,
+            runtimeCell,
+            runtimeCell.RuntimeCellData,
+            "WorldPartitionRuntimeCellData",
+            "RuntimeCellData",
+            "RuntimeCellData");
+
+        if (runtimeCell is UWorldPartitionRuntimeLevelStreamingCell levelStreamingCell)
+        {
+            InsertPackageIndexObjectRelation(
+                connection,
+                transaction,
+                sourcePath,
+                runtimeCell,
+                levelStreamingCell.LevelStreaming,
+                "WorldPartitionLevelStreamingCell",
+                "LevelStreaming",
+                "LevelStreaming");
         }
     }
 
@@ -746,6 +903,93 @@ internal static class UESourceIndexBuilder
             // cooked 蓝图里有些组件模板会缺类或缺外部包；跳过单个引用，避免整包源索引失败。
             return false;
         }
+    }
+
+    private static void InsertPackageIndexObjectRelation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UObject owner,
+        FPackageIndex? targetIndex,
+        string relationSource,
+        string relationType,
+        string? relationName)
+    {
+        if (targetIndex is not { IsNull: false })
+            return;
+
+        var targetPath = GetPackageIndexPath(targetIndex);
+        var targetName = targetIndex.Name;
+        var targetType = relationType;
+        try
+        {
+            if (targetIndex.Load<UObject>() is { } loaded)
+            {
+                targetPath = loaded.GetPathName();
+                targetName = loaded.Name;
+                targetType = loaded.GetType().Name;
+            }
+        }
+        catch
+        {
+            // 外部 Actor/流式关卡可能缺包或按需加载失败；保留 PPtr 名称，不能让整包索引中断。
+        }
+
+        InsertRelation(connection, transaction, sourcePath, owner.GetPathName(), relationType, targetPath, targetName);
+        InsertComponentAssetRelation(
+            connection,
+            transaction,
+            sourcePath,
+            owner.GetPathName(),
+            owner.GetType().Name,
+            targetPath ?? targetName ?? owner.GetPathName(),
+            targetType,
+            targetName,
+            relationName,
+            relationSource,
+            relationType,
+            targetPath,
+            targetName,
+            null,
+            null,
+            CUE4Parse.UE4.Objects.Core.Math.FTransform.Identity);
+    }
+
+    private static void InsertSoftObjectPathRelation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UObject owner,
+        FSoftObjectPath? softPath,
+        string relationSource,
+        string relationType,
+        string? relationName)
+    {
+        if (softPath is not { } value)
+            return;
+
+        var pathText = value.ToString();
+        if (string.IsNullOrWhiteSpace(pathText))
+            return;
+
+        InsertRelation(connection, transaction, sourcePath, owner.GetPathName(), relationType, pathText, value.AssetPathName.Text);
+        InsertComponentAssetRelation(
+            connection,
+            transaction,
+            sourcePath,
+            owner.GetPathName(),
+            owner.GetType().Name,
+            pathText,
+            relationType,
+            value.AssetPathName.Text,
+            relationName,
+            relationSource,
+            relationType,
+            pathText,
+            value.AssetPathName.Text,
+            null,
+            null,
+            CUE4Parse.UE4.Objects.Core.Math.FTransform.Identity);
     }
 
     private static IEnumerable<USCS_Node> GetAllSCSNodesSafe(USimpleConstructionScript script)

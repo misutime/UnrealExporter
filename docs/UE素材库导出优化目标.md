@@ -63,11 +63,11 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `material_texture_slots`，记录材质名、slot 名、贴图路径、贴图对象路径和关系来源：`DirectParameter`、`ResolvedParams`、`ReferencedTexture`。
 - 已支持 `skeleton_bones` 和 `animation_tracks`，记录模型/骨架的 boneName、parentIndex，以及动画 track 到 skeleton bone index/boneName 的映射。
 - 已支持 `mesh_sockets`，记录 StaticMesh、SkeletalMesh、USkeleton 的 socket 名、绑定骨骼和相对 TRS，服务挂件、武器、特效和任务道具组合关系。
-- 已支持 `component_asset_relations`，从 BlueprintGeneratedClass 的 ComponentTemplates、SimpleConstructionScript、InheritableComponentHandler、Level Actors、Actor 组件属性、导出组件，以及 cooked 蓝图/CDO 属性里的显式 PPtr 记录 StaticMesh、SkeletalMesh、Material、Texture、Animation、Skeleton、AnimClass、BlueprintClass、Actor 关系。
+- 已支持 `component_asset_relations`，从 BlueprintGeneratedClass 的 ComponentTemplates、SimpleConstructionScript、InheritableComponentHandler、World/Level/LevelStreaming/WorldPartition/RuntimeCell、Level Actors、Actor 组件属性、导出组件，以及 cooked 蓝图/CDO 属性里的显式 PPtr 记录 StaticMesh、SkeletalMesh、Material、Texture、Animation、Skeleton、AnimClass、BlueprintClass、Actor、关卡和分区关系。
 - 已支持素材库侧 `component_asset_relations.jsonl`、`component_groups.json` 和 `library_index.db` 同名表，把源索引中的蓝图/组件关系匹配到已导出资产；匹配不到的引用保留为 `missingExportedAsset`，用于判断任务模型还缺哪些部件。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
-- 下一步继续扩展 Import/Export、WorldPartition/ExternalActor 和更完整依赖图，减少每次靠目录扫描和临时加载。
+- 下一步继续扩展 Import/Export、ExternalActor 描述数据和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路
 
