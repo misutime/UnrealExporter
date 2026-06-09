@@ -1782,16 +1782,21 @@ internal static class UELibraryPostProcessor
     private static string InferResourceKind(string path)
     {
         var text = path.Replace('\\', '/').ToLowerInvariant();
-        if (text.Contains("/characters/") || text.Contains("/character/"))
-            return "Character";
-        if (text.Contains("/vehicle") || text.Contains("/vehicles/"))
-            return "Vehicle";
-        if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/"))
+        if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/") ||
+            text.Contains("/grappling/") || text.Contains("/grapplegun/"))
             return "Weapon";
+        if (text.Contains("/item/") || text.Contains("/items/") ||
+            text.Contains("/props/") || text.Contains("/prop/") ||
+            text.Contains("/collectable") || text.Contains("/targets/") ||
+            text.Contains("/abilities/") || text.Contains("/coreabilities/") ||
+            text.Contains("/anomaly/"))
+            return "Prop";
         if (text.Contains("/environment/") || text.Contains("/scenery/") || text.Contains("/building/") || text.Contains("/plants/"))
             return "Environment";
-        if (text.Contains("/props/") || text.Contains("/prop/") || text.Contains("/collectable"))
-            return "Prop";
+        if (text.Contains("/vehicle") || text.Contains("/vehicles/"))
+            return "Vehicle";
+        if (text.Contains("/characters/") || text.Contains("/character/"))
+            return "Character";
         return "Unknown";
     }
 
