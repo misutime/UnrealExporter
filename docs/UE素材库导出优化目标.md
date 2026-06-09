@@ -6,7 +6,7 @@
 
 UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、AnimSequence track 到骨骼的映射，以及 Montage/Composite segment、slot、section 与子动画引用，并用于验证模型动画候选的 track 覆盖率和骨骼层级兼容性。
+本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、AnimSequence track 到骨骼的映射，以及 Montage/Composite segment、slot、section 与子动画引用，并用于验证模型动画候选的 track 覆盖率和骨骼层级兼容性。
 
 ## 完整实现目标
 
@@ -21,7 +21,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `texture_links.jsonl` 必须记录原贴图、共享贴图、sha256、大小和硬链接状态；`asset_catalog.jsonl` 必须包含 Texture 行。
    - `material_texture_slots.jsonl` 和 `library_index.db.material_texture_slots` 必须记录材质 slot、UE 贴图对象、导出贴图、共享贴图、sha256 和匹配状态。
    - 材质 JSON 必须保留 UE 材质参数、贴图槽、颜色、scalar、switch、blend mode 和 shading model。
-   - 已支持 `:gltf` 输出文本 glTF + `.bin`；后续要让 glTF image 直接引用共享贴图，GLB 继续作为独立预览格式。
+   - 已支持 `:gltf` 输出文本 glTF + `.bin`，并在材质槽和共享贴图明确匹配时改写 glTF image URI；GLB 继续作为独立预览格式。
    - 不能按游戏私有命名硬猜贴图用途；只能从 UE 材质槽、材质参数和通用纹理语义推断。
 
 3. 骨骼
@@ -42,11 +42,11 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 6. 索引与报告
    - `asset_catalog.jsonl` 是素材库 JSONL 总入口，必须合并导出主链路数据和验证数据。
-   - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、model_validation、model_animation_relations、relation_animations 和 animation_validation。
+   - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、animation_tracks、animation_segments、animation_sections 和 source_index_errors。
-   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、model_validation、model_animation_relations、relation_animations 和 animation_validation。
+   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、shared_gltf_texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
 
 ## 优化列表
 
@@ -69,7 +69,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 - 当前硬链接已经记录纹理哈希和共享路径；源索引已经补充材质到具体贴图槽的依赖关系。
 - 已生成 `material_texture_slots.jsonl` 和 SQLite `material_texture_slots`，把材质 slot 连接到导出贴图与 `Textures/_Shared` 共享贴图；未导出的贴图保留 `missingExportedTexture`，不伪造关系。
-- 增加 `gltf_external_textures` 模式，让已支持的文本 glTF 进一步引用共享贴图；GLB 保持可选内嵌预览。
+- 文本 glTF 已能按 UE 材质槽引用共享贴图，并通过 `shared_texture_gltf_links.jsonl` 记录改写来源；后续继续扩展更多材质语义和冲突报告。
 - 材质 JSON 增加 shared texture path 字段，便于外部工具重建材质。
 
 ### P1：模型与动画兼容验证

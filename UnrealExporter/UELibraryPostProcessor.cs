@@ -56,11 +56,12 @@ internal static class UELibraryPostProcessor
         var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
         var sourceIndex = LoadSourceIndex(root);
         var materialTextureSlots = WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex);
+        var sharedGltfTextureLinks = RewriteGltfSharedTextureUris(root, reports, materialTextureSlots);
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         WriteSkeletonIndex(root, reports);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, modelAnimationRelations, animationValidation);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -745,6 +746,180 @@ internal static class UELibraryPostProcessor
         return result.ToArray();
     }
 
+    private static SharedGltfTextureLink[] RewriteGltfSharedTextureUris(
+        string root,
+        List<ModelValidationEntry> reports,
+        MaterialTextureSlotLink[] materialTextureSlots)
+    {
+        var rows = new List<SharedGltfTextureLink>();
+        var matchedSlots = materialTextureSlots
+            .Where(x => x.MatchStatus == "matched" && !string.IsNullOrWhiteSpace(x.SharedTexture))
+            .GroupBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var report in reports.Where(x => x.RelativePath.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)))
+        {
+            var gltfPath = Path.Combine(root, report.RelativePath);
+            if (!File.Exists(gltfPath))
+                continue;
+
+            try
+            {
+                var gltf = JObject.Parse(File.ReadAllText(gltfPath));
+                var materials = ArrayOf(gltf, "materials");
+                var textures = ArrayOf(gltf, "textures");
+                var images = ArrayOf(gltf, "images");
+                var changed = false;
+                var rewrittenImages = new Dictionary<int, string>();
+
+                for (var materialIndex = 0; materialIndex < materials.Length; materialIndex++)
+                {
+                    var material = materials[materialIndex];
+                    var materialName = material["name"]?.Value<string>() ?? "";
+                    if (string.IsNullOrWhiteSpace(materialName) || !matchedSlots.TryGetValue(materialName, out var slots))
+                        continue;
+
+                    changed |= TryRewriteMaterialTexture(root, gltfPath, report, material, textures, images, slots,
+                        materialName, "baseColor", material["pbrMetallicRoughness"]?["baseColorTexture"] as JObject, rows, rewrittenImages);
+                    changed |= TryRewriteMaterialTexture(root, gltfPath, report, material, textures, images, slots,
+                        materialName, "metallicRoughness", material["pbrMetallicRoughness"]?["metallicRoughnessTexture"] as JObject, rows, rewrittenImages);
+                    changed |= TryRewriteMaterialTexture(root, gltfPath, report, material, textures, images, slots,
+                        materialName, "normal", material["normalTexture"] as JObject, rows, rewrittenImages);
+                    changed |= TryRewriteMaterialTexture(root, gltfPath, report, material, textures, images, slots,
+                        materialName, "occlusion", material["occlusionTexture"] as JObject, rows, rewrittenImages);
+                    changed |= TryRewriteMaterialTexture(root, gltfPath, report, material, textures, images, slots,
+                        materialName, "emissive", material["emissiveTexture"] as JObject, rows, rewrittenImages);
+                }
+
+                if (changed)
+                {
+                    File.WriteAllText(gltfPath, gltf.ToString(Formatting.Indented), Encoding.UTF8);
+                    report.EmbeddedImageCount = images.Count(x => x["bufferView"] != null);
+                }
+            }
+            catch (Exception ex)
+            {
+                rows.Add(new SharedGltfTextureLink
+                {
+                    Model = report.RelativePath,
+                    Status = "error",
+                    Reason = ex.Message,
+                });
+            }
+        }
+
+        var path = Path.Combine(root, "shared_texture_gltf_links.jsonl");
+        using var writer = new StreamWriter(path, false, Encoding.UTF8);
+        foreach (var row in rows.OrderBy(x => x.Model, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(x => x.Semantic, StringComparer.OrdinalIgnoreCase))
+            writer.WriteLine(JsonConvert.SerializeObject(row));
+
+        return rows.ToArray();
+    }
+
+    private static bool TryRewriteMaterialTexture(
+        string root,
+        string gltfPath,
+        ModelValidationEntry report,
+        JObject material,
+        JObject[] textures,
+        JObject[] images,
+        MaterialTextureSlotLink[] slots,
+        string materialName,
+        string semantic,
+        JObject? textureInfo,
+        List<SharedGltfTextureLink> rows,
+        Dictionary<int, string> rewrittenImages)
+    {
+        if (textureInfo == null)
+            return false;
+
+        var textureIndex = textureInfo["index"]?.Value<int>();
+        if (textureIndex == null || textureIndex < 0 || textureIndex >= textures.Length)
+            return false;
+
+        var imageIndex = textures[textureIndex.Value]["source"]?.Value<int>();
+        if (imageIndex == null || imageIndex < 0 || imageIndex >= images.Length)
+            return false;
+
+        var slot = FindBestSlotForSemantic(slots, semantic);
+        if (slot?.SharedTexture == null)
+            return false;
+
+        var sharedPath = Path.Combine(root, slot.SharedTexture);
+        if (!File.Exists(sharedPath))
+            return false;
+
+        var uri = MakeRelative(Path.GetDirectoryName(gltfPath)!, sharedPath);
+        if (rewrittenImages.TryGetValue(imageIndex.Value, out var existingUri) &&
+            !existingUri.Equals(uri, StringComparison.OrdinalIgnoreCase))
+        {
+            rows.Add(new SharedGltfTextureLink
+            {
+                Model = report.RelativePath,
+                MaterialName = materialName,
+                Semantic = semantic,
+                SlotName = slot.SlotName,
+                ImageIndex = imageIndex.Value,
+                SharedTexture = slot.SharedTexture,
+                Uri = uri,
+                Status = "conflict",
+                Reason = $"image[{imageIndex.Value}] 已被映射到 {existingUri}，跳过不同共享贴图。",
+            });
+            return false;
+        }
+
+        var image = images[imageIndex.Value];
+        var hadBufferView = image["bufferView"] != null;
+        image["uri"] = uri;
+        image.Remove("bufferView");
+        image.Remove("mimeType");
+        rewrittenImages[imageIndex.Value] = uri;
+        rows.Add(new SharedGltfTextureLink
+        {
+            Model = report.RelativePath,
+            MaterialName = materialName,
+            Semantic = semantic,
+            SlotName = slot.SlotName,
+            TextureName = slot.TextureName,
+            ImageIndex = imageIndex.Value,
+            SharedTexture = slot.SharedTexture,
+            Sha256 = slot.Sha256,
+            Uri = uri,
+            RemovedBufferView = hadBufferView,
+            Status = "rewritten",
+            Reason = "根据 UE 材质贴图槽匹配到共享贴图，并改写文本 glTF image URI。",
+        });
+        return true;
+    }
+
+    private static MaterialTextureSlotLink? FindBestSlotForSemantic(MaterialTextureSlotLink[] slots, string semantic)
+    {
+        return slots
+            .Where(x => SlotMatchesSemantic(x.SlotName, semantic))
+            .OrderByDescending(x => SlotSemanticScore(x.SlotName, semantic))
+            .ThenBy(x => x.SlotName, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+    }
+
+    private static bool SlotMatchesSemantic(string slotName, string semantic)
+        => SlotSemanticScore(slotName, semantic) > 0;
+
+    private static int SlotSemanticScore(string slotName, string semantic)
+    {
+        var slot = slotName.Replace("_", "").Replace(" ", "").Replace("-", "").ToLowerInvariant();
+        return semantic switch
+        {
+            "baseColor" when slot.Contains("basecolor") || slot.Contains("diffuse") || slot.Contains("albedo") => 100,
+            "normal" when slot.Contains("normal") => 100,
+            "metallicRoughness" when slot.Contains("specularmask") || slot.Contains("roughness") || slot.Contains("metallic") || slot.Contains("orm") || slot.Contains("mask") => 80,
+            "occlusion" when slot.Contains("ao") || slot.Contains("ambientocclusion") || slot.Contains("occlusion") || slot.Contains("specularmask") || slot.Contains("orm") || slot.Contains("mask") => 70,
+            "emissive" when slot.Contains("emissive") || slot.Contains("emission") => 100,
+            _ => 0,
+        };
+    }
+
     private static MaterialInfo? FindMaterialInfo(Dictionary<string, MaterialInfo> materialIndex, string? materialName)
     {
         if (string.IsNullOrWhiteSpace(materialName))
@@ -1163,6 +1338,7 @@ internal static class UELibraryPostProcessor
         List<ModelValidationEntry> reports,
         List<TextureLinkInfo> textureLinks,
         MaterialTextureSlotLink[] materialTextureSlots,
+        SharedGltfTextureLink[] sharedGltfTextureLinks,
         JObject modelAnimationRelations,
         AnimationValidationSummary animationValidation)
     {
@@ -1242,6 +1418,23 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE shared_gltf_texture_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                material_name TEXT,
+                semantic TEXT,
+                slot_name TEXT,
+                texture_name TEXT,
+                image_index INTEGER,
+                shared_texture TEXT,
+                sha256 TEXT,
+                uri TEXT,
+                removed_buffer_view INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE model_animation_relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model TEXT NOT NULL,
@@ -1291,6 +1484,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
+        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
+        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_status ON shared_gltf_texture_links(status);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
@@ -1306,6 +1501,9 @@ internal static class UELibraryPostProcessor
 
         foreach (var slot in materialTextureSlots)
             InsertMaterialTextureSlot(connection, transaction, slot);
+
+        foreach (var link in sharedGltfTextureLinks)
+            InsertSharedGltfTextureLink(connection, transaction, link);
 
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
@@ -1425,6 +1623,40 @@ internal static class UELibraryPostProcessor
         Add(command, "$matchStatus", slot.MatchStatus);
         Add(command, "$matchReason", slot.MatchReason);
         Add(command, "$relationSource", slot.RelationSource);
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertSharedGltfTextureLink(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SharedGltfTextureLink link)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO shared_gltf_texture_links (
+                model, material_name, semantic, slot_name, texture_name,
+                image_index, shared_texture, sha256, uri,
+                removed_buffer_view, status, reason
+            )
+            VALUES (
+                $model, $materialName, $semantic, $slotName, $textureName,
+                $imageIndex, $sharedTexture, $sha256, $uri,
+                $removedBufferView, $status, $reason
+            );
+            """;
+        Add(command, "$model", link.Model);
+        Add(command, "$materialName", link.MaterialName);
+        Add(command, "$semantic", link.Semantic);
+        Add(command, "$slotName", link.SlotName);
+        Add(command, "$textureName", link.TextureName);
+        Add(command, "$imageIndex", link.ImageIndex);
+        Add(command, "$sharedTexture", link.SharedTexture);
+        Add(command, "$sha256", link.Sha256);
+        Add(command, "$uri", link.Uri);
+        Add(command, "$removedBufferView", link.RemovedBufferView ? 1 : 0);
+        Add(command, "$status", link.Status);
+        Add(command, "$reason", link.Reason);
         command.ExecuteNonQuery();
     }
 
@@ -1642,6 +1874,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
+        sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
         sb.AppendLine("## 下一步");
@@ -1742,12 +1975,12 @@ internal static class UELibraryPostProcessor
             JsonConvert.SerializeObject(new
             {
                 generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "重复 PNG/HDR 统一复制到 Textures/_Shared，再把重复文件替换为硬链接。模型容器内嵌贴图暂不改写。",
+                rule = "重复 PNG/HDR 统一复制到 Textures/_Shared，再把重复文件替换为硬链接；文本 glTF 会按 UE 材质槽尽量引用共享贴图。",
                 scanned = textureFiles.Length,
                 unique = byHash.Count,
                 copiedToShared = copied,
                 hardLinkedFiles = linked,
-                note = "所有原 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；模型容器内嵌贴图暂不改写。",
+                note = "所有原 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 保持独立预览，文本 glTF 可通过 shared_texture_gltf_links.jsonl 追踪共享贴图改写。",
             }, Formatting.Indented),
             Encoding.UTF8);
         Console.WriteLine($"Texture dedupe finished: scanned={textureFiles.Length}, unique={byHash.Count}, linked={linked}");
@@ -1956,6 +2189,22 @@ internal static class UELibraryPostProcessor
         public string MatchStatus { get; set; } = string.Empty;
         public string? MatchReason { get; set; }
         public string RelationSource { get; set; } = string.Empty;
+    }
+
+    private sealed class SharedGltfTextureLink
+    {
+        public string Model { get; set; } = string.Empty;
+        public string MaterialName { get; set; } = string.Empty;
+        public string Semantic { get; set; } = string.Empty;
+        public string SlotName { get; set; } = string.Empty;
+        public string? TextureName { get; set; }
+        public int? ImageIndex { get; set; }
+        public string? SharedTexture { get; set; }
+        public string? Sha256 { get; set; }
+        public string? Uri { get; set; }
+        public bool RemovedBufferView { get; set; }
+        public string Status { get; set; } = string.Empty;
+        public string? Reason { get; set; }
     }
 
     private sealed class ModelBoneLookup
