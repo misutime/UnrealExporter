@@ -1686,8 +1686,9 @@ internal static class UELibraryPostProcessor
                 var exactSuffixMatches = textureLinks
                     .Where(x => TextureRelativeWithoutExtension(x.RelativePath).EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase))
                     .ToArray();
-                if (exactSuffixMatches.Length == 1)
-                    return exactSuffixMatches[0];
+                var exactMatch = PickPreferredTextureLink(exactSuffixMatches);
+                if (exactMatch != null)
+                    return exactMatch;
             }
         }
 
@@ -1697,7 +1698,25 @@ internal static class UELibraryPostProcessor
         var nameMatches = textureLinks
             .Where(x => string.Equals(Path.GetFileNameWithoutExtension(x.RelativePath), slot.TextureName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
-        return nameMatches.Length == 1 ? nameMatches[0] : null;
+        return PickPreferredTextureLink(nameMatches);
+    }
+
+    private static TextureLinkInfo? PickPreferredTextureLink(TextureLinkInfo[] matches)
+    {
+        if (matches.Length == 0)
+            return null;
+
+        if (matches.Length == 1)
+            return matches[0];
+
+        // 同一个 UTexture2D 可能同时写出 HDR 伴随文件和 PNG 预览；材质槽默认使用 PNG 作为可用素材库贴图。
+        var pngMatches = matches
+            .Where(x => x.Extension.Equals(".png", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (pngMatches.Length == 1)
+            return pngMatches[0];
+
+        return null;
     }
 
     private static string BuildPackageSuffix(string objectPath)

@@ -801,13 +801,15 @@ public class UnrealExporter
                     ""
                 );
                 var matchedByConfig = regexMatch.Length > 0;
-                autoReferencedExportRules.TryGetValue(normalizedFilePath, out var autoReferencedRule);
-                if (!matchedByConfig && autoReferencedRule != null)
-                    regexMatch = autoReferencedRule.Rule;
+                autoReferencedExportRules.TryGetValue(normalizedFilePath, out var autoReferencedRules);
+                var exportJobs = BuildExportJobs(regexMatch, matchedByConfig, autoReferencedRules);
 
                 bool isExclude = config.Exclude.Any(path =>
                     new Regex("^" + path + "$", RegexOptions.IgnoreCase).IsMatch(file.Value.Path)
                 );
+                var activeExportJobs = isExclude
+                    ? exportJobs.Where(x => x.AutoReferencedRule != null).ToList()
+                    : exportJobs;
 
                 bool isChanged = true;
 
@@ -825,398 +827,416 @@ public class UnrealExporter
                 if (config.CreateNewCheckpoint)
                     newCheckpointDict.TryAdd(file.Value.Path, file.Value.Size);
 
-                if (regexMatch.Length > 0 && !isExclude && isChanged)
+                if (activeExportJobs.Count > 0 && isChanged)
                 {
-                    var exportedThisFile = false;
                     // "uasset"
                     var fileType = file.Value.Path.SubstringAfterLast('.').ToLower();
 
-                    // "json" etc.
-                    var outputType = regexMatch.SubstringAfterLast(':').ToLower();
-
-                    try
+                    foreach (var exportJob in activeExportJobs)
                     {
-                        switch (fileType)
+                        var exportedThisJob = false;
+
+                        // "json" etc.
+                        var outputType = exportJob.OutputType;
+
+                        try
                         {
-                            // Referencing CUE4ParseViewModel.cs from Fmodel source code
-                            case "uasset":
-                            case "umap":
+                            switch (fileType)
                             {
-                                var allObjects = provider
-                                    .LoadPackage(file.Value)
-                                    .GetExports()
-                                    .ToArray();
-
-                                if (outputType == "png")
+                                // Referencing CUE4ParseViewModel.cs from Fmodel source code
+                                case "uasset":
+                                case "umap":
                                 {
-                                    foreach (var obj in allObjects)
+                                    var allObjects = provider
+                                        .LoadPackage(file.Value)
+                                        .GetExports()
+                                        .ToArray();
+
+                                    if (outputType == "png")
                                     {
-                                        // Only exports the first object that is a valid bitmap
-                                        if (obj is UTexture2D texture)
+                                        foreach (var obj in allObjects)
                                         {
-                                            var decodedTexture = texture.Decode(
-                                                ETexturePlatform.DesktopMobile
-                                            );
+                                            if (!MatchesAutoReferencedTarget(obj, exportJob.AutoReferencedRule))
+                                                continue;
 
-                                            if (decodedTexture != null)
+                                            // 配置规则导出首个贴图；自动补导按目标对象导出，避免同包多贴图互相遮住。
+                                            if (obj is UTexture2D texture)
                                             {
-                                                if (config.LogOutputs)
-                                                    Console.WriteLine("=> " + outputPath + ".png");
-                                                if (!Directory.Exists(outputDir))
-                                                    Directory.CreateDirectory(outputDir);
+                                                var decodedTexture = texture.Decode(
+                                                    ETexturePlatform.DesktopMobile
+                                                );
 
-                                                // Save the bitmap to a file
-                                                try
+                                                if (decodedTexture != null)
                                                 {
-                                                    using SKBitmap bitmap =
-                                                        decodedTexture.ToSkBitmap();
-                                                    using (
-                                                        SKImage image = SKImage.FromBitmap(bitmap)
-                                                    )
+                                                    var objectOutputPath = BuildObjectOutputPath(outputPath, outputDir, fileName, obj, exportJob.AutoReferencedRule);
+                                                    if (config.LogOutputs)
+                                                        Console.WriteLine("=> " + objectOutputPath + ".png");
+                                                    if (!Directory.Exists(Path.GetDirectoryName(objectOutputPath)!))
+                                                        Directory.CreateDirectory(Path.GetDirectoryName(objectOutputPath)!);
+
+                                                    // Save the bitmap to a file
+                                                    try
                                                     {
-                                                        using SKData data = image.Encode(
-                                                            SKEncodedImageFormat.Png,
-                                                            100
-                                                        );
-                                                        var pngPath = outputPath + ".png";
-                                                        var fileLock = FileLocks.GetOrAdd(
-                                                            pngPath,
-                                                            _ => new object()
-                                                        );
-                                                        lock (fileLock)
+                                                        using SKBitmap bitmap =
+                                                            decodedTexture.ToSkBitmap();
+                                                        using (
+                                                            SKImage image = SKImage.FromBitmap(bitmap)
+                                                        )
                                                         {
-                                                            using Stream stream = File.Open(
-                                                                pngPath,
-                                                                FileMode.Create,
-                                                                FileAccess.Write,
-                                                                FileShare.Read
+                                                            using SKData data = image.Encode(
+                                                                SKEncodedImageFormat.Png,
+                                                                100
                                                             );
-                                                            data.SaveTo(stream);
+                                                            var pngPath = objectOutputPath + ".png";
+                                                            var fileLock = FileLocks.GetOrAdd(
+                                                                pngPath,
+                                                                _ => new object()
+                                                            );
+                                                            lock (fileLock)
+                                                            {
+                                                                using Stream stream = File.Open(
+                                                                    pngPath,
+                                                                    FileMode.Create,
+                                                                    FileAccess.Write,
+                                                                    FileShare.Read
+                                                                );
+                                                                data.SaveTo(stream);
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                catch (IOException ex)
-                                                {
-                                                    Console.WriteLine(
-                                                        $"WARN: Skipped locked texture {outputPath}.png ({ex.Message})"
-                                                    );
+                                                    catch (IOException ex)
+                                                    {
+                                                        Console.WriteLine(
+                                                            $"WARN: Skipped locked texture {objectOutputPath}.png ({ex.Message})"
+                                                        );
+                                                        break;
+                                                    }
+                                                    AppendExportManifest(config, file.Value.Path, obj, objectOutputPath + ".png", "Texture");
+                                                    AppendAssetCatalog(config, BuildTextureCatalogEntry(file.Value.Path, texture, objectOutputPath + ".png"));
+                                                    exportedThisJob = true;
+                                                    Interlocked.Increment(ref totalExportedFiles);
+
                                                     break;
-                                                }
-                                                AppendExportManifest(config, file.Value.Path, obj, outputPath + ".png", "Texture");
-                                                AppendAssetCatalog(config, BuildTextureCatalogEntry(file.Value.Path, texture, outputPath + ".png"));
-                                                exportedThisFile = true;
-                                                Interlocked.Increment(ref totalExportedFiles);
-
-                                                break;
-                                            }
-                                            else
-                                            {
-                                                Console.WriteLine(
-                                                    $"ERROR: Failed to export {file.Value.Path} (not a valid image bitmap)."
-                                                );
-                                            }
-                                        }
-                                        else
-                                        {
-                                            // Not necessarily an error
-                                            // Console.WriteLine($"ERROR: Failed to export {file.Value.Path} (object is not of type UTexture2D).");
-                                        }
-                                    }
-                                }
-                                else if (outputType == "json")
-                                {
-                                    // Serialize to JSON, then write to file
-                                    if (config.LogOutputs)
-                                        Console.WriteLine("=> " + outputPath + ".json");
-                                    var json = JsonConvert.SerializeObject(
-                                        allObjects,
-                                        Formatting.Indented
-                                    );
-                                    if (!Directory.Exists(outputDir))
-                                        Directory.CreateDirectory(outputDir);
-                                    File.WriteAllText(outputPath + ".json", json);
-                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
-                                    foreach (var material in allObjects.OfType<UMaterialInterface>())
-                                        AppendAssetCatalog(config, BuildMaterialCatalogEntry(file.Value.Path, material, outputPath + ".json"));
-                                    exportedThisFile = true;
-                                    Interlocked.Increment(ref totalExportedFiles);
-                                }
-                                // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
-                                // https://github.com/4sval/FModel/blob/master/FModel/ViewModels/CUE4ParseViewModel.cs#L928
-                                // Possible refactor to include TryGetValue
-                                // https://github.com/FabianFG/CUE4Parse/blob/b3550db731303a6f383ca2b4f61737ca870deef2/CUE4Parse/FileProvider/AbstractFileProvider.cs#L562
-                                else if (outputType == "uasset")
-                                {
-                                    if (provider.TrySavePackage(file.Value, out var assets))
-                                    {
-                                        Parallel.ForEach(
-                                            assets,
-                                            kvp =>
-                                            {
-                                                if (config.LogOutputs)
-                                                    Console.WriteLine(
-                                                        "=> "
-                                                            + outputPath
-                                                            + "."
-                                                            + kvp.Key.SubstringAfterLast('.')
-                                                    );
-                                                if (!Directory.Exists(outputDir))
-                                                    Directory.CreateDirectory(outputDir);
-                                                File.WriteAllBytes(
-                                                    outputPath
-                                                        + "."
-                                                        + kvp.Key.SubstringAfterLast('.'),
-                                                    kvp.Value
-                                                );
-                                                AppendExportManifest(config, file.Value.Path, null, outputPath + "." + kvp.Key.SubstringAfterLast('.'), "RawPackage");
-                                                exportedThisFile = true;
-                                                Interlocked.Increment(ref totalExportedFiles);
-                                            }
-                                        );
-                                    }
-                                }
-                                else if (outputType is "glb" or "gltf")
-                                {
-                                    foreach (var obj in allObjects)
-                                    {
-                                        if (obj is not UStaticMesh && obj is not USkeletalMesh)
-                                            continue;
-
-                                        var options = new ExporterOptions
-                                        {
-                                            LodFormat = ELodFormat.FirstLod,
-                                            // CUE4Parse 当前只直接写 GLB；gltf 在导出成功后拆成文本容器和 bin。
-                                            MeshFormat = EMeshFormat.Gltf2,
-                                            MaterialFormat = EMaterialFormat.AllLayersNoRef,
-                                            TextureFormat = ETextureFormat.Png,
-                                            CompressionFormat = EFileCompressionFormat.None,
-                                            Platform = ETexturePlatform.DesktopMobile,
-                                            SocketFormat = ESocketFormat.Bone,
-                                            ExportMorphTargets = true,
-                                            ExportMaterials = true,
-                                            ExportHdrTexturesAsHdr = true,
-                                        };
-
-                                        try
-                                        {
-                                            var exporter = new Exporter(obj, options);
-                                            if (
-                                                exporter.TryWriteToDir(
-                                                    new DirectoryInfo(
-                                                        Path.GetFullPath(config.OutputDir)
-                                                    ),
-                                                    out var label,
-                                                    out var savedFilePath
-                                                )
-                                            )
-                                            {
-                                                if (outputType == "gltf")
-                                                {
-                                                    savedFilePath = ConvertGlbToGltf(savedFilePath, deleteSourceGlb: true);
                                                 }
                                                 else
                                                 {
-                                                    SanitizeGlbForPreview(savedFilePath);
+                                                    Console.WriteLine(
+                                                        $"ERROR: Failed to export {file.Value.Path} (not a valid image bitmap)."
+                                                    );
                                                 }
-                                                if (config.LogOutputs)
-                                                    Console.WriteLine($"=> {savedFilePath}");
-                                                AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
-                                                AppendAssetCatalog(config, BuildModelCatalogEntry(file.Value.Path, obj, savedFilePath));
-                                                exportedThisFile = true;
-                                                Interlocked.Increment(ref totalExportedFiles);
-                                                break;
                                             }
-
-                                            string meshFailure = DescribeMeshExportFailure(obj, options);
-                                            Console.WriteLine(
-                                                $"ERROR: Failed to export {file.Value.Path} as {outputType.ToUpperInvariant()}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}{(meshFailure.Length > 0 ? $" [{meshFailure}]" : "")}."
-                                            );
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Console.WriteLine(
-                                                $"WARN: Skipped mesh {file.Value.Path} ({ex.Message})"
-                                            );
-                                        }
-                                    }
-                                }
-                                else if (outputType is "ueanim" or "psa")
-                                {
-                                    foreach (var obj in allObjects)
-                                    {
-                                        if (obj is not UAnimSequence && obj is not UAnimMontage && obj is not UAnimComposite)
-                                            continue;
-
-                                        var animationAsset = (UAnimationAsset)obj;
-                                        AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "discovered", null);
-                                        if (NeedsAclNative(animationAsset) && !HasAclNativeExports())
-                                        {
-                                            const string error = "missingNativeFeature: ACL. CUE4Parse-Natives 没有编入 ACL，无法解压 ACL 压缩动画。请补齐 CUE4Parse-Natives/ACL/external/acl 后重建。";
-                                            var diagnosticPath = outputPath + "." + outputType + ".missing-acl.json";
-                                            Console.WriteLine($"WARN: Skipped animation {file.Value.Path} ({error})");
-                                            WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
-                                            AppendExportManifest(config, file.Value.Path, obj, diagnosticPath, "AnimationMetadata");
-                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "blocked", error));
-                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "blocked", error);
-                                            break;
-                                        }
-
-                                        var options = new ExporterOptions
-                                        {
-                                            AnimFormat = outputType == "ueanim" ? EAnimFormat.UEFormat : EAnimFormat.ActorX,
-                                            CompressionFormat = EFileCompressionFormat.None,
-                                        };
-
-                                        try
-                                        {
-                                            var exporter = new Exporter(obj, options);
-                                            if (
-                                                exporter.TryWriteToDir(
-                                                    new DirectoryInfo(Path.GetFullPath(config.OutputDir)),
-                                                    out var label,
-                                                    out var savedFilePath
-                                                )
-                                            )
+                                            else
                                             {
-                                                if (config.LogOutputs)
-                                                    Console.WriteLine($"=> {savedFilePath}");
-                                                AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Animation");
-                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, savedFilePath, outputType, "ok", null));
-                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, savedFilePath, "ok", null);
-                                                exportedThisFile = true;
-                                                Interlocked.Increment(ref totalExportedFiles);
+                                                // Not necessarily an error
+                                                // Console.WriteLine($"ERROR: Failed to export {file.Value.Path} (object is not of type UTexture2D).");
+                                            }
+                                        }
+                                    }
+                                    else if (outputType == "json")
+                                    {
+                                        // Serialize to JSON, then write to file
+                                        if (config.LogOutputs)
+                                            Console.WriteLine("=> " + outputPath + ".json");
+                                        var json = JsonConvert.SerializeObject(
+                                            allObjects,
+                                            Formatting.Indented
+                                        );
+                                        if (!Directory.Exists(outputDir))
+                                            Directory.CreateDirectory(outputDir);
+                                        File.WriteAllText(outputPath + ".json", json);
+                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
+                                        foreach (var material in allObjects.OfType<UMaterialInterface>())
+                                            AppendAssetCatalog(config, BuildMaterialCatalogEntry(file.Value.Path, material, outputPath + ".json"));
+                                        exportedThisJob = true;
+                                        Interlocked.Increment(ref totalExportedFiles);
+                                    }
+                                    // Referenced from FModel's ExportData(). uexp is tied to the uasset file.
+                                    // https://github.com/4sval/FModel/blob/master/FModel/ViewModels/CUE4ParseViewModel.cs#L928
+                                    // Possible refactor to include TryGetValue
+                                    // https://github.com/FabianFG/CUE4Parse/blob/b3550db731303a6f383ca2b4f61737ca870deef2/CUE4Parse/FileProvider/AbstractFileProvider.cs#L562
+                                    else if (outputType == "uasset")
+                                    {
+                                        if (provider.TrySavePackage(file.Value, out var assets))
+                                        {
+                                            Parallel.ForEach(
+                                                assets,
+                                                kvp =>
+                                                {
+                                                    if (config.LogOutputs)
+                                                        Console.WriteLine(
+                                                            "=> "
+                                                                + outputPath
+                                                                + "."
+                                                                + kvp.Key.SubstringAfterLast('.')
+                                                        );
+                                                    if (!Directory.Exists(outputDir))
+                                                        Directory.CreateDirectory(outputDir);
+                                                    File.WriteAllBytes(
+                                                        outputPath
+                                                            + "."
+                                                            + kvp.Key.SubstringAfterLast('.'),
+                                                        kvp.Value
+                                                    );
+                                                    AppendExportManifest(config, file.Value.Path, null, outputPath + "." + kvp.Key.SubstringAfterLast('.'), "RawPackage");
+                                                    exportedThisJob = true;
+                                                    Interlocked.Increment(ref totalExportedFiles);
+                                                }
+                                            );
+                                        }
+                                    }
+                                    else if (outputType is "glb" or "gltf")
+                                    {
+                                        foreach (var obj in allObjects)
+                                        {
+                                            if (!MatchesAutoReferencedTarget(obj, exportJob.AutoReferencedRule))
+                                                continue;
+
+                                            if (obj is not UStaticMesh && obj is not USkeletalMesh)
+                                                continue;
+
+                                            var options = new ExporterOptions
+                                            {
+                                                LodFormat = ELodFormat.FirstLod,
+                                                // CUE4Parse 当前只直接写 GLB；gltf 在导出成功后拆成文本容器和 bin。
+                                                MeshFormat = EMeshFormat.Gltf2,
+                                                MaterialFormat = EMaterialFormat.AllLayersNoRef,
+                                                TextureFormat = ETextureFormat.Png,
+                                                CompressionFormat = EFileCompressionFormat.None,
+                                                Platform = ETexturePlatform.DesktopMobile,
+                                                SocketFormat = ESocketFormat.Bone,
+                                                ExportMorphTargets = true,
+                                                ExportMaterials = true,
+                                                ExportHdrTexturesAsHdr = true,
+                                            };
+
+                                            try
+                                            {
+                                                var exporter = new Exporter(obj, options);
+                                                if (
+                                                    exporter.TryWriteToDir(
+                                                        new DirectoryInfo(
+                                                            Path.GetFullPath(config.OutputDir)
+                                                        ),
+                                                        out var label,
+                                                        out var savedFilePath
+                                                    )
+                                                )
+                                                {
+                                                    if (outputType == "gltf")
+                                                    {
+                                                        savedFilePath = ConvertGlbToGltf(savedFilePath, deleteSourceGlb: true);
+                                                    }
+                                                    else
+                                                    {
+                                                        SanitizeGlbForPreview(savedFilePath);
+                                                    }
+                                                    if (config.LogOutputs)
+                                                        Console.WriteLine($"=> {savedFilePath}");
+                                                    AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
+                                                    AppendAssetCatalog(config, BuildModelCatalogEntry(file.Value.Path, obj, savedFilePath));
+                                                    exportedThisJob = true;
+                                                    Interlocked.Increment(ref totalExportedFiles);
+                                                    break;
+                                                }
+
+                                                string meshFailure = DescribeMeshExportFailure(obj, options);
+                                                Console.WriteLine(
+                                                    $"ERROR: Failed to export {file.Value.Path} as {outputType.ToUpperInvariant()}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}{(meshFailure.Length > 0 ? $" [{meshFailure}]" : "")}."
+                                                );
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Console.WriteLine(
+                                                    $"WARN: Skipped mesh {file.Value.Path} ({ex.Message})"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    else if (outputType is "ueanim" or "psa")
+                                    {
+                                        foreach (var obj in allObjects)
+                                        {
+                                            if (!MatchesAutoReferencedTarget(obj, exportJob.AutoReferencedRule))
+                                                continue;
+
+                                            if (obj is not UAnimSequence && obj is not UAnimMontage && obj is not UAnimComposite)
+                                                continue;
+
+                                            var animationAsset = (UAnimationAsset)obj;
+                                            var objectOutputPath = BuildObjectOutputPath(outputPath, outputDir, fileName, obj, exportJob.AutoReferencedRule);
+                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "discovered", null);
+                                            if (NeedsAclNative(animationAsset) && !HasAclNativeExports())
+                                            {
+                                                const string error = "missingNativeFeature: ACL. CUE4Parse-Natives 没有编入 ACL，无法解压 ACL 压缩动画。请补齐 CUE4Parse-Natives/ACL/external/acl 后重建。";
+                                                var diagnosticPath = objectOutputPath + "." + outputType + ".missing-acl.json";
+                                                Console.WriteLine($"WARN: Skipped animation {file.Value.Path} ({error})");
+                                                WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
+                                                AppendExportManifest(config, file.Value.Path, obj, diagnosticPath, "AnimationMetadata");
+                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "blocked", error));
+                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "blocked", error);
                                                 break;
                                             }
 
-                                            Console.WriteLine(
-                                                $"ERROR: Failed to export {file.Value.Path} as {outputType}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}."
-                                            );
-                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "error", label));
-                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", label);
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Console.WriteLine(
-                                                $"WARN: Skipped animation {file.Value.Path} ({ex.Message})"
-                                            );
-                                            AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, outputPath + "." + outputType, outputType, "error", ex.Message));
-                                            AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", ex.Message);
+                                            var options = new ExporterOptions
+                                            {
+                                                AnimFormat = outputType == "ueanim" ? EAnimFormat.UEFormat : EAnimFormat.ActorX,
+                                                CompressionFormat = EFileCompressionFormat.None,
+                                            };
+
+                                            try
+                                            {
+                                                var exporter = new Exporter(obj, options);
+                                                if (
+                                                    exporter.TryWriteToDir(
+                                                        new DirectoryInfo(Path.GetFullPath(config.OutputDir)),
+                                                        out var label,
+                                                        out var savedFilePath
+                                                    )
+                                                )
+                                                {
+                                                    if (config.LogOutputs)
+                                                        Console.WriteLine($"=> {savedFilePath}");
+                                                    AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Animation");
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, savedFilePath, outputType, "ok", null));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, savedFilePath, "ok", null);
+                                                    exportedThisJob = true;
+                                                    Interlocked.Increment(ref totalExportedFiles);
+                                                    break;
+                                                }
+
+                                                Console.WriteLine(
+                                                    $"ERROR: Failed to export {file.Value.Path} as {outputType}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}."
+                                                );
+                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", label));
+                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", label);
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Console.WriteLine(
+                                                    $"WARN: Skipped animation {file.Value.Path} ({ex.Message})"
+                                                );
+                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", ex.Message));
+                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", ex.Message);
+                                            }
                                         }
                                     }
-                                }
 
-                                // else if (outputType == "uexp")
-                                // {
-                                //     if (config.LogOutputs) Console.WriteLine("=> " + outputPath + ".uexp");
-                                //     if (provider.TrySavePackage(file.Value, out var assets))
-                                //     {
-                                //         Parallel.ForEach(assets, kvp =>
-                                //         {
-                                //             lock (new object())
-                                //             {
-                                //                 if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
-                                //                 File.WriteAllBytes(outputPath + ".uexp", kvp.Value);
-                                //             }
-                                //         });
-                                //     }
-                                //     Interlocked.Increment(ref totalExportedFiles);
-                                // }
+                                    // else if (outputType == "uexp")
+                                    // {
+                                    //     if (config.LogOutputs) Console.WriteLine("=> " + outputPath + ".uexp");
+                                    //     if (provider.TrySavePackage(file.Value, out var assets))
+                                    //     {
+                                    //         Parallel.ForEach(assets, kvp =>
+                                    //         {
+                                    //             lock (new object())
+                                    //             {
+                                    //                 if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+                                    //                 File.WriteAllBytes(outputPath + ".uexp", kvp.Value);
+                                    //             }
+                                    //         });
+                                    //     }
+                                    //     Interlocked.Increment(ref totalExportedFiles);
+                                    // }
 
-                                break;
-                            }
-                            case "locres":
-                            {
-                                if (
-                                    outputType == "json"
-                                    && provider.TryCreateReader(file.Value.Path, out var archive)
-                                )
-                                {
-                                    if (config.LogOutputs)
-                                        Console.WriteLine("=> " + outputPath + ".json");
-                                    var locres = new FTextLocalizationResource(archive);
-                                    var json = JsonConvert.SerializeObject(
-                                        locres,
-                                        Formatting.Indented
-                                    );
-                                    if (!Directory.Exists(outputDir))
-                                        Directory.CreateDirectory(outputDir);
-                                    File.WriteAllText(outputPath + ".json", json);
-                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Localization");
-                                    Interlocked.Increment(ref totalExportedFiles);
+                                    break;
                                 }
-                                break;
-                            }
-                            case "js":
-                            {
-                                if (
-                                    outputType == fileType
-                                    && provider.TrySaveAsset(file.Value.Path, out var data)
-                                )
+                                case "locres":
                                 {
-                                    if (config.LogOutputs)
-                                        Console.WriteLine("=> " + outputPath + "." + outputType);
-                                    using var stream = new MemoryStream(data) { Position = 0 };
-                                    using var reader = new StreamReader(stream);
-                                    JSBeautifyOptions options = new() { };
-                                    JSBeautify beautifier = new(reader.ReadToEnd(), options);
-                                    if (!Directory.Exists(outputDir))
-                                        Directory.CreateDirectory(outputDir);
-                                    File.WriteAllText(outputPath + ".js", beautifier.GetResult());
-                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".js", "Js");
-                                    Interlocked.Increment(ref totalExportedFiles);
+                                    if (
+                                        outputType == "json"
+                                        && provider.TryCreateReader(file.Value.Path, out var archive)
+                                    )
+                                    {
+                                        if (config.LogOutputs)
+                                            Console.WriteLine("=> " + outputPath + ".json");
+                                        var locres = new FTextLocalizationResource(archive);
+                                        var json = JsonConvert.SerializeObject(
+                                            locres,
+                                            Formatting.Indented
+                                        );
+                                        if (!Directory.Exists(outputDir))
+                                            Directory.CreateDirectory(outputDir);
+                                        File.WriteAllText(outputPath + ".json", json);
+                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Localization");
+                                        exportedThisJob = true;
+                                        Interlocked.Increment(ref totalExportedFiles);
+                                    }
+                                    break;
                                 }
-                                break;
-                            }
-                            case "db":
-                            {
-                                if (
-                                    outputType == fileType
-                                    && provider.TrySaveAsset(file.Value.Path, out var data)
-                                )
+                                case "js":
                                 {
-                                    if (config.LogOutputs)
-                                        Console.WriteLine("=> " + outputPath + "." + outputType);
-                                    using var stream = new MemoryStream(data) { Position = 0 };
-                                    using var reader = new StreamReader(stream);
-                                    if (!Directory.Exists(outputDir))
-                                        Directory.CreateDirectory(outputDir);
-                                    File.WriteAllBytes(outputPath + ".db", data);
-                                    AppendExportManifest(config, file.Value.Path, null, outputPath + ".db", "Database");
-                                    Interlocked.Increment(ref totalExportedFiles);
+                                    if (
+                                        outputType == fileType
+                                        && provider.TrySaveAsset(file.Value.Path, out var data)
+                                    )
+                                    {
+                                        if (config.LogOutputs)
+                                            Console.WriteLine("=> " + outputPath + "." + outputType);
+                                        using var stream = new MemoryStream(data) { Position = 0 };
+                                        using var reader = new StreamReader(stream);
+                                        JSBeautifyOptions options = new() { };
+                                        JSBeautify beautifier = new(reader.ReadToEnd(), options);
+                                        if (!Directory.Exists(outputDir))
+                                            Directory.CreateDirectory(outputDir);
+                                        File.WriteAllText(outputPath + ".js", beautifier.GetResult());
+                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".js", "Js");
+                                        exportedThisJob = true;
+                                        Interlocked.Increment(ref totalExportedFiles);
+                                    }
+                                    break;
                                 }
-                                break;
+                                case "db":
+                                {
+                                    if (
+                                        outputType == fileType
+                                        && provider.TrySaveAsset(file.Value.Path, out var data)
+                                    )
+                                    {
+                                        if (config.LogOutputs)
+                                            Console.WriteLine("=> " + outputPath + "." + outputType);
+                                        using var stream = new MemoryStream(data) { Position = 0 };
+                                        using var reader = new StreamReader(stream);
+                                        if (!Directory.Exists(outputDir))
+                                            Directory.CreateDirectory(outputDir);
+                                        File.WriteAllBytes(outputPath + ".db", data);
+                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".db", "Database");
+                                        exportedThisJob = true;
+                                        Interlocked.Increment(ref totalExportedFiles);
+                                    }
+                                    break;
+                                }
                             }
                         }
-                    }
-                    catch (AggregateException ae)
-                    {
-                        Console.WriteLine(ae.Message);
-                        // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine(
-                            $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
-                        );
-                    }
+                        catch (AggregateException ae)
+                        {
+                            Console.WriteLine(ae.Message);
+                            // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine(
+                                $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
+                            );
+                        }
 
-                    if (autoReferencedRule != null)
-                    {
-                        AppendAutoReferencedExportDiagnostic(
-                            config,
-                            BuildAutoReferencedExportDiagnostic(
-                                "export",
-                                exportedThisFile ? "exported" : "notExported",
-                                autoReferencedRule.RelationType,
-                                autoReferencedRule.TargetPath,
-                                autoReferencedRule.SourcePath,
-                                autoReferencedRule.OutputType,
-                                exportedThisFile
-                                    ? (matchedByConfig ? "coveredByConfig" : null)
-                                    : "matchedPackageButNoExportedObject"));
-                    }
+                        if (exportJob.AutoReferencedRule != null)
+                        {
+                            AppendAutoReferencedExportDiagnostic(
+                                config,
+                                BuildAutoReferencedExportDiagnostic(
+                                    "export",
+                                    exportedThisJob ? "exported" : "notExported",
+                                    exportJob.AutoReferencedRule.RelationType,
+                                    exportJob.AutoReferencedRule.TargetPath,
+                                    exportJob.AutoReferencedRule.SourcePath,
+                                    exportJob.AutoReferencedRule.OutputType,
+                                    exportedThisJob
+                                        ? (exportJob.MatchedByConfig ? "coveredByConfig" : null)
+                                        : "matchedPackageButNoExportedObject"));
+                        }
 
-                    Interlocked.Increment(ref totalRegexMatches);
+                        Interlocked.Increment(ref totalRegexMatches);
+                    }
                 }
             }
         );
@@ -1248,22 +1268,22 @@ public class UnrealExporter
         Console.WriteLine();
     }
 
-    private static Dictionary<string, AutoReferencedExportRule> BuildAutoReferencedExportRules(
+    private static Dictionary<string, AutoReferencedExportRule[]> BuildAutoReferencedExportRules(
         AbstractFileProvider provider,
         ConfigObj config)
     {
-        if (!config.AutoExportReferencedAssets)
-            return new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
+        if (!ShouldAutoExportReferencedAssets(config))
+            return new Dictionary<string, AutoReferencedExportRule[]>(StringComparer.OrdinalIgnoreCase);
 
         var dbPath = Path.Combine(Path.GetFullPath(config.OutputDir), "ue_source_index.db");
         if (!File.Exists(dbPath))
         {
             Console.WriteLine($"WARN: auto referenced export skipped because source index is missing: {dbPath}");
-            return new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
+            return new Dictionary<string, AutoReferencedExportRule[]>(StringComparer.OrdinalIgnoreCase);
         }
 
         var packageFiles = BuildPackageFileLookup(provider);
-        var rules = new Dictionary<string, AutoReferencedExportRule>(StringComparer.OrdinalIgnoreCase);
+        var rules = new Dictionary<string, List<AutoReferencedExportRule>>(StringComparer.OrdinalIgnoreCase);
         var diagnostics = new List<object>();
         var unresolved = 0;
         var ambiguous = 0;
@@ -1330,16 +1350,28 @@ public class UnrealExporter
         WriteAutoReferencedExportDiagnostics(config, diagnostics);
 
         Console.WriteLine(
-            $"Auto referenced exports: {rules.Count} rule(s)" +
+            $"Auto referenced exports: {rules.Sum(x => x.Value.Count)} rule(s)" +
             (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : ""));
-        return rules;
+        return rules.ToDictionary(
+            x => x.Key,
+            x => x.Value.ToArray(),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldAutoExportReferencedAssets(ConfigObj config)
+    {
+        if (config.AutoExportReferencedAssets.HasValue)
+            return config.AutoExportReferencedAssets.Value;
+
+        // 素材库导出需要从完整源索引补齐显式引用，避免组合模型、材质贴图或动画只导出一半。
+        return config.GenerateLibraryIndexes && config.GenerateSourceIndex;
     }
 
     private static int AddSkeletonMeshExportRules(
         SqliteConnection connection,
         AbstractFileProvider provider,
         string skeletonPath,
-        Dictionary<string, AutoReferencedExportRule> rules,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
         var unresolved = 0;
@@ -1375,7 +1407,7 @@ public class UnrealExporter
     private static (int Unresolved, int Ambiguous) AddMaterialTextureExportRules(
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
-        Dictionary<string, AutoReferencedExportRule> rules,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
         if (!TableExists(connection, "material_texture_slots"))
@@ -1426,7 +1458,7 @@ public class UnrealExporter
     private static int AddAnimationSegmentExportRules(
         SqliteConnection connection,
         AbstractFileProvider provider,
-        Dictionary<string, AutoReferencedExportRule> rules,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
         if (!TableExists(connection, "animation_segments"))
@@ -1463,7 +1495,7 @@ public class UnrealExporter
     }
 
     private static void AddAutoReferencedExportRule(
-        Dictionary<string, AutoReferencedExportRule> rules,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics,
         string relationType,
         string targetPath,
@@ -1476,7 +1508,19 @@ public class UnrealExporter
             relationType,
             targetPath,
             outputType);
-        rules[NormalizeAssetPath(sourcePath)] = rule;
+        var sourceKey = NormalizeAssetPath(sourcePath);
+        if (!rules.TryGetValue(sourceKey, out var sourceRules))
+        {
+            sourceRules = [];
+            rules[sourceKey] = sourceRules;
+        }
+
+        if (sourceRules.Any(x =>
+                x.OutputType.Equals(outputType, StringComparison.OrdinalIgnoreCase) &&
+                x.TargetPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        sourceRules.Add(rule);
         diagnostics.Add(BuildAutoReferencedExportDiagnostic(
             "plan",
             "planned",
@@ -1549,6 +1593,103 @@ public class UnrealExporter
         public string TargetPath { get; }
 
         public string OutputType { get; }
+    }
+
+    private sealed class ExportJob
+    {
+        public ExportJob(string outputType, bool matchedByConfig, AutoReferencedExportRule? autoReferencedRule)
+        {
+            OutputType = outputType;
+            MatchedByConfig = matchedByConfig;
+            AutoReferencedRule = autoReferencedRule;
+        }
+
+        public string OutputType { get; }
+
+        public bool MatchedByConfig { get; }
+
+        public AutoReferencedExportRule? AutoReferencedRule { get; }
+    }
+
+    private static List<ExportJob> BuildExportJobs(
+        string regexMatch,
+        bool matchedByConfig,
+        AutoReferencedExportRule[]? autoReferencedRules)
+    {
+        var jobs = new List<ExportJob>();
+        if (regexMatch.Length > 0)
+            jobs.Add(new ExportJob(regexMatch.SubstringAfterLast(':').ToLower(), matchedByConfig, null));
+
+        foreach (var rule in autoReferencedRules ?? [])
+        {
+            // 自动补导必须逐对象执行；同一个 uasset 里可能同时塞了多个贴图或动画。
+            if (jobs.Any(x =>
+                    x.AutoReferencedRule != null &&
+                    x.OutputType.Equals(rule.OutputType, StringComparison.OrdinalIgnoreCase) &&
+                    x.AutoReferencedRule.TargetPath.Equals(rule.TargetPath, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            jobs.Add(new ExportJob(rule.OutputType.ToLowerInvariant(), matchedByConfig, rule));
+        }
+
+        return jobs;
+    }
+
+    private static bool MatchesAutoReferencedTarget(UObject obj, AutoReferencedExportRule? rule)
+    {
+        if (rule == null)
+            return true;
+
+        var targetPath = NormalizeObjectPath(rule.TargetPath);
+        var objectPath = NormalizeObjectPath(obj.GetPathName());
+        if (objectPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var targetName = GetObjectNameFromPath(targetPath);
+        return targetName.Length > 0 && obj.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildObjectOutputPath(
+        string defaultOutputPath,
+        string outputDir,
+        string packageFileName,
+        UObject obj,
+        AutoReferencedExportRule? rule)
+    {
+        if (rule == null)
+            return defaultOutputPath;
+
+        var objectName = SanitizeOutputName(GetObjectNameFromPath(rule.TargetPath));
+        if (objectName.Length == 0)
+            objectName = SanitizeOutputName(obj.Name);
+
+        if (objectName.Length == 0 || objectName.Equals(packageFileName, StringComparison.OrdinalIgnoreCase))
+            return defaultOutputPath;
+
+        return Path.Combine(outputDir, objectName);
+    }
+
+    private static string GetObjectNameFromPath(string objectPath)
+    {
+        var normalized = NormalizeObjectPath(objectPath);
+        var dotIndex = normalized.LastIndexOf('.');
+        if (dotIndex >= 0 && dotIndex + 1 < normalized.Length)
+            return normalized[(dotIndex + 1)..];
+
+        var slashIndex = normalized.LastIndexOf('/');
+        return slashIndex >= 0 && slashIndex + 1 < normalized.Length
+            ? normalized[(slashIndex + 1)..]
+            : normalized;
+    }
+
+    private static string SanitizeOutputName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return "";
+
+        var invalid = Path.GetInvalidFileNameChars();
+        var chars = name.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray();
+        return new string(chars).Trim();
     }
 
     private static bool TableExists(SqliteConnection connection, string tableName)
@@ -2632,7 +2773,7 @@ public class ConfigObj
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
     public bool GenerateSourceIndex { get; set; }
-    public bool AutoExportReferencedAssets { get; set; }
+    public bool? AutoExportReferencedAssets { get; set; }
     public List<string>? SourceIndexRegex { get; set; }
     public int SourceIndexLimit { get; set; }
     public required List<string> Export { get; set; }
