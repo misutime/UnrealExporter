@@ -6,7 +6,7 @@
 
 UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、Mesh/Skeleton socket、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用。蓝图、组件、Level/Actor 实例层面开始记录 ComponentTemplate、SCS、继承组件覆盖、导出组件、关卡 Actor、Actor 组件属性和 cooked 蓝图/CDO 属性里的显式资源 PPtr；素材库侧会把这些关系提升为可查询的组件关系和组合 group，用于后续组合模型、挂点、任务道具和动画蓝图关系重建。
+本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图显式标记为 `missingExportedTexture`；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、Mesh/Skeleton socket、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用。`skeletons.json` 已把 glTF skin 预览骨架和 UE Skeleton 原始路径、源索引骨架对象、同 Skeleton 动画列表合并输出。蓝图、组件、Level/Actor 实例层面开始记录 ComponentTemplate、SCS、继承组件覆盖、导出组件、关卡 Actor、Actor 组件属性和 cooked 蓝图/CDO 属性里的显式资源 PPtr；素材库侧会把这些关系提升为可查询的组件关系和组合 group，用于后续组合模型、挂点、任务道具和动画蓝图关系重建。
 
 ## 完整实现目标
 
@@ -27,7 +27,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 3. 骨骼
    - SkeletalMesh catalog 记录 `skeletonPath`、`skeletonName`、`boneNames`、boneCount。
    - GLB 验证阶段计算 skeletonHash，用于发现相同骨架或近似骨架。
-   - `skeletons.json` 聚合 GLB skin 骨架组，但模型与动画的默认绑定优先使用 UE Skeleton 原始引用。
+   - `skeletons.json` 聚合 GLB skin 骨架组，并合并 UE Skeleton 原始引用、源索引骨架对象和同 Skeleton 动画列表；模型与动画的默认绑定优先使用 UE Skeleton 原始引用。
 
 4. 动画
    - 支持 `ueanim` 与 `psa` 输出类型，目标对象包括 `UAnimSequence`、`UAnimMontage`、`UAnimComposite`。

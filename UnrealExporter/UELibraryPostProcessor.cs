@@ -62,7 +62,7 @@ internal static class UELibraryPostProcessor
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
-        WriteSkeletonIndex(root, reports);
+        WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
         WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
@@ -2413,30 +2413,101 @@ internal static class UELibraryPostProcessor
         }
     }
 
-    private static void WriteSkeletonIndex(string root, List<ModelValidationEntry> reports)
+    private static void WriteSkeletonIndex(
+        string root,
+        List<ModelValidationEntry> reports,
+        List<JObject> catalogRows,
+        SourceIndexSnapshot sourceIndex)
     {
+        var modelsByOutput = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["output"]))
+            .GroupBy(x => ((string)x["output"]!).Replace('\\', '/'), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var animationsBySkeleton = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
         var skeletons = reports
             .Where(x => !string.IsNullOrWhiteSpace(x.SkeletonHash))
             .GroupBy(x => x.SkeletonHash!, StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(x => x.Count())
             .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(group => new
+            .Select(group =>
             {
-                skeletonId = group.Key,
-                modelCount = group.Count(),
-                boneCount = group.First().BoneCount,
-                relationBasis = "glTF skin joints exported from UE SkeletalMesh",
-                models = group
-                    .OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase)
+                var modelRows = group
+                    .Select(report => new
+                    {
+                        Report = report,
+                        Catalog = modelsByOutput.TryGetValue(report.RelativePath.Replace('\\', '/'), out var catalog) ? catalog : null,
+                    })
+                    .ToArray();
+                var skeletonPaths = modelRows
+                    .Select(x => (string?)x.Catalog?["skeletonPath"])
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                var primarySkeletonPath = skeletonPaths.FirstOrDefault();
+                var skeletonSourceObjects = skeletonPaths
+                    .SelectMany(path => sourceIndex.BonesBySkeleton.TryGetValue(path!, out var bones) ? bones : [])
+                    .GroupBy(x => $"{x.SourcePath}|{x.OwnerObjectPath}|{x.OwnerType}", StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x.First().OwnerType, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => x.First().OwnerObjectPath, StringComparer.OrdinalIgnoreCase)
                     .Select(x => new
                     {
-                        name = x.Name,
-                        output = x.RelativePath,
-                        resourceKind = x.ResourceKind,
+                        sourcePath = x.First().SourcePath,
+                        ownerObjectPath = x.First().OwnerObjectPath,
+                        ownerType = x.First().OwnerType,
+                        boneCount = x.Count(),
+                    })
+                    .ToArray();
+                var animations = skeletonPaths
+                    .SelectMany(path => animationsBySkeleton.TryGetValue(path!, out var rows) ? rows : [])
+                    .OrderBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new
+                    {
+                        name = (string?)x["name"],
+                        source = (string?)x["source"],
+                        output = (string?)x["output"],
+                        status = (string?)x["status"],
+                        duration = (double?)x["duration"],
+                        frameCount = (int?)x["frameCount"],
+                        trackCount = (int?)x["trackCount"],
+                    })
+                    .ToArray();
+
+                return new
+                {
+                    skeletonId = group.Key,
+                    skeletonPath = primarySkeletonPath,
+                    skeletonName = modelRows.Select(x => (string?)x.Catalog?["skeletonName"]).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
+                    skeletonPaths,
+                    modelCount = group.Count(),
+                    animationCount = animations.Length,
+                    boneCount = group.First().BoneCount,
+                    relationBasis = "glTF skin joints + UE Skeleton source reference",
+                    sourceIndexAvailable = sourceIndex.Available,
+                    skeletonSourceObjects,
+                    models = modelRows
+                    .OrderBy(x => x.Report.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new
+                    {
+                        name = x.Report.Name,
+                        output = x.Report.RelativePath,
+                        resourceKind = x.Report.ResourceKind,
+                        source = (string?)x.Catalog?["source"],
+                        objectPath = (string?)x.Catalog?["objectPath"],
+                        skeletonPath = (string?)x.Catalog?["skeletonPath"],
+                        skeletonName = (string?)x.Catalog?["skeletonName"],
                     })
                     .ToArray(),
-                boneNames = group.First().BoneNames.Take(256).ToArray(),
-                boneNamesTruncated = group.First().BoneNames.Length > 256,
+                    animations,
+                    boneNames = group.First().BoneNames.Take(256).ToArray(),
+                    boneNamesTruncated = group.First().BoneNames.Length > 256,
+                };
             })
             .ToArray();
 
@@ -2445,7 +2516,13 @@ internal static class UELibraryPostProcessor
             JsonConvert.SerializeObject(new
             {
                 generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "骨架分组来自已导出 GLB/glTF skin joints。后续应由 UE 源索引补充 USkeleton 路径和动画关系。",
+                rule = "骨架分组以已导出 GLB/glTF skin joints 为预览基准，同时合并 UE Skeleton 原始路径、源索引骨架对象和同 Skeleton 动画列表。",
+                sourceIndex = new
+                {
+                    available = sourceIndex.Available,
+                    path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
+                    error = sourceIndex.Error,
+                },
                 skeletonCount = skeletons.Length,
                 skeletons,
             }, Formatting.Indented),
