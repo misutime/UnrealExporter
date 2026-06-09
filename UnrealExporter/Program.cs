@@ -1293,6 +1293,9 @@ public class UnrealExporter
             rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:{outputType}";
         }
 
+        var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules);
+        unresolved += materialTextureResult.Unresolved;
+        ambiguous += materialTextureResult.Ambiguous;
         unresolved += AddAnimationSegmentExportRules(connection, provider, rules);
 
         Console.WriteLine(
@@ -1334,6 +1337,53 @@ public class UnrealExporter
         }
 
         return unresolved;
+    }
+
+    private static (int Unresolved, int Ambiguous) AddMaterialTextureExportRules(
+        SqliteConnection connection,
+        Dictionary<string, string[]> packageFiles,
+        Dictionary<string, string> rules)
+    {
+        if (!TableExists(connection, "material_texture_slots"))
+            return (0, 0);
+
+        var unresolved = 0;
+        var ambiguous = 0;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT texture_object_path
+            FROM material_texture_slots
+            WHERE texture_object_path IS NOT NULL
+              AND texture_object_path != '';
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var texturePath = reader.GetString(0);
+            var suffix = BuildPackageFileSuffix(texturePath);
+            if (string.IsNullOrWhiteSpace(suffix))
+            {
+                unresolved++;
+                continue;
+            }
+
+            if (!packageFiles.TryGetValue(suffix, out var matches) || matches.Length == 0)
+            {
+                unresolved++;
+                continue;
+            }
+
+            if (matches.Length > 1)
+            {
+                ambiguous++;
+                continue;
+            }
+
+            var filePath = matches[0];
+            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:png";
+        }
+
+        return (unresolved, ambiguous);
     }
 
     private static int AddAnimationSegmentExportRules(
