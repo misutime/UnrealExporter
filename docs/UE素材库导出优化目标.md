@@ -6,7 +6,7 @@
 
 UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级和 AnimSequence track 到骨骼的映射。
+本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级和 AnimSequence track 到骨骼的映射，并用于验证模型动画候选的 track 覆盖率和骨骼层级兼容性。
 
 ## 完整实现目标
 
@@ -35,17 +35,17 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
 
 5. 模型动画关系
-   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配。
+   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果。
    - 未匹配时保留 `NoMatchingAnimationExported`，不硬猜。
-   - 后续可增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖、bbox/姿态采样验证。
+   - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 
 6. 索引与报告
    - `asset_catalog.jsonl` 是素材库 JSONL 总入口，必须合并导出主链路数据和验证数据。
-   - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、model_validation、model_animation_relations 和 relation_animations。
+   - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
    - `model_validation.json` 验证 GLB mesh、material、image、skin、bbox。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、animation_tracks 和 source_index_errors。
-   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、model_validation、model_animation_relations 和 relation_animations。
+   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、model_validation、model_animation_relations、relation_animations 和 animation_validation。
 
 ## 优化列表
 
@@ -72,9 +72,9 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 ### P1：模型与动画兼容验证
 
 - 在 UE Skeleton 引用匹配后，增加骨骼名覆盖率、track bone index 覆盖率和骨架层级检查。
-- 当前源索引已具备骨骼层级和 track 映射数据，下一步把这些数据接入 `model_animations.json` 的兼容验证和 `animation_validation.json` 报告。
+- 当前源索引已具备骨骼层级和 track 映射数据，并已接入 `model_animations.json` 的兼容验证和 `animation_validation.json` 报告。
 - 对 Montage/Composite 展开 segment，保留 slot、section、segment 时间范围。
-- 输出 `animation_validation.json`，区分可导出、缺 native、骨架不匹配、缺依赖。
+- 已输出 `animation_validation.json`，区分 ok、warning、error，并记录缺源索引、缺模型骨骼、缺动画 track、骨骼缺失和层级不一致等原因。
 
 ### P2：素材库浏览质量
 

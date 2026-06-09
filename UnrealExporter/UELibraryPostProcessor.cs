@@ -53,10 +53,12 @@ internal static class UELibraryPostProcessor
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
         var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
-        var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows);
+        var sourceIndex = LoadSourceIndex(root);
+        var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
+        var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         WriteSkeletonIndex(root, reports);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, modelAnimationRelations);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -508,7 +510,346 @@ internal static class UELibraryPostProcessor
         return $"{kind}|{objectPath}";
     }
 
-    private static JObject WriteModelAnimationRelations(string root, List<JObject> catalogRows)
+    private static SourceIndexSnapshot LoadSourceIndex(string root)
+    {
+        var dbPath = Path.Combine(root, "ue_source_index.db");
+        var snapshot = new SourceIndexSnapshot { Path = dbPath, Available = File.Exists(dbPath) };
+        if (!snapshot.Available)
+            return snapshot;
+
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            snapshot.BonesByOwner = LoadBonesByOwner(connection);
+            snapshot.BonesBySkeleton = snapshot.BonesByOwner.Values
+                .SelectMany(x => x)
+                .Where(x => !string.IsNullOrWhiteSpace(x.SkeletonPath))
+                .GroupBy(x => x.SkeletonPath!, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+            snapshot.TracksByAnimation = LoadTracksByAnimation(connection);
+        }
+        catch (Exception ex)
+        {
+            snapshot.Available = false;
+            snapshot.Error = ex.Message;
+            Console.WriteLine($"WARN: ue_source_index.db skipped ({ex.Message})");
+        }
+
+        return snapshot;
+    }
+
+    private static Dictionary<string, SourceBone[]> LoadBonesByOwner(SqliteConnection connection)
+    {
+        var result = new Dictionary<string, List<SourceBone>>(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, owner_object_path, owner_type, skeleton_path, bone_index, bone_name, parent_index
+            FROM skeleton_bones
+            ORDER BY owner_object_path, bone_index;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var ownerObjectPath = GetString(reader, 1);
+            if (string.IsNullOrWhiteSpace(ownerObjectPath))
+                continue;
+
+            if (!result.TryGetValue(ownerObjectPath, out var bones))
+            {
+                bones = [];
+                result[ownerObjectPath] = bones;
+            }
+
+            bones.Add(new SourceBone
+            {
+                SourcePath = GetString(reader, 0),
+                OwnerObjectPath = ownerObjectPath,
+                OwnerType = GetString(reader, 2) ?? "",
+                SkeletonPath = GetString(reader, 3),
+                BoneIndex = reader.GetInt32(4),
+                BoneName = GetString(reader, 5) ?? "",
+                ParentIndex = reader.GetInt32(6),
+            });
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, SourceAnimationTrack[]> LoadTracksByAnimation(SqliteConnection connection)
+    {
+        var result = new Dictionary<string, List<SourceAnimationTrack>>(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, animation_object_path, skeleton_path, track_index, bone_index, bone_name
+            FROM animation_tracks
+            ORDER BY animation_object_path, track_index;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var animationObjectPath = GetString(reader, 1);
+            if (string.IsNullOrWhiteSpace(animationObjectPath))
+                continue;
+
+            if (!result.TryGetValue(animationObjectPath, out var tracks))
+            {
+                tracks = [];
+                result[animationObjectPath] = tracks;
+            }
+
+            tracks.Add(new SourceAnimationTrack
+            {
+                SourcePath = GetString(reader, 0),
+                AnimationObjectPath = animationObjectPath,
+                SkeletonPath = GetString(reader, 2),
+                TrackIndex = reader.GetInt32(3),
+                BoneIndex = reader.GetInt32(4),
+                BoneName = GetString(reader, 5),
+            });
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static AnimationValidationSummary WriteAnimationValidation(
+        string root,
+        List<JObject> catalogRows,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var validations = BuildAnimationValidations(catalogRows, sourceIndex);
+        var summary = new AnimationValidationSummary
+        {
+            SourceIndexAvailable = sourceIndex.Available,
+            SourceIndexError = sourceIndex.Error,
+            Validations = validations,
+            ByPairKey = validations.ToDictionary(x => x.PairKey, StringComparer.OrdinalIgnoreCase),
+        };
+
+        var json = new JObject
+        {
+            ["generatedAt"] = DateTime.UtcNow.ToString("O"),
+            ["rule"] = "只验证 UE Skeleton 原始引用一致的模型动画候选；再检查动画 track 骨骼是否被模型骨架覆盖，以及重叠骨骼父子层级是否兼容。",
+            ["sourceIndex"] = JObject.FromObject(new
+            {
+                available = sourceIndex.Available,
+                path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
+                error = sourceIndex.Error,
+            }),
+            ["totals"] = JObject.FromObject(new
+            {
+                pairs = validations.Length,
+                ok = validations.Count(x => x.Status == "ok"),
+                warning = validations.Count(x => x.Status == "warning"),
+                error = validations.Count(x => x.Status == "error"),
+            }),
+            ["validations"] = JArray.FromObject(validations.Select(x => new
+            {
+                status = x.Status,
+                reason = x.Reason,
+                model = x.ModelOutput,
+                modelName = x.ModelName,
+                modelSource = x.ModelSource,
+                animation = x.AnimationOutput,
+                animationName = x.AnimationName,
+                animationSource = x.AnimationSource,
+                skeletonPath = x.SkeletonPath,
+                skeletonName = x.SkeletonName,
+                modelBoneCount = x.ModelBoneCount,
+                animationTrackCount = x.AnimationTrackCount,
+                matchedTrackBones = x.MatchedTrackBones,
+                missingTrackBoneCount = x.MissingTrackBones.Length,
+                missingTrackBones = x.MissingTrackBones.Take(64).ToArray(),
+                trackCoverage = x.TrackCoverage,
+                hierarchyCompatible = x.HierarchyCompatible,
+                hierarchyMismatchCount = x.HierarchyMismatches.Length,
+                hierarchyMismatches = x.HierarchyMismatches.Take(32).ToArray(),
+            })),
+        };
+
+        File.WriteAllText(Path.Combine(root, "animation_validation.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
+        return summary;
+    }
+
+    private static AnimationValidationEntry[] BuildAnimationValidations(
+        List<JObject> catalogRows,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var models = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .ToArray();
+        var animations = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
+        var result = new List<AnimationValidationEntry>();
+        foreach (var model in models)
+        {
+            var skeletonPath = (string)model["skeletonPath"]!;
+            if (!animations.TryGetValue(skeletonPath, out var matchedAnimations))
+                continue;
+
+            foreach (var animation in matchedAnimations)
+                result.Add(ValidateAnimationPair(model, animation, sourceIndex));
+        }
+
+        return result
+            .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.AnimationOutput, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static AnimationValidationEntry ValidateAnimationPair(
+        JObject model,
+        JObject animation,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var skeletonPath = (string?)model["skeletonPath"];
+        var modelBones = FindModelBones(model, skeletonPath, sourceIndex);
+        var animationTracks = FindAnimationTracks(animation, sourceIndex);
+        var missingTrackBones = animationTracks
+            .Where(x => !string.IsNullOrWhiteSpace(x.BoneName))
+            .Where(x => !modelBones.ByName.ContainsKey(x.BoneName!))
+            .Select(x => x.BoneName!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var namedTrackCount = animationTracks.Count(x => !string.IsNullOrWhiteSpace(x.BoneName));
+        var matchedTrackBones = Math.Max(0, namedTrackCount - missingTrackBones.Length);
+        var trackCoverage = namedTrackCount == 0 ? 0 : Math.Round((double)matchedTrackBones / namedTrackCount, 4);
+        var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex);
+        var status = "ok";
+        var reason = "Skeleton 路径一致，动画 track 骨骼被模型骨架覆盖，重叠骨骼层级兼容。";
+
+        if (!sourceIndex.Available)
+        {
+            status = "warning";
+            reason = "缺少 ue_source_index.db，无法验证骨骼覆盖和动画 track。";
+        }
+        else if (modelBones.Bones.Length == 0)
+        {
+            status = "warning";
+            reason = "源索引中没有找到模型骨骼，暂时只能依赖 UE Skeleton 路径。";
+        }
+        else if (animationTracks.Length == 0)
+        {
+            status = "warning";
+            reason = "源索引中没有找到动画 track，暂时只能依赖 UE Skeleton 路径。";
+        }
+        else if (missingTrackBones.Length > 0)
+        {
+            status = "error";
+            reason = "动画 track 引用了模型骨架中不存在的骨骼。";
+        }
+        else if (hierarchyMismatches.Length > 0)
+        {
+            status = "warning";
+            reason = "动画和模型的部分重叠骨骼父级不一致，需要人工复核。";
+        }
+
+        return new AnimationValidationEntry
+        {
+            PairKey = BuildPairKey(model, animation),
+            Status = status,
+            Reason = reason,
+            ModelOutput = (string?)model["output"] ?? "",
+            ModelName = (string?)model["name"] ?? "",
+            ModelSource = (string?)model["source"] ?? "",
+            AnimationOutput = (string?)animation["output"] ?? "",
+            AnimationName = (string?)animation["name"] ?? "",
+            AnimationSource = (string?)animation["source"] ?? "",
+            SkeletonPath = skeletonPath,
+            SkeletonName = (string?)model["skeletonName"],
+            ModelBoneCount = modelBones.Bones.Length,
+            AnimationTrackCount = animationTracks.Length,
+            MatchedTrackBones = matchedTrackBones,
+            MissingTrackBones = missingTrackBones,
+            TrackCoverage = trackCoverage,
+            HierarchyCompatible = hierarchyMismatches.Length == 0,
+            HierarchyMismatches = hierarchyMismatches,
+        };
+    }
+
+    private static ModelBoneLookup FindModelBones(JObject model, string? skeletonPath, SourceIndexSnapshot sourceIndex)
+    {
+        var objectPath = (string?)model["objectPath"];
+        if (!string.IsNullOrWhiteSpace(objectPath) && sourceIndex.BonesByOwner.TryGetValue(objectPath, out var byOwner))
+            return new ModelBoneLookup(byOwner);
+
+        if (!string.IsNullOrWhiteSpace(skeletonPath) && sourceIndex.BonesBySkeleton.TryGetValue(skeletonPath, out var bySkeleton))
+        {
+            var singleOwner = PickSingleBoneOwner(bySkeleton, "SkeletalMesh") ?? PickSingleBoneOwner(bySkeleton, null);
+            return new ModelBoneLookup(singleOwner ?? []);
+        }
+
+        return new ModelBoneLookup([]);
+    }
+
+    private static SourceAnimationTrack[] FindAnimationTracks(JObject animation, SourceIndexSnapshot sourceIndex)
+    {
+        var objectPath = (string?)animation["objectPath"];
+        if (!string.IsNullOrWhiteSpace(objectPath) && sourceIndex.TracksByAnimation.TryGetValue(objectPath, out var byObjectPath))
+            return byObjectPath;
+
+        return [];
+    }
+
+    private static string[] CompareHierarchy(
+        ModelBoneLookup modelBones,
+        SourceAnimationTrack[] animationTracks,
+        SourceIndexSnapshot sourceIndex)
+    {
+        if (modelBones.Bones.Length == 0 || animationTracks.Length == 0)
+            return [];
+
+        var skeletonPath = animationTracks.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.SkeletonPath))?.SkeletonPath;
+        if (string.IsNullOrWhiteSpace(skeletonPath) || !sourceIndex.BonesBySkeleton.TryGetValue(skeletonPath, out var skeletonBones))
+            return [];
+
+        var skeletonLookup = new ModelBoneLookup(PickSingleBoneOwner(skeletonBones, "Skeleton") ?? PickSingleBoneOwner(skeletonBones, null) ?? []);
+        var mismatches = new List<string>();
+        foreach (var track in animationTracks)
+        {
+            if (string.IsNullOrWhiteSpace(track.BoneName))
+                continue;
+            if (!modelBones.ByName.TryGetValue(track.BoneName, out var modelBone))
+                continue;
+            if (!skeletonLookup.ByName.TryGetValue(track.BoneName, out var skeletonBone))
+                continue;
+
+            var modelParent = modelBones.GetParentName(modelBone);
+            var skeletonParent = skeletonLookup.GetParentName(skeletonBone);
+            if (!string.Equals(modelParent, skeletonParent, StringComparison.OrdinalIgnoreCase))
+                mismatches.Add($"{track.BoneName}: modelParent={modelParent ?? "<root>"}, skeletonParent={skeletonParent ?? "<root>"}");
+        }
+
+        return mismatches.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static SourceBone[]? PickSingleBoneOwner(SourceBone[] bones, string? preferredOwnerType)
+    {
+        var groups = bones
+            .Where(x => string.IsNullOrWhiteSpace(preferredOwnerType) || string.Equals(x.OwnerType, preferredOwnerType, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(x => x.OwnerObjectPath, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return groups.Length == 0
+            ? null
+            : groups[0].OrderBy(x => x.BoneIndex).ToArray();
+    }
+
+    private static string BuildPairKey(JObject model, JObject animation)
+        => $"{((string?)model["output"] ?? "").Replace('\\', '/').ToLowerInvariant()}|{((string?)animation["output"] ?? "").Replace('\\', '/').ToLowerInvariant()}";
+
+    private static JObject WriteModelAnimationRelations(
+        string root,
+        List<JObject> catalogRows,
+        AnimationValidationSummary animationValidation)
     {
         var models = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -528,17 +869,12 @@ internal static class UELibraryPostProcessor
         {
             var skeletonPath = (string)model["skeletonPath"]!;
             animationGroups.TryGetValue(skeletonPath, out var matchedAnimations);
-            relations.Add(JObject.FromObject(new
-            {
-                model = model["output"],
-                modelName = model["name"],
-                modelSource = model["source"],
-                skeletonPath,
-                skeletonName = model["skeletonName"],
-                confidence = matchedAnimations is { Length: > 0 } ? "ExplicitSkeleton" : "NoMatchingAnimationExported",
-                animations = (matchedAnimations ?? [])
-                    .OrderBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
-                    .Select(x => new
+            var relationAnimations = (matchedAnimations ?? [])
+                .OrderBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
+                .Select(x =>
+                {
+                    animationValidation.ByPairKey.TryGetValue(BuildPairKey(model, x), out var validation);
+                    return new
                     {
                         name = x["name"],
                         source = x["source"],
@@ -547,8 +883,24 @@ internal static class UELibraryPostProcessor
                         duration = x["duration"],
                         frameCount = x["frameCount"],
                         trackCount = x["trackCount"],
-                    })
-                    .ToArray(),
+                        validationStatus = validation?.Status,
+                        validationReason = validation?.Reason,
+                        trackCoverage = validation?.TrackCoverage,
+                        hierarchyCompatible = validation?.HierarchyCompatible,
+                        missingTrackBones = validation?.MissingTrackBones.Take(32).ToArray(),
+                    };
+                })
+                .ToArray();
+
+            relations.Add(JObject.FromObject(new
+            {
+                model = model["output"],
+                modelName = model["name"],
+                modelSource = model["source"],
+                skeletonPath,
+                skeletonName = model["skeletonName"],
+                confidence = relationAnimations.Length > 0 ? "ExplicitSkeleton" : "NoMatchingAnimationExported",
+                animations = relationAnimations,
             }));
         }
 
@@ -617,7 +969,8 @@ internal static class UELibraryPostProcessor
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
         List<TextureLinkInfo> textureLinks,
-        JObject modelAnimationRelations)
+        JObject modelAnimationRelations,
+        AnimationValidationSummary animationValidation)
     {
         var dbPath = Path.Combine(root, "library_index.db");
         if (File.Exists(dbPath))
@@ -702,10 +1055,30 @@ internal static class UELibraryPostProcessor
                 FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
             );
             """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                animation TEXT NOT NULL,
+                skeleton_path TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                model_bone_count INTEGER NOT NULL,
+                animation_track_count INTEGER NOT NULL,
+                matched_track_bones INTEGER NOT NULL,
+                track_coverage REAL NOT NULL,
+                hierarchy_compatible INTEGER NOT NULL,
+                missing_track_bones_json TEXT NOT NULL,
+                hierarchy_mismatches_json TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            """);
         Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
 
         foreach (var row in catalogRows)
             InsertAsset(connection, transaction, row);
@@ -717,6 +1090,7 @@ internal static class UELibraryPostProcessor
             InsertModelValidation(connection, transaction, report);
 
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
+        InsertAnimationValidation(connection, transaction, animationValidation);
 
         transaction.Commit();
     }
@@ -862,6 +1236,62 @@ internal static class UELibraryPostProcessor
         command.ExecuteNonQuery();
     }
 
+    private static void InsertAnimationValidation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AnimationValidationSummary summary)
+    {
+        foreach (var validation in summary.Validations)
+        {
+            var rawJson = JObject.FromObject(new
+            {
+                validation.Status,
+                validation.Reason,
+                model = validation.ModelOutput,
+                animation = validation.AnimationOutput,
+                validation.SkeletonPath,
+                validation.ModelBoneCount,
+                validation.AnimationTrackCount,
+                validation.MatchedTrackBones,
+                validation.TrackCoverage,
+                validation.HierarchyCompatible,
+                validation.MissingTrackBones,
+                validation.HierarchyMismatches,
+            });
+
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_validation (
+                    model, animation, skeleton_path, status, reason,
+                    model_bone_count, animation_track_count, matched_track_bones,
+                    track_coverage, hierarchy_compatible,
+                    missing_track_bones_json, hierarchy_mismatches_json, raw_json
+                )
+                VALUES (
+                    $model, $animation, $skeletonPath, $status, $reason,
+                    $modelBoneCount, $animationTrackCount, $matchedTrackBones,
+                    $trackCoverage, $hierarchyCompatible,
+                    $missingTrackBonesJson, $hierarchyMismatchesJson, $rawJson
+                );
+                """;
+            Add(command, "$model", validation.ModelOutput);
+            Add(command, "$animation", validation.AnimationOutput);
+            Add(command, "$skeletonPath", validation.SkeletonPath);
+            Add(command, "$status", validation.Status);
+            Add(command, "$reason", validation.Reason);
+            Add(command, "$modelBoneCount", validation.ModelBoneCount);
+            Add(command, "$animationTrackCount", validation.AnimationTrackCount);
+            Add(command, "$matchedTrackBones", validation.MatchedTrackBones);
+            Add(command, "$trackCoverage", validation.TrackCoverage);
+            Add(command, "$hierarchyCompatible", validation.HierarchyCompatible ? 1 : 0);
+            Add(command, "$missingTrackBonesJson", JsonConvert.SerializeObject(validation.MissingTrackBones));
+            Add(command, "$hierarchyMismatchesJson", JsonConvert.SerializeObject(validation.HierarchyMismatches));
+            Add(command, "$rawJson", rawJson.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+    }
+
     private static void Execute(SqliteConnection connection, SqliteTransaction transaction, string sql)
     {
         using var command = connection.CreateCommand();
@@ -881,6 +1311,9 @@ internal static class UELibraryPostProcessor
     {
         command.Parameters.AddWithValue(name, value ?? DBNull.Value);
     }
+
+    private static string? GetString(SqliteDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
 
     private static void WriteSkeletonIndex(string root, List<ModelValidationEntry> reports)
     {
@@ -929,7 +1362,7 @@ internal static class UELibraryPostProcessor
         var sb = new StringBuilder();
         sb.AppendLine("# UE Asset Library");
         sb.AppendLine();
-        sb.AppendLine("这份目录由 UnrealExporter 导出主链路和素材库索引步骤生成。当前阶段重点验证 GLB、材质 JSON、贴图硬链接、骨骼和动画 Skeleton 关系。");
+        sb.AppendLine("这份目录由 UnrealExporter 导出主链路和素材库索引步骤生成。当前阶段重点验证 GLB、材质 JSON、贴图硬链接、骨骼、动画和 UE 原始关系。");
         sb.AppendLine();
         sb.AppendLine("## 统计");
         sb.AppendLine();
@@ -944,10 +1377,11 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `asset_catalog.jsonl` | 模型、材质、贴图、动画主索引，一行一个资产。 |");
         sb.AppendLine("| `library_index.db` | 已导出素材库的 SQLite 索引，便于筛选模型、动画、贴图和关系。 |");
-        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象和 UE 原始 Skeleton/Material 关系。 |");
+        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Skeleton/Material/Texture 关系、骨骼层级和动画 track。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
-        sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配。 |");
+        sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配，并回填动画验证结果。 |");
+        sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
         sb.AppendLine("| `model_validation.json` | GLB 静态结构、材质、贴图、skin 验证报告。 |");
         sb.AppendLine("| `skeletons.json` | 按 GLB skin joints 生成的骨架分组。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
@@ -955,8 +1389,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("## 下一步");
         sb.AppendLine();
-        sb.AppendLine("- 建立 SQLite UE 源索引，批量记录 `UAnimSequence`、`USkeleton`、`SkeletalMesh`、材质与贴图的原生关系。");
-        sb.AppendLine("- 增加动画采样预览验证，检查 track 覆盖率、骨架兼容和播放姿态。");
+        sb.AppendLine("- 增加动画采样预览验证，检查播放姿态、bbox 变化和异常骨骼变换。");
+        sb.AppendLine("- 扩展 Montage/Composite segment 报告，保留 slot、section 和 segment 时间范围。");
         sb.AppendLine("- 生成模型 + 动画的 glTF 预览并写 `preview_validation.json`。");
         File.WriteAllText(Path.Combine(root, "LIBRARY_README.md"), sb.ToString(), Encoding.UTF8);
     }
@@ -1198,5 +1632,92 @@ internal static class UELibraryPostProcessor
         public string[] MissingMaterialSidecars { get; set; } = [];
         public object? BBox { get; set; }
         public string[] Notes { get; set; } = [];
+    }
+
+    private sealed class SourceIndexSnapshot
+    {
+        public string Path { get; set; } = string.Empty;
+        public bool Available { get; set; }
+        public string? Error { get; set; }
+        public Dictionary<string, SourceBone[]> BonesByOwner { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, SourceBone[]> BonesBySkeleton { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, SourceAnimationTrack[]> TracksByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class SourceBone
+    {
+        public string? SourcePath { get; set; }
+        public string OwnerObjectPath { get; set; } = string.Empty;
+        public string OwnerType { get; set; } = string.Empty;
+        public string? SkeletonPath { get; set; }
+        public int BoneIndex { get; set; }
+        public string BoneName { get; set; } = string.Empty;
+        public int ParentIndex { get; set; }
+    }
+
+    private sealed class SourceAnimationTrack
+    {
+        public string? SourcePath { get; set; }
+        public string AnimationObjectPath { get; set; } = string.Empty;
+        public string? SkeletonPath { get; set; }
+        public int TrackIndex { get; set; }
+        public int BoneIndex { get; set; }
+        public string? BoneName { get; set; }
+    }
+
+    private sealed class ModelBoneLookup
+    {
+        public ModelBoneLookup(SourceBone[] bones)
+        {
+            Bones = bones;
+            ByName = bones
+                .Where(x => !string.IsNullOrWhiteSpace(x.BoneName))
+                .GroupBy(x => x.BoneName, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+            ByIndex = bones
+                .GroupBy(x => x.BoneIndex)
+                .ToDictionary(x => x.Key, x => x.First());
+        }
+
+        public SourceBone[] Bones { get; }
+        public Dictionary<string, SourceBone> ByName { get; }
+        private Dictionary<int, SourceBone> ByIndex { get; }
+
+        public string? GetParentName(SourceBone bone)
+        {
+            if (bone.ParentIndex < 0)
+                return null;
+            return ByIndex.TryGetValue(bone.ParentIndex, out var parent) ? parent.BoneName : null;
+        }
+    }
+
+    private sealed class AnimationValidationSummary
+    {
+        public bool SourceIndexAvailable { get; set; }
+        public string? SourceIndexError { get; set; }
+        public AnimationValidationEntry[] Validations { get; set; } = [];
+        public Dictionary<string, AnimationValidationEntry> ByPairKey { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class AnimationValidationEntry
+    {
+        public string PairKey { get; set; } = string.Empty;
+        public string Status { get; set; } = "unknown";
+        public string Reason { get; set; } = string.Empty;
+        public string ModelOutput { get; set; } = string.Empty;
+        public string ModelName { get; set; } = string.Empty;
+        public string ModelSource { get; set; } = string.Empty;
+        public string AnimationOutput { get; set; } = string.Empty;
+        public string AnimationName { get; set; } = string.Empty;
+        public string AnimationSource { get; set; } = string.Empty;
+        public string? SkeletonPath { get; set; }
+        public string? SkeletonName { get; set; }
+        public int ModelBoneCount { get; set; }
+        public int AnimationTrackCount { get; set; }
+        public int MatchedTrackBones { get; set; }
+        public string[] MissingTrackBones { get; set; } = [];
+        public double TrackCoverage { get; set; }
+        public bool HierarchyCompatible { get; set; }
+        public string[] HierarchyMismatches { get; set; } = [];
     }
 }
