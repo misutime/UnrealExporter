@@ -63,6 +63,7 @@ internal static class UELibraryPostProcessor
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
+        WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, animationValidation, sourceIndex);
         WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
@@ -2734,6 +2735,150 @@ internal static class UELibraryPostProcessor
         return skeletonArray;
     }
 
+    private static void WriteLibraryHealth(
+        string root,
+        List<JObject> catalogRows,
+        List<ModelValidationEntry> reports,
+        IReadOnlyList<TextureLinkInfo> textureLinks,
+        MaterialTextureSlotLink[] materialTextureSlots,
+        SharedGltfTextureLink[] sharedGltfTextureLinks,
+        ComponentAssetRelationLink[] componentAssetRelations,
+        SourcePackageObjectMap[] packageObjectMaps,
+        JArray skeletonGroups,
+        JObject modelAnimationRelations,
+        AnimationValidationSummary animationValidation,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var models = catalogRows.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var materials = catalogRows.Where(x => string.Equals((string?)x["kind"], "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var textures = catalogRows.Where(x => string.Equals((string?)x["kind"], "Texture", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var animations = catalogRows.Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var componentGroups = BuildComponentGroupRows(componentAssetRelations);
+        var animationRelations = (JArray?)modelAnimationRelations["relations"] ?? [];
+        var matchedModelAnimationRelations = animationRelations.Count(x => ((JArray?)x["animations"] ?? []).Count > 0);
+        var missingMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "missingExportedTexture", StringComparison.OrdinalIgnoreCase));
+        var missingComponentRefs = componentGroups.Sum(x => x.MissingReferenceCount);
+        var modelWarnings = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
+        var modelErrors = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
+        var validationErrors = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
+        var validationWarnings = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
+        var linkErrors = textureLinks.Count(x => !string.IsNullOrWhiteSpace(x.LinkError));
+
+        var healthStatus =
+            modelErrors > 0 || validationErrors > 0 ? "error" :
+            modelWarnings > 0 || missingComponentRefs > 0 || missingMaterialSlots > 0 || linkErrors > 0 || validationWarnings > 0 ? "warning" :
+            "ok";
+
+        var issues = new JArray();
+        if (!sourceIndex.Available)
+            issues.Add(new JObject
+            {
+                ["level"] = "warning",
+                ["area"] = "sourceIndex",
+                ["message"] = "缺少 ue_source_index.db，部分 UE 原始关系、骨骼和动画验证无法完成。",
+                ["detail"] = sourceIndex.Error,
+            });
+        if (modelErrors > 0)
+            issues.Add(new JObject { ["level"] = "error", ["area"] = "models", ["message"] = $"有 {modelErrors} 个模型结构验证失败。" });
+        if (modelWarnings > 0)
+            issues.Add(new JObject { ["level"] = "warning", ["area"] = "models", ["message"] = $"有 {modelWarnings} 个模型存在结构或材质侧车验证警告。" });
+        if (missingMaterialSlots > 0)
+            issues.Add(new JObject { ["level"] = "warning", ["area"] = "materials", ["message"] = $"有 {missingMaterialSlots} 个材质贴图槽没有匹配到已导出贴图。" });
+        if (missingComponentRefs > 0)
+            issues.Add(new JObject { ["level"] = "warning", ["area"] = "components", ["message"] = $"有 {missingComponentRefs} 个蓝图/组件显式资源引用没有匹配到已导出素材。" });
+        if (validationErrors > 0 || validationWarnings > 0)
+            issues.Add(new JObject
+            {
+                ["level"] = validationErrors > 0 ? "error" : "warning",
+                ["area"] = "animations",
+                ["message"] = $"动画骨架验证存在 error={validationErrors}, warning={validationWarnings}。",
+            });
+        if (linkErrors > 0)
+            issues.Add(new JObject { ["level"] = "warning", ["area"] = "textures", ["message"] = $"有 {linkErrors} 个共享贴图硬链接创建失败。" });
+
+        var health = new JObject
+        {
+            ["generatedAt"] = DateTime.UtcNow.ToString("O"),
+            ["status"] = healthStatus,
+            ["rule"] = "素材库健康度只统计 UnrealExporter 导出和源索引解析得到的事实，不按名称猜测模型、贴图、骨骼、动画关系。",
+            ["sourceIndex"] = JObject.FromObject(new
+            {
+                available = sourceIndex.Available,
+                path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
+                error = sourceIndex.Error,
+            }),
+            ["models"] = JObject.FromObject(new
+            {
+                total = models.Length,
+                ok = reports.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
+                warning = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase)),
+                error = modelErrors,
+                withSkin = reports.Count(x => x.SkinCount > 0),
+                withSkeletonPath = models.Count(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"])),
+                withEmbeddedAnimation = reports.Count(x => x.AnimationCount > 0),
+                missingMaterialSidecars = reports.Sum(x => x.MissingMaterialSidecars.Length),
+            }),
+            ["textures"] = JObject.FromObject(new
+            {
+                catalogRows = textures.Length,
+                scanned = textureLinks.Count,
+                unique = textureLinks.Select(x => x.Hash).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                hardLinked = textureLinks.Count(x => x.HardLinked),
+                linkErrors,
+                sharedGltfLinks = sharedGltfTextureLinks.Length,
+                sharedGltfLinked = sharedGltfTextureLinks.Count(x => string.Equals(x.Status, "linked", StringComparison.OrdinalIgnoreCase)),
+            }),
+            ["materials"] = JObject.FromObject(new
+            {
+                total = materials.Length,
+                textureSlots = materialTextureSlots.Length,
+                matchedTextureSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase)),
+                missingTextureSlots = missingMaterialSlots,
+            }),
+            ["components"] = JObject.FromObject(new
+            {
+                relationCount = componentAssetRelations.Length,
+                groupCount = componentGroups.Length,
+                groupsWithMissingReferences = componentGroups.Count(x => x.MissingReferenceCount > 0),
+                missingReferenceCount = missingComponentRefs,
+                modelReferences = componentGroups.Sum(x => x.ModelReferenceCount),
+                exportedModelReferences = componentGroups.Sum(x => x.ExportedModelReferenceCount),
+                skeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase)),
+                exportedSkeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) && x.MatchStatus == "matched"),
+                missingSkeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) && x.MatchStatus != "matched"),
+                animationReferences = componentGroups.Sum(x => x.AnimationReferenceCount),
+                exportedAnimationReferences = componentGroups.Sum(x => x.ExportedAnimationReferenceCount),
+                materialReferences = componentGroups.Sum(x => x.MaterialReferenceCount),
+                exportedMaterialReferences = componentGroups.Sum(x => x.ExportedMaterialReferenceCount),
+            }),
+            ["skeletons"] = JObject.FromObject(new
+            {
+                groupCount = skeletonGroups.Count,
+                groupsWithAnimations = skeletonGroups.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
+                sourceSkeletonObjects = skeletonGroups.Sum(x => ((JArray?)x["sourceSkeletonObjects"] ?? []).Count),
+            }),
+            ["animations"] = JObject.FromObject(new
+            {
+                catalogRows = animations.Length,
+                relationModels = animationRelations.Count,
+                matchedModels = matchedModelAnimationRelations,
+                validationPairs = animationValidation.Validations.Length,
+                validationOk = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
+                validationWarning = validationWarnings,
+                validationError = validationErrors,
+            }),
+            ["sourceObjects"] = JObject.FromObject(new
+            {
+                packageObjectMaps = packageObjectMaps.Length,
+                materialTextureSlots = sourceIndex.MaterialTextureSlots.Length,
+                componentAssetRelations = sourceIndex.ComponentAssetRelations.Length,
+            }),
+            ["issues"] = issues,
+        };
+
+        File.WriteAllText(Path.Combine(root, "library_health.json"), health.ToString(Formatting.Indented), Encoding.UTF8);
+    }
+
     private static void WriteLibraryReadme(
         string root,
         List<ModelValidationEntry> reports,
@@ -2760,6 +2905,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| 文件 | 用途 |");
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `asset_catalog.jsonl` | 模型、材质、贴图、动画主索引，一行一个资产。 |");
+        sb.AppendLine("| `library_health.json` | 素材库健康汇总，集中统计模型、贴图、材质、组件关系、骨架和动画验证缺口。 |");
         sb.AppendLine("| `library_index.db` | 已导出素材库的 SQLite 索引，便于筛选模型、动画、贴图和关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
