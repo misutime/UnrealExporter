@@ -36,7 +36,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
 
 5. 模型动画关系
-   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果。
+   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section 和子动画引用，不能只报一个无 track 的 warning。
    - 未匹配时保留 `NoMatchingAnimationExported`，不硬猜。
    - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 
@@ -69,6 +69,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `package_object_maps`，在源索引阶段记录 UE 包 ImportMap/ExportMap，并同步生成素材库侧 `package_object_maps.jsonl` 和 `library_index.db.package_object_maps`，用于分析包级依赖、导出对象、class/outer/super/template 关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
+- `model_animations.json` 和 `library_index.db.relation_animations` 已保留动画 segment/section 摘要和完整 raw_json，用于区分直接可采样 AnimSequence 与 Montage/Composite 容器动画。
 - 下一步继续扩展 ExternalActor 描述数据和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路

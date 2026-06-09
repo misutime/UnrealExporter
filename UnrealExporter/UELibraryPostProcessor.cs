@@ -1731,6 +1731,11 @@ internal static class UELibraryPostProcessor
                         duration = x["duration"],
                         frameCount = x["frameCount"],
                         trackCount = x["trackCount"],
+                        segmentCount = x["segments"] is JArray segments ? segments.Count : 0,
+                        referencedAnimationCount = CountReferencedAnimations(x["segments"] as JArray),
+                        segments = x["segments"],
+                        sectionCount = x["sections"] is JArray sections ? sections.Count : 0,
+                        sections = x["sections"],
                         validationStatus = validation?.Status,
                         validationReason = validation?.Reason,
                         trackCoverage = validation?.TrackCoverage,
@@ -1768,6 +1773,16 @@ internal static class UELibraryPostProcessor
         File.WriteAllText(Path.Combine(root, "model_animations.json"), summary.ToString(Formatting.Indented));
         return summary;
     }
+
+    private static int CountReferencedAnimations(JArray? segments)
+        => segments == null
+            ? 0
+            : segments
+                .OfType<JObject>()
+                .Select(x => (string?)x["referencedAnimationPath"])
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
 
     private static void WriteModelValidation(string root, List<ModelValidationEntry> reports)
     {
@@ -2022,6 +2037,10 @@ internal static class UELibraryPostProcessor
                 duration REAL,
                 frame_count INTEGER,
                 track_count INTEGER,
+                segment_count INTEGER NOT NULL,
+                referenced_animation_count INTEGER NOT NULL,
+                section_count INTEGER NOT NULL,
+                raw_json TEXT NOT NULL,
                 FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
             );
             """);
@@ -2451,10 +2470,12 @@ internal static class UELibraryPostProcessor
         command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO relation_animations (
-                relation_id, name, source, output, status, duration, frame_count, track_count
+                relation_id, name, source, output, status, duration, frame_count, track_count,
+                segment_count, referenced_animation_count, section_count, raw_json
             )
             VALUES (
-                $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount
+                $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
+                $segmentCount, $referencedAnimationCount, $sectionCount, $rawJson
             );
             """;
         Add(command, "$relationId", relationId);
@@ -2465,6 +2486,10 @@ internal static class UELibraryPostProcessor
         Add(command, "$duration", (double?)animation["duration"]);
         Add(command, "$frameCount", (int?)animation["frameCount"]);
         Add(command, "$trackCount", (int?)animation["trackCount"]);
+        Add(command, "$segmentCount", (int?)animation["segmentCount"] ?? 0);
+        Add(command, "$referencedAnimationCount", (int?)animation["referencedAnimationCount"] ?? 0);
+        Add(command, "$sectionCount", (int?)animation["sectionCount"] ?? 0);
+        Add(command, "$rawJson", animation.ToString(Formatting.None));
         command.ExecuteNonQuery();
     }
 

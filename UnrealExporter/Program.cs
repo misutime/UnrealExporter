@@ -1293,6 +1293,8 @@ public class UnrealExporter
             rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:{outputType}";
         }
 
+        unresolved += AddAnimationSegmentExportRules(connection, provider, rules);
+
         Console.WriteLine(
             $"Auto referenced exports: {rules.Count} rule(s)" +
             (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : ""));
@@ -1334,6 +1336,51 @@ public class UnrealExporter
         return unresolved;
     }
 
+    private static int AddAnimationSegmentExportRules(
+        SqliteConnection connection,
+        AbstractFileProvider provider,
+        Dictionary<string, string> rules)
+    {
+        if (!TableExists(connection, "animation_segments"))
+            return 0;
+
+        var unresolved = 0;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT animation_object_path
+            FROM animation_segments
+            WHERE animation_object_path IS NOT NULL
+              AND animation_object_path != ''
+            UNION
+            SELECT DISTINCT referenced_animation_path
+            FROM animation_segments
+            WHERE referenced_animation_path IS NOT NULL
+              AND referenced_animation_path != '';
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var filePath = FindProviderFilePathByObjectPath(provider, reader.GetString(0));
+            if (filePath == null)
+            {
+                unresolved++;
+                continue;
+            }
+
+            rules[NormalizeAssetPath(filePath)] = $"{Regex.Escape(filePath)}:ueanim";
+        }
+
+        return unresolved;
+    }
+
+    private static bool TableExists(SqliteConnection connection, string tableName)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $tableName LIMIT 1;";
+        command.Parameters.AddWithValue("$tableName", tableName);
+        return command.ExecuteScalar() != null;
+    }
+
     private static Dictionary<string, string[]> BuildPackageFileLookup(AbstractFileProvider provider)
     {
         var rows = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -1360,6 +1407,19 @@ public class UnrealExporter
             x => x.Key,
             x => x.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
             StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string? FindProviderFilePathByObjectPath(AbstractFileProvider provider, string objectPath)
+    {
+        var suffix = BuildPackageFileSuffix(objectPath);
+        if (string.IsNullOrWhiteSpace(suffix))
+            return null;
+
+        return provider.Files.Values
+            .Select(x => x.Path)
+            .FirstOrDefault(path =>
+                NormalizeAssetPath(Path.ChangeExtension(path, null))
+                    .EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
     }
 
     private static IEnumerable<string> BuildProviderFileSuffixes(string withoutExtension)
