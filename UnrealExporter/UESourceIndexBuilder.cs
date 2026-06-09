@@ -149,6 +149,29 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE skeleton_bones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                owner_object_path TEXT,
+                owner_type TEXT NOT NULL,
+                skeleton_path TEXT,
+                bone_index INTEGER NOT NULL,
+                bone_name TEXT NOT NULL,
+                parent_index INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_tracks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                animation_object_path TEXT,
+                skeleton_path TEXT,
+                track_index INTEGER NOT NULL,
+                bone_index INTEGER NOT NULL,
+                bone_name TEXT
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE source_index_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -161,6 +184,10 @@ internal static class UESourceIndexBuilder
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_slot ON material_texture_slots(slot_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_owner ON skeleton_bones(owner_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_skeleton ON skeleton_bones(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_animation ON animation_tracks(animation_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_tracks_skeleton ON animation_tracks(skeleton_path);");
     }
 
     private static void InsertSourceFile(SqliteConnection connection, SqliteTransaction transaction, GameFile file)
@@ -259,6 +286,88 @@ internal static class UESourceIndexBuilder
 
         if (obj is UMaterialInterface materialInterface)
             InsertMaterialTextureSlots(connection, transaction, file.Path, materialInterface);
+
+        if (skeletalMesh != null)
+            InsertSkeletonBones(connection, transaction, file.Path, skeletalMesh.GetPathName(), "SkeletalMesh", skeletonPath, skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo);
+
+        if (obj is USkeleton skeleton)
+            InsertSkeletonBones(connection, transaction, file.Path, skeleton.GetPathName(), "Skeleton", skeleton.GetPathName(), skeleton.ReferenceSkeleton.FinalRefBoneInfo);
+
+        if (animSequence != null)
+            InsertAnimationTracks(connection, transaction, file.Path, animSequence, skeletonPath);
+    }
+
+    private static void InsertSkeletonBones(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string ownerObjectPath,
+        string ownerType,
+        string? skeletonPath,
+        IReadOnlyList<FMeshBoneInfo> bones)
+    {
+        for (var index = 0; index < bones.Count; index++)
+        {
+            var bone = bones[index];
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_bones (
+                    source_path, owner_object_path, owner_type, skeleton_path,
+                    bone_index, bone_name, parent_index
+                )
+                VALUES (
+                    $sourcePath, $ownerObjectPath, $ownerType, $skeletonPath,
+                    $boneIndex, $boneName, $parentIndex
+                );
+                """;
+            Add(command, "$sourcePath", sourcePath);
+            Add(command, "$ownerObjectPath", ownerObjectPath);
+            Add(command, "$ownerType", ownerType);
+            Add(command, "$skeletonPath", skeletonPath);
+            Add(command, "$boneIndex", index);
+            Add(command, "$boneName", bone.Name.Text);
+            Add(command, "$parentIndex", bone.ParentIndex);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAnimationTracks(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UAnimSequence sequence,
+        string? skeletonPath)
+    {
+        var skeletonBones = sequence.Skeleton.Load<USkeleton>()?.ReferenceSkeleton.FinalRefBoneInfo ?? [];
+        var trackMap = sequence.GetTrackMap();
+        for (var trackIndex = 0; trackIndex < trackMap.Length; trackIndex++)
+        {
+            var boneIndex = trackMap[trackIndex].BoneTreeIndex;
+            var boneName = boneIndex >= 0 && boneIndex < skeletonBones.Length
+                ? skeletonBones[boneIndex].Name.Text
+                : null;
+
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_tracks (
+                    source_path, animation_object_path, skeleton_path,
+                    track_index, bone_index, bone_name
+                )
+                VALUES (
+                    $sourcePath, $animationObjectPath, $skeletonPath,
+                    $trackIndex, $boneIndex, $boneName
+                );
+                """;
+            Add(command, "$sourcePath", sourcePath);
+            Add(command, "$animationObjectPath", sequence.GetPathName());
+            Add(command, "$skeletonPath", skeletonPath);
+            Add(command, "$trackIndex", trackIndex);
+            Add(command, "$boneIndex", boneIndex);
+            Add(command, "$boneName", boneName);
+            command.ExecuteNonQuery();
+        }
     }
 
     private static void InsertMaterialTextureSlots(
