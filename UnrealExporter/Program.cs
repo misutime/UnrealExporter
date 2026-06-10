@@ -69,7 +69,7 @@ public class UnrealExporter
         // For Oodle to work from outside of project directory
         Directory.SetCurrentDirectory(RootDir);
 
-        if (TryRunPostProcessCommand(args))
+        if (TryRunPostProcessCommand(args) || TryRunUEAnimationPreviewCommand(args))
             return;
 
         double trueStart = Now();
@@ -148,6 +148,44 @@ public class UnrealExporter
         var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
         UELibraryPostProcessor.Run(root, dedupeTextures);
         return true;
+    }
+
+    private static bool TryRunUEAnimationPreviewCommand(string[] args)
+    {
+        if (args.Length == 0)
+            return false;
+
+        if (
+            !args[0].Equals("--preview-ue-animation", StringComparison.OrdinalIgnoreCase)
+            && !args[0].Equals("preview-ue-animation", StringComparison.OrdinalIgnoreCase)
+        )
+            return false;
+
+        var model = GetCommandOption(args, "--model");
+        var animation = GetCommandOption(args, "--animation");
+        var output = GetCommandOption(args, "--output");
+        if (string.IsNullOrWhiteSpace(model) ||
+            string.IsNullOrWhiteSpace(animation) ||
+            string.IsNullOrWhiteSpace(output))
+        {
+            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb>.");
+            Environment.ExitCode = 2;
+            return true;
+        }
+
+        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output);
+        return true;
+    }
+
+    private static string? GetCommandOption(string[] args, string name)
+    {
+        for (var i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i].Equals(name, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+
+        return null;
     }
 
     public static void InitOodle()

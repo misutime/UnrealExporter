@@ -2821,7 +2821,7 @@ internal static class UELibraryPostProcessor
             },
             notes = new[]
             {
-                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 目前已索引和验证关系，但还未生成可播放 glTF 动画预览。",
+                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览。",
                 "任务/道具模型优先看 taskAndPropModels.bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系。",
                 "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
             },
@@ -4123,7 +4123,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("- 增加动画采样预览验证，检查播放姿态、bbox 变化和异常骨骼变换。");
         sb.AppendLine("- 扩展 Montage/Composite segment 报告，保留 slot、section 和 segment 时间范围。");
-        sb.AppendLine("- 生成模型 + 动画的 glTF 预览并写 `preview_validation.json`。");
+        sb.AppendLine("- 为 Montage/Composite 自动选择已导出的 segment 子动画生成预览。");
         File.WriteAllText(Path.Combine(root, "LIBRARY_README.md"), sb.ToString(), Encoding.UTF8);
     }
 
