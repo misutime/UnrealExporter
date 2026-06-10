@@ -2821,7 +2821,7 @@ internal static class UELibraryPostProcessor
             },
             notes = new[]
             {
-                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览。",
+                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
                 "任务/道具模型优先看 taskAndPropModels.bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系。",
                 "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
             },

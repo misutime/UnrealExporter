@@ -164,16 +164,17 @@ public class UnrealExporter
         var model = GetCommandOption(args, "--model");
         var animation = GetCommandOption(args, "--animation");
         var output = GetCommandOption(args, "--output");
+        var report = GetCommandOption(args, "--report");
         if (string.IsNullOrWhiteSpace(model) ||
             string.IsNullOrWhiteSpace(animation) ||
             string.IsNullOrWhiteSpace(output))
         {
-            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb>.");
+            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb> [--report <preview_validation.json>].");
             Environment.ExitCode = 2;
             return true;
         }
 
-        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output);
+        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report);
         return true;
     }
 

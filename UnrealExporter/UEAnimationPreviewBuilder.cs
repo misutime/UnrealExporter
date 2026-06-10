@@ -10,10 +10,13 @@ namespace UnrealExporter;
 
 internal static class UEAnimationPreviewBuilder
 {
-    public static int Run(string modelPath, string animationPath, string outputPath)
+    public static int Run(string modelPath, string animationPath, string outputPath, string? reportPath = null)
     {
-        var reportPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outputPath)) ?? ".", "preview_validation.json");
+        reportPath = string.IsNullOrWhiteSpace(reportPath)
+            ? Path.ChangeExtension(Path.GetFullPath(outputPath), ".preview_validation.json")
+            : Path.GetFullPath(reportPath);
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
+        Directory.CreateDirectory(Path.GetDirectoryName(reportPath)!);
 
         try
         {
@@ -54,7 +57,7 @@ internal static class UEAnimationPreviewBuilder
                 {
                     gltfAnimation.CreateTranslationChannel(
                         node,
-                        track.Positions.ToDictionary(x => x.Time(animation.FramesPerSecond), x => SwapYZ(x.Value) * 0.01f),
+                        BuildKeyMap(track.Positions, animation.FramesPerSecond, x => SwapYZ(x) * 0.01f),
                         linear: true);
                     writtenChannels++;
                 }
@@ -63,7 +66,7 @@ internal static class UEAnimationPreviewBuilder
                 {
                     gltfAnimation.CreateRotationChannel(
                         node,
-                        track.Rotations.ToDictionary(x => x.Time(animation.FramesPerSecond), x => SwapYZ(x.Value)),
+                        BuildKeyMap(track.Rotations, animation.FramesPerSecond, SwapYZ),
                         linear: true);
                     writtenChannels++;
                 }
@@ -72,7 +75,7 @@ internal static class UEAnimationPreviewBuilder
                 {
                     gltfAnimation.CreateScaleChannel(
                         node,
-                        track.Scales.ToDictionary(x => x.Time(animation.FramesPerSecond), x => x.Value),
+                        BuildKeyMap(track.Scales, animation.FramesPerSecond, x => x),
                         linear: true);
                     writtenChannels++;
                 }
@@ -86,6 +89,7 @@ internal static class UEAnimationPreviewBuilder
             {
                 status,
                 gltf = Path.GetFullPath(outputPath),
+                report = reportPath,
                 model = Path.GetFullPath(modelPath),
                 animation = Path.GetFullPath(animationPath),
                 animationName = animation.Name,
@@ -111,6 +115,7 @@ internal static class UEAnimationPreviewBuilder
             {
                 status = "error",
                 gltf = (string?)null,
+                report = reportPath,
                 model = Path.GetFullPath(modelPath),
                 animation = Path.GetFullPath(animationPath),
                 error = ex.Message,
@@ -240,6 +245,21 @@ internal static class UEAnimationPreviewBuilder
 
     private static Quaternion SwapYZ(Quaternion value)
         => Quaternion.Normalize(new Quaternion(value.X, value.Z, value.Y, value.W));
+
+    private static Dictionary<float, TOut> BuildKeyMap<TIn, TOut>(
+        IEnumerable<UEAnimKey<TIn>> keys,
+        float framesPerSecond,
+        Func<TIn, TOut> convert)
+    {
+        // UEAnim 可能保留相同帧的修正 key；glTF sampler 要求时间唯一，保留最后一个。
+        var result = new Dictionary<float, TOut>();
+        foreach (var key in keys)
+        {
+            result[key.Time(framesPerSecond)] = convert(key.Value);
+        }
+
+        return result;
+    }
 
     private static void WriteReport(string path, object report)
     {
