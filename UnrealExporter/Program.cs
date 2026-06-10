@@ -69,7 +69,7 @@ public class UnrealExporter
         // For Oodle to work from outside of project directory
         Directory.SetCurrentDirectory(RootDir);
 
-        if (TryRunPostProcessCommand(args) || TryRunTaskModelQualityCommand(args) || TryRunUEAnimationPreviewCommand(args))
+        if (TryRunPostProcessCommand(args) || TryRunMaterializeAnimationMetadataCommand(args) || TryRunTaskModelQualityCommand(args) || TryRunUEAnimationPreviewCommand(args))
             return;
 
         double trueStart = Now();
@@ -147,6 +147,28 @@ public class UnrealExporter
         var root = args[1];
         var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
         UELibraryPostProcessor.Run(root, dedupeTextures);
+        return true;
+    }
+
+    private static bool TryRunMaterializeAnimationMetadataCommand(string[] args)
+    {
+        if (args.Length == 0)
+            return false;
+
+        if (
+            !args[0].Equals("--materialize-animation-metadata", StringComparison.OrdinalIgnoreCase)
+            && !args[0].Equals("materialize-animation-metadata", StringComparison.OrdinalIgnoreCase)
+        )
+            return false;
+
+        if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
+        {
+            Console.WriteLine("ERROR: --materialize-animation-metadata requires an exported library root path.");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --materialize-animation-metadata <outputDir>");
+            return true;
+        }
+
+        UELibraryPostProcessor.MaterializeAnimationMetadataSidecars(args[1]);
         return true;
     }
 

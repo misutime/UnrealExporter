@@ -26,10 +26,12 @@ internal static class UELibraryPostProcessor
 
         Console.WriteLine($"UE Library postprocess root: {root}");
         var modelFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
+            .Where(x => !IsIgnoredLibraryPath(root, x))
             .Where(IsSupportedGltfModel)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var materialJsonFiles = Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories)
+            .Where(x => !IsIgnoredLibraryPath(root, x))
             .Where(IsLikelyMaterialJson)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -79,6 +81,186 @@ internal static class UELibraryPostProcessor
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
+    }
+
+    public static void MaterializeAnimationMetadataSidecars(string libraryRoot)
+    {
+        if (string.IsNullOrWhiteSpace(libraryRoot))
+            throw new ArgumentException("Library root is required.", nameof(libraryRoot));
+
+        var root = Path.GetFullPath(libraryRoot);
+        if (!Directory.Exists(root))
+            throw new DirectoryNotFoundException($"Library root not found: {root}");
+
+        var catalogSummary = MaterializeAnimationMetadataJsonLines(root, Path.Combine(root, "asset_catalog.jsonl"), updateCatalogRow: true);
+        var bindingSummary = MaterializeAnimationMetadataJsonLines(root, Path.Combine(root, "animation_bindings.jsonl"), updateCatalogRow: false);
+        Console.WriteLine(JsonConvert.SerializeObject(new
+        {
+            root,
+            assetCatalog = catalogSummary,
+            animationBindings = bindingSummary,
+            note = "已把失败但含曲线、通知或容器片段的 UE 动画写成 .metadata.json；它们仍不会进入默认可播放动画候选。"
+        }, Formatting.Indented));
+    }
+
+    private static AnimationMetadataMaterializeSummary MaterializeAnimationMetadataJsonLines(
+        string root,
+        string path,
+        bool updateCatalogRow)
+    {
+        var summary = new AnimationMetadataMaterializeSummary { Path = path };
+        if (!File.Exists(path))
+        {
+            summary.SkippedReason = "fileNotFound";
+            return summary;
+        }
+
+        var tempPath = path + ".metadata.tmp";
+        var backupPath = path + ".metadata.bak";
+        using (var writer = new StreamWriter(tempPath, append: false, new UTF8Encoding(false)))
+        {
+            foreach (var line in File.ReadLines(path))
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    writer.WriteLine(line);
+                    continue;
+                }
+
+                summary.Rows++;
+                JObject row;
+                try
+                {
+                    row = JObject.Parse(line);
+                }
+                catch (JsonException)
+                {
+                    summary.JsonErrors++;
+                    writer.WriteLine(line);
+                    continue;
+                }
+
+                if (!IsFailedAnimationRow(row) || !HasUsefulAnimationMetadata(row))
+                {
+                    writer.WriteLine(line);
+                    continue;
+                }
+
+                var metadataPath = BuildAnimationMetadataPath(root, row);
+                if (string.IsNullOrWhiteSpace(metadataPath))
+                {
+                    summary.MissingOutput++;
+                    writer.WriteLine(line);
+                    continue;
+                }
+
+                WriteAnimationMetadataSidecar(row, metadataPath);
+                summary.Materialized++;
+
+                row["status"] = "metadata";
+                row["format"] = "json";
+                row["output"] = metadataPath;
+                row["metadataOnly"] = true;
+                row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知或 Montage/Composite 片段，供素材库检索和后续动画支持使用。";
+                if (updateCatalogRow)
+                    row["kind"] = "Animation";
+
+                writer.WriteLine(row.ToString(Formatting.None));
+            }
+        }
+
+        ReplaceJsonLinesFile(path, tempPath, backupPath);
+        return summary;
+    }
+
+    private static bool IsFailedAnimationRow(JObject row)
+        => string.Equals((string?)row["kind"], "Animation", StringComparison.OrdinalIgnoreCase)
+           || string.Equals((string?)row["kind"], "AnimationBinding", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasUsefulAnimationMetadata(JObject row)
+    {
+        if (!string.Equals((string?)row["status"], "error", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return JArrayCount(row["curves"]) > 0
+            || JArrayCount(row["notifies"]) > 0
+            || JArrayCount(row["segments"]) > 0
+            || JArrayCount(row["sections"]) > 0
+            || ((int?)row["curveCount"] ?? 0) > 0
+            || ((int?)row["notifyCount"] ?? 0) > 0;
+    }
+
+    private static int JArrayCount(JToken? token)
+        => token is JArray array ? array.Count : 0;
+
+    private static string BuildAnimationMetadataPath(string root, JObject row)
+    {
+        var output = (string?)row["output"];
+        if (!string.IsNullOrWhiteSpace(output))
+        {
+            var path = output!;
+            if (!Path.IsPathRooted(path))
+                path = Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
+            return Path.GetFullPath(path) + ".metadata.json";
+        }
+
+        var source = ((string?)row["source"])?.Replace('\\', '/');
+        var name = (string?)row["name"];
+        if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(name))
+            return "";
+
+        var withoutExtension = Path.ChangeExtension(source, null) ?? source;
+        var safeRelative = withoutExtension
+            .Replace('/', Path.DirectorySeparatorChar)
+            .Replace(':', '_')
+            .TrimStart(Path.DirectorySeparatorChar);
+        return Path.Combine(root, safeRelative + ".ueanim.metadata.json");
+    }
+
+    private static void WriteAnimationMetadataSidecar(JObject row, string metadataPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(metadataPath)!);
+        var metadata = new JObject
+        {
+            ["generatedAt"] = DateTime.UtcNow.ToString("O"),
+            ["kind"] = "AnimationMetadata",
+            ["status"] = "metadata",
+            ["sourceStatus"] = row["status"]?.DeepClone(),
+            ["error"] = row["error"]?.DeepClone(),
+            ["source"] = row["source"]?.DeepClone(),
+            ["sourceType"] = row["sourceType"]?.DeepClone(),
+            ["name"] = row["name"]?.DeepClone(),
+            ["objectPath"] = row["objectPath"]?.DeepClone(),
+            ["skeletonPath"] = row["skeletonPath"]?.DeepClone(),
+            ["skeletonName"] = row["skeletonName"]?.DeepClone(),
+            ["skeletonGuid"] = row["skeletonGuid"]?.DeepClone(),
+            ["duration"] = row["duration"]?.DeepClone(),
+            ["frameCount"] = row["frameCount"]?.DeepClone(),
+            ["trackCount"] = row["trackCount"]?.DeepClone(),
+            ["trackBoneIndexes"] = row["trackBoneIndexes"]?.DeepClone(),
+            ["notifyCount"] = row["notifyCount"]?.DeepClone(),
+            ["notifies"] = row["notifies"]?.DeepClone() ?? new JArray(),
+            ["curveCount"] = row["curveCount"]?.DeepClone(),
+            ["curves"] = row["curves"]?.DeepClone() ?? new JArray(),
+            ["segments"] = row["segments"]?.DeepClone() ?? new JArray(),
+            ["sections"] = row["sections"]?.DeepClone() ?? new JArray(),
+            ["compression"] = row["compression"]?.DeepClone(),
+            ["requiresAcl"] = row["requiresAcl"]?.DeepClone(),
+            ["additiveType"] = row["additiveType"]?.DeepClone(),
+            ["additiveBasePoseType"] = row["additiveBasePoseType"]?.DeepClone(),
+            ["retargetSource"] = row["retargetSource"]?.DeepClone(),
+            ["note"] = "这是导出失败动画的可读元数据侧车，不是可直接播放的 .ueanim。曲线、通知和容器片段仍可用于素材库检索和后续曲线动画支持。"
+        };
+        File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
+    }
+
+    private static void ReplaceJsonLinesFile(string path, string tempPath, string backupPath)
+    {
+        if (File.Exists(backupPath))
+            File.Delete(backupPath);
+        File.Move(path, backupPath);
+        File.Move(tempPath, path);
+        File.Delete(backupPath);
     }
 
     public static void RefreshTaskModelQualityReport(string libraryRoot)
@@ -154,6 +336,20 @@ internal static class UELibraryPostProcessor
         var ext = Path.GetExtension(path);
         return ext.Equals(".glb", StringComparison.OrdinalIgnoreCase) ||
                ext.Equals(".gltf", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsIgnoredLibraryPath(string root, string path)
+    {
+        var relative = MakeRelative(root, path).Replace('\\', '/');
+        if (relative.StartsWith(".as_browser_cache/", StringComparison.OrdinalIgnoreCase)
+            || relative.StartsWith(".animestudio_browser/", StringComparison.OrdinalIgnoreCase)
+            || relative.StartsWith("Textures/_Shared/", StringComparison.OrdinalIgnoreCase)
+            || relative.StartsWith("Textures/.Shared/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return relative.Split('/').Any(part => part.StartsWith(".", StringComparison.Ordinal));
     }
 
     private static Dictionary<string, MaterialInfo> LoadMaterialIndex(string root, string[] materialJsonFiles)
@@ -5230,6 +5426,16 @@ internal static class UELibraryPostProcessor
     }
 
     private sealed record ModelAnimationCandidate(JObject Model, JObject Animation, string Reason);
+
+    private sealed class AnimationMetadataMaterializeSummary
+    {
+        public string Path { get; set; } = string.Empty;
+        public string? SkippedReason { get; set; }
+        public int Rows { get; set; }
+        public int Materialized { get; set; }
+        public int MissingOutput { get; set; }
+        public int JsonErrors { get; set; }
+    }
 
     private sealed class ModelCoverageRow
     {
