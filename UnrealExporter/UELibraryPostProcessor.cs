@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -34,44 +35,67 @@ internal static class UELibraryPostProcessor
             .ToArray();
 
         Console.WriteLine($"Scanning {modelFiles.Length} glTF model(s), {materialJsonFiles.Length} material JSON file(s).");
-        var materialIndex = LoadMaterialIndex(root, materialJsonFiles);
+        var materialIndex = RunStage("加载材质索引", () => LoadMaterialIndex(root, materialJsonFiles));
         var reports = new List<ModelValidationEntry>(modelFiles.Length);
         var catalogRows = new List<JObject>(modelFiles.Length + materialIndex.Count);
 
-        foreach (var glbPath in modelFiles)
+        RunStage("验证模型并写模型说明", () =>
         {
-            var report = InspectModel(root, glbPath, materialIndex);
-            reports.Add(report);
-            catalogRows.Add(BuildModelCatalogRow(report));
-            WriteAssetReadme(root, report);
-        }
+            foreach (var glbPath in modelFiles)
+            {
+                var report = InspectModel(root, glbPath, materialIndex);
+                reports.Add(report);
+                catalogRows.Add(BuildModelCatalogRow(report));
+                WriteAssetReadme(root, report);
+            }
+        });
 
         foreach (var material in materialIndex.Values.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildMaterialCatalogRow(material));
 
-        var textureLinks = dedupeTextures ? DeduplicateTextureFilesCore(root) : [];
+        var textureLinks = dedupeTextures
+            ? RunStage("共享贴图去重/硬链接", () => DeduplicateTextureFilesCore(root))
+            : [];
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
-        var mergedCatalogRows = WriteAssetCatalog(root, catalogRows);
-        var sourceIndex = LoadSourceIndex(root);
-        var materialTextureSlots = WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex);
-        ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots);
-        mergedCatalogRows = WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList());
-        var sharedGltfTextureLinks = RewriteGltfSharedTextureUris(root, reports, materialTextureSlots);
-        var componentAssetRelations = WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex);
-        var packageObjectMaps = WritePackageObjectMaps(root, sourceIndex);
-        var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations);
-        var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
-        var modelCoverage = WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations);
-        WriteModelValidation(root, reports);
-        var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
-        WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex);
-        WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation);
-        WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
+        var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows));
+        var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
+        var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex));
+        RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
+        mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList()));
+        var sharedGltfTextureLinks = RunStage("改写文本glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots));
+        var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex));
+        var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
+        var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
+        var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
+        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations));
+        RunStage("写模型验证报告", () => WriteModelValidation(root, reports));
+        var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex));
+        RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
+        RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
+        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation));
+        RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
+    }
+
+    private static T RunStage<T>(string name, Func<T> action)
+    {
+        var sw = Stopwatch.StartNew();
+        Console.WriteLine($"[postprocess] {name}...");
+        var result = action();
+        Console.WriteLine($"[postprocess] {name} done ({sw.Elapsed:mm\\:ss\\.fff})");
+        return result;
+    }
+
+    private static void RunStage(string name, Action action)
+    {
+        RunStage(name, () =>
+        {
+            action();
+            return true;
+        });
     }
 
     private static bool IsLikelyMaterialJson(string path)
@@ -80,8 +104,28 @@ internal static class UELibraryPostProcessor
         {
             using var reader = File.OpenText(path);
             using var jsonReader = new JsonTextReader(reader);
-            var token = JToken.ReadFrom(jsonReader);
-            return token is JObject obj && obj["Parameters"] is JObject;
+            if (!jsonReader.Read() || jsonReader.TokenType != JsonToken.StartObject)
+                return false;
+
+            while (jsonReader.Read())
+            {
+                if (jsonReader.TokenType == JsonToken.EndObject)
+                    return false;
+                if (jsonReader.TokenType != JsonToken.PropertyName)
+                    continue;
+
+                var propertyName = (string?)jsonReader.Value;
+                if (!jsonReader.Read())
+                    return false;
+
+                // 素材库根报告可能很大；这里只看顶层字段，避免为了排除报告 JSON 而整文件解析。
+                if (string.Equals(propertyName, "Parameters", StringComparison.OrdinalIgnoreCase))
+                    return jsonReader.TokenType == JsonToken.StartObject;
+
+                jsonReader.Skip();
+            }
+
+            return false;
         }
         catch
         {
@@ -869,11 +913,13 @@ internal static class UELibraryPostProcessor
                     .First(),
                 StringComparer.OrdinalIgnoreCase);
 
+        // 材质槽数量可能非常大，不能每个槽都线性扫描全部贴图。
+        var textureLookup = BuildTextureLinkLookup(textureLinks);
         var result = new List<MaterialTextureSlotLink>();
         foreach (var slot in sourceIndex.MaterialTextureSlots)
         {
             var material = FindMaterialInfo(materialIndex, slot.MaterialName);
-            var textureLink = FindTextureLink(textureLinks, slot);
+            var textureLink = FindTextureLink(textureLookup, slot);
             var textureInfo = FindTextureObjectInfo(textureObjects, slot);
             var textureClassName = slot.TextureClassName ?? textureInfo?.ClassName;
             var textureClassPath = slot.TextureClassPath ?? textureInfo?.ClassPath;
@@ -1058,23 +1104,35 @@ internal static class UELibraryPostProcessor
 
         if (classText.Contains("rendertarget"))
             return "runtimeRenderTarget";
+        if (classText.Contains("mediatexture"))
+            return "mediaTexture";
         if (classText.Contains("volumetexture") || classText.Contains("texturecube") || classText.Contains("texture2darray"))
             return "unsupportedTextureType";
         if (classText.Contains("curve") || classText.Contains("atlas"))
             return "materialDataTexture";
         if (objectPath.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase))
             return "engineScriptObject";
+        if (IsEnginePluginTexturePath(objectPath))
+            return "enginePluginTexture";
         if (textureInfo == null && string.IsNullOrWhiteSpace(textureClassName))
             return "unresolvedTexturePackage";
 
         return "exportedTextureMissing";
     }
 
+    private static bool IsEnginePluginTexturePath(string objectPath)
+    {
+        if (string.IsNullOrWhiteSpace(objectPath))
+            return false;
+
+        return objectPath.StartsWith("/SpeedTreeImporter/", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string BuildMissingTextureStatus(string? missingCategory)
     {
         return missingCategory switch
         {
-            "runtimeRenderTarget" or "unsupportedTextureType" or "materialDataTexture" or "engineScriptObject" => "nonExportableTexture",
+            "runtimeRenderTarget" or "mediaTexture" or "unsupportedTextureType" or "materialDataTexture" or "engineScriptObject" or "enginePluginTexture" => "nonExportableTexture",
             "unresolvedTexturePackage" => "unresolvedTexturePackage",
             _ => "missingExportedTexture",
         };
@@ -1085,9 +1143,11 @@ internal static class UELibraryPostProcessor
         return missingCategory switch
         {
             "runtimeRenderTarget" => "源索引记录的是运行时 RenderTarget，当前不能按普通 PNG 贴图导出。",
+            "mediaTexture" => "源索引记录的是 MediaTexture，内容来自视频/媒体播放源，不按普通 PNG 贴图验收。",
             "unsupportedTextureType" => $"源索引记录的是 {textureClassName ?? "特殊贴图"}，当前贴图导出链路只稳定支持 Texture2D。",
             "materialDataTexture" => $"源索引记录的是 {textureClassName ?? "材质数据资源"}，更像材质参数/曲线数据，暂不按普通贴图验收。",
             "engineScriptObject" => "材质槽指向 UE 脚本默认对象，不是可直接导出的贴图资产。",
+            "enginePluginTexture" => "材质槽指向 UE 引擎/导入器插件内置贴图，不是当前游戏素材库的 PNG 缺失。",
             "unresolvedTexturePackage" => "源索引记录了材质贴图槽，但没有在 UE 包 Import/Export 记录中定位到对应贴图对象。",
             _ => "源索引记录了普通材质贴图槽，但当前导出目录中没有找到对应 PNG/HDR。",
         };
@@ -1810,17 +1870,66 @@ internal static class UELibraryPostProcessor
         return materialIndex.Values.FirstOrDefault(x => string.Equals(x.Name, materialName, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static TextureLinkInfo? FindTextureLink(List<TextureLinkInfo> textureLinks, SourceMaterialTextureSlot slot)
+    private static TextureLinkLookup BuildTextureLinkLookup(List<TextureLinkInfo> textureLinks)
+    {
+        var byPackageSuffix = new Dictionary<string, List<TextureLinkInfo>>(StringComparer.OrdinalIgnoreCase);
+        var byFileName = new Dictionary<string, List<TextureLinkInfo>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var link in textureLinks)
+        {
+            foreach (var key in BuildTextureLookupKeys(link.RelativePath))
+                AddTextureLookupValue(byPackageSuffix, key, link);
+
+            var fileName = Path.GetFileNameWithoutExtension(link.RelativePath);
+            if (!string.IsNullOrWhiteSpace(fileName))
+                AddTextureLookupValue(byFileName, fileName, link);
+        }
+
+        return new TextureLinkLookup(
+            byPackageSuffix.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase),
+            byFileName.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static IEnumerable<string> BuildTextureLookupKeys(string relativePath)
+    {
+        var normalized = NormalizeTextureLookupKey(TextureRelativeWithoutExtension(relativePath));
+        if (string.IsNullOrWhiteSpace(normalized))
+            yield break;
+
+        yield return normalized;
+
+        var contentIndex = normalized.IndexOf("/content/", StringComparison.OrdinalIgnoreCase);
+        if (contentIndex >= 0)
+            yield return normalized[(contentIndex + 1)..];
+    }
+
+    private static void AddTextureLookupValue(
+        Dictionary<string, List<TextureLinkInfo>> lookup,
+        string key,
+        TextureLinkInfo link)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return;
+
+        if (!lookup.TryGetValue(key, out var list))
+        {
+            list = [];
+            lookup[key] = list;
+        }
+
+        list.Add(link);
+    }
+
+    private static TextureLinkInfo? FindTextureLink(TextureLinkLookup lookup, SourceMaterialTextureSlot slot)
     {
         var objectPath = slot.TextureObjectPath ?? slot.TexturePath;
         if (!string.IsNullOrWhiteSpace(objectPath))
         {
             var packageSuffix = BuildPackageSuffix(objectPath);
-            if (!string.IsNullOrWhiteSpace(packageSuffix))
+            var packageKey = NormalizeTextureLookupKey(packageSuffix);
+            if (!string.IsNullOrWhiteSpace(packageKey) &&
+                lookup.ByPackageSuffix.TryGetValue(packageKey, out var exactSuffixMatches))
             {
-                var exactSuffixMatches = textureLinks
-                    .Where(x => TextureRelativeWithoutExtension(x.RelativePath).EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
                 var exactMatch = PickPreferredTextureLink(exactSuffixMatches);
                 if (exactMatch != null)
                     return exactMatch;
@@ -1830,10 +1939,17 @@ internal static class UELibraryPostProcessor
         if (string.IsNullOrWhiteSpace(slot.TextureName))
             return null;
 
-        var nameMatches = textureLinks
-            .Where(x => string.Equals(Path.GetFileNameWithoutExtension(x.RelativePath), slot.TextureName, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        return PickPreferredTextureLink(nameMatches);
+        return lookup.ByFileName.TryGetValue(slot.TextureName, out var nameMatches)
+            ? PickPreferredTextureLink(nameMatches)
+            : null;
+    }
+
+    private static string NormalizeTextureLookupKey(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return "";
+
+        return path.Replace('\\', '/').Trim().TrimStart('/').ToLowerInvariant();
     }
 
     private static TextureLinkInfo? PickPreferredTextureLink(TextureLinkInfo[] matches)
@@ -2129,11 +2245,13 @@ internal static class UELibraryPostProcessor
         }
         else if (missingTrackBones.Length > 0)
         {
-            if (trackCoverage >= 0.9 || (matchedTrackBones > 0 && missingTrackBones.Length <= 2))
+            if (trackCoverage >= 0.9
+                || (matchedTrackBones > 0 && missingTrackBones.Length <= 2)
+                || (trackCoverage >= 0.8 && IsOnlyAuxiliaryMissingTrackBones(missingTrackBones)))
             {
                 status = "warning";
                 validationCategory = "partialTrackCoverage";
-                reason = "动画有可匹配的骨骼 track，但少量辅助骨骼缺失，需要预览复核。";
+                reason = "动画主体骨骼覆盖较高，但部分辅助骨骼 track 缺失，需要预览复核。";
             }
             else
             {
@@ -2175,6 +2293,29 @@ internal static class UELibraryPostProcessor
             MissingReferencedAnimations = missingReferencedAnimations,
             HierarchyMismatches = hierarchyMismatches,
         };
+    }
+
+    private static bool IsOnlyAuxiliaryMissingTrackBones(string[] missingTrackBones)
+    {
+        if (missingTrackBones.Length == 0)
+            return false;
+
+        return missingTrackBones.All(IsAuxiliaryAnimationBoneName);
+    }
+
+    private static bool IsAuxiliaryAnimationBoneName(string boneName)
+    {
+        var normalized = boneName.Replace("_", "", StringComparison.Ordinal)
+            .Replace("-", "", StringComparison.Ordinal)
+            .Replace(" ", "", StringComparison.Ordinal);
+        return normalized.Contains("hair", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("cloth", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("cape", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("skirt", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("tail", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("ribbon", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("accessory", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("weapon", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsContainerAnimation(JObject animation)
@@ -4476,6 +4617,10 @@ internal static class UELibraryPostProcessor
         public bool HardLinked { get; set; }
         public string? LinkError { get; set; }
     }
+
+    private sealed record TextureLinkLookup(
+        Dictionary<string, TextureLinkInfo[]> ByPackageSuffix,
+        Dictionary<string, TextureLinkInfo[]> ByFileName);
 
     private sealed class ModelValidationEntry
     {
