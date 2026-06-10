@@ -3314,23 +3314,31 @@ internal static class UELibraryPostProcessor
         var animatedRows = taskRows
             .Where(x => x.AnimationCandidateCount > 0)
             .ToArray();
+        var qualityIssueRows = taskRows
+            .Where(x => BuildTaskQualityIssueReasons(x).Length > 0)
+            .ToArray();
 
         return new
         {
             total = taskRows.Length,
             ready = new
             {
+                usableModelQuality = taskRows.Length - qualityIssueRows.Length,
                 withExplicitComponentReferences = explicitRelationRows.Length,
+                pathOnlyUsableModels = pathOnlyRows.Length - pathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
                 withAnimationCandidates = animatedRows.Length,
                 okValidation = taskRows.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
             },
             needsReview = new
             {
-                pathOnlyWithoutComponentReferences = pathOnlyRows.Length,
                 warnings = warningRows.Length,
                 errors = errorRows.Length,
                 missingMaterials = missingMaterialRows.Length,
                 noExternalTextureSlots = noTextureRows.Length,
+            },
+            relationNeedsReview = new
+            {
+                pathOnlyWithoutComponentReferences = pathOnlyRows.Length,
             },
             bySourceType = taskRows
                 .GroupBy(x => string.IsNullOrWhiteSpace(x.SourceType) ? "unknown" : x.SourceType, StringComparer.OrdinalIgnoreCase)
@@ -3381,16 +3389,17 @@ internal static class UELibraryPostProcessor
             .OfType<JObject>()
             .Select(ReadModelCoverageRow)
             .Where(IsTaskOrPropCoverageRow)
-            .OrderByDescending(x => BuildTaskReviewReasons(x).Length)
+            .OrderByDescending(x => BuildTaskQualityIssueReasons(x).Length)
             .ThenByDescending(x => x.AnimationCandidateCount)
             .ThenByDescending(x => x.ComponentReferenceCount)
             .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var readyRows = rows.Where(x => BuildTaskReviewReasons(x).Length == 0).ToArray();
-        var reviewRows = rows.Where(x => BuildTaskReviewReasons(x).Length > 0).ToArray();
+        var readyRows = rows.Where(x => BuildTaskQualityIssueReasons(x).Length == 0).ToArray();
+        var reviewRows = rows.Where(x => BuildTaskQualityIssueReasons(x).Length > 0).ToArray();
+        var relationReviewRows = rows.Where(x => BuildTaskRelationReviewReasons(x).Length > 0).ToArray();
         var qualityIssueRows = rows.Where(x => BuildTaskQualityIssueReasons(x).Length > 0).ToArray();
         var byReason = reviewRows
-            .SelectMany(row => BuildTaskReviewReasons(row).Select(reason => new { reason, row }))
+            .SelectMany(row => BuildTaskQualityIssueReasons(row).Select(reason => new { reason, row }))
             .GroupBy(x => x.reason, StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(x => x.Count())
             .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
@@ -3411,6 +3420,7 @@ internal static class UELibraryPostProcessor
                 taskOrPropModels = rows.Length,
                 ready = readyRows.Length,
                 needsReview = reviewRows.Length,
+                relationNeedsReview = relationReviewRows.Length,
                 usableModelQuality = rows.Length - qualityIssueRows.Length,
                 qualityIssueModels = qualityIssueRows.Length,
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
@@ -3430,8 +3440,9 @@ internal static class UELibraryPostProcessor
                 {
                     signal = x.Key,
                     total = x.Count(),
-                    ready = x.Count(y => BuildTaskReviewReasons(y.row).Length == 0),
-                    needsReview = x.Count(y => BuildTaskReviewReasons(y.row).Length > 0),
+                    ready = x.Count(y => BuildTaskQualityIssueReasons(y.row).Length == 0),
+                    needsReview = x.Count(y => BuildTaskQualityIssueReasons(y.row).Length > 0),
+                    relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y.row).Length > 0),
                     withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
                     withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
                 })
@@ -3444,14 +3455,16 @@ internal static class UELibraryPostProcessor
                 {
                     sourceType = x.Key,
                     total = x.Count(),
-                    ready = x.Count(y => BuildTaskReviewReasons(y).Length == 0),
-                    needsReview = x.Count(y => BuildTaskReviewReasons(y).Length > 0),
+                    ready = x.Count(y => BuildTaskQualityIssueReasons(y).Length == 0),
+                    needsReview = x.Count(y => BuildTaskQualityIssueReasons(y).Length > 0),
+                    relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y).Length > 0),
                     withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
                     withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
                 })
                 .ToArray(),
             byReviewReason = byReason,
             reviewModels = reviewRows.Select(BuildTaskQualityRow).ToArray(),
+            relationReviewModels = relationReviewRows.Select(BuildTaskQualityRow).ToArray(),
             qualityIssueModels = qualityIssueRows.Select(BuildTaskQualityRow).ToArray(),
             readyExamples = readyRows
                 .OrderByDescending(x => x.ComponentReferenceCount)
@@ -3463,7 +3476,7 @@ internal static class UELibraryPostProcessor
         });
 
         File.WriteAllText(Path.Combine(root, "task_model_quality.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
-        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows);
+        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows, relationReviewRows);
     }
 
     private static bool IsTaskOrPropCoverageRow(ModelCoverageRow row)
@@ -3472,9 +3485,15 @@ internal static class UELibraryPostProcessor
     private static string[] BuildTaskReviewReasons(ModelCoverageRow row)
     {
         var reasons = new List<string>();
+        reasons.AddRange(BuildTaskQualityIssueReasons(row));
+        return reasons.ToArray();
+    }
+
+    private static string[] BuildTaskRelationReviewReasons(ModelCoverageRow row)
+    {
+        var reasons = new List<string>();
         if (row.ComponentReferenceCount == 0)
             reasons.Add("pathOnlyRelation");
-        reasons.AddRange(BuildTaskQualityIssueReasons(row));
         return reasons.ToArray();
     }
 
@@ -3510,15 +3529,18 @@ internal static class UELibraryPostProcessor
             row.ComponentReferenceCount,
             row.AnimationCandidateCount,
             row.TaskSignals,
-            NeedsReview = BuildTaskReviewReasons(row).Length > 0,
-            ReviewReasons = BuildTaskReviewReasons(row),
+            NeedsReview = BuildTaskQualityIssueReasons(row).Length > 0,
+            ReviewReasons = BuildTaskQualityIssueReasons(row),
+            RelationNeedsReview = BuildTaskRelationReviewReasons(row).Length > 0,
+            RelationReviewReasons = BuildTaskRelationReviewReasons(row),
         };
 
     private static void WriteTaskModelQualityReadme(
         string root,
         ModelCoverageRow[] rows,
         ModelCoverageRow[] readyRows,
-        ModelCoverageRow[] reviewRows)
+        ModelCoverageRow[] reviewRows,
+        ModelCoverageRow[] relationReviewRows)
     {
         var warningCount = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase));
         var errorCount = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase));
@@ -3527,11 +3549,12 @@ internal static class UELibraryPostProcessor
         {
             "# UE 任务/道具模型质量报告",
             "",
-            "本报告用于快速确认任务模型、交互道具和 Prop 是否已经作为可浏览素材进入库。`pathOnlyRelation` 表示模型来自任务/道具路径或 Prop 分类，但当前没有解析到 UE 组件显式引用；这类模型仍然保留为可用素材，只是关系需要后续补强。",
+            "本报告用于快速确认任务模型、交互道具和 Prop 是否已经作为可浏览素材进入库。`需要复查` 只统计模型质量问题；`关系待补` 表示模型来自任务/道具路径或 Prop 分类，但当前没有解析到 UE 组件显式引用。",
             "",
             $"总数: {rows.Length}",
             $"可直接使用: {readyRows.Length}",
             $"需要复查: {reviewRows.Length}",
+            $"关系待补: {relationReviewRows.Length}",
             $"模型质量问题: {qualityIssueCount}",
             $"有 UE 组件引用: {rows.Count(x => x.ComponentReferenceCount > 0)}",
             $"仅路径/分类命中: {rows.Count(x => x.ComponentReferenceCount == 0)}",
@@ -3546,7 +3569,7 @@ internal static class UELibraryPostProcessor
         };
 
         var reasonGroups = reviewRows
-            .SelectMany(row => BuildTaskReviewReasons(row).Select(reason => new { reason, row }))
+            .SelectMany(row => BuildTaskQualityIssueReasons(row).Select(reason => new { reason, row }))
             .GroupBy(x => x.reason, StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(x => x.Count())
             .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
@@ -3555,10 +3578,21 @@ internal static class UELibraryPostProcessor
             lines.Add($"- {group.Key}: {group.Count()}");
 
         lines.Add("");
+        lines.Add("## 关系待补");
+        lines.Add("");
+        lines.Add($"- pathOnlyRelation: {relationReviewRows.Length}");
+
+        lines.Add("");
         lines.Add("## 复查样例");
         lines.Add("");
         foreach (var row in reviewRows.Take(40))
-            lines.Add($"- {row.Name} [{string.Join(", ", BuildTaskReviewReasons(row))}] `{row.Output}`");
+            lines.Add($"- {row.Name} [{string.Join(", ", BuildTaskQualityIssueReasons(row))}] `{row.Output}`");
+
+        lines.Add("");
+        lines.Add("## 关系待补样例");
+        lines.Add("");
+        foreach (var row in relationReviewRows.Take(40))
+            lines.Add($"- {row.Name} [{string.Join(", ", BuildTaskRelationReviewReasons(row))}] `{row.Output}`");
 
         File.WriteAllLines(Path.Combine(root, "TASK_MODEL_QUALITY.md"), lines, Encoding.UTF8);
     }
@@ -4032,8 +4066,8 @@ internal static class UELibraryPostProcessor
             var isPathOnlyTask = isTaskOrProp && componentReferenceCount == 0;
             var missingMaterials = isTaskOrProp && materialCount == 0;
             var noExternalTextureSlots = isTaskOrProp && textureCount == 0;
+            // pathOnly 只是“关系待补”，不代表模型质量不可用；质量复查只看验证、材质和贴图事实。
             var needsReview = isTaskOrProp && (
-                isPathOnlyTask ||
                 missingMaterials ||
                 noExternalTextureSlots ||
                 string.Equals(validationStatus, "warning", StringComparison.OrdinalIgnoreCase) ||
