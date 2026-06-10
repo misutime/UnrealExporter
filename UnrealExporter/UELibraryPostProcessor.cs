@@ -2128,11 +2128,43 @@ internal static class UELibraryPostProcessor
         if (string.IsNullOrWhiteSpace(normalized))
             yield break;
 
+        var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var key in BuildTextureLookupKeyVariants(normalized))
+        {
+            if (emitted.Add(key))
+                yield return key;
+        }
+    }
+
+    private static IEnumerable<string> BuildTextureLookupKeyVariants(string normalized)
+    {
         yield return normalized;
 
         var contentIndex = normalized.IndexOf("/content/", StringComparison.OrdinalIgnoreCase);
         if (contentIndex >= 0)
+        {
             yield return normalized[(contentIndex + 1)..];
+
+            var beforeContent = normalized[..contentIndex];
+            var afterContent = normalized[(contentIndex + "/content/".Length)..];
+            var pluginsIndex = beforeContent.LastIndexOf("/plugins/", StringComparison.OrdinalIgnoreCase);
+            if (pluginsIndex >= 0)
+            {
+                var pluginName = beforeContent[(pluginsIndex + "/plugins/".Length)..].Split('/').LastOrDefault();
+                if (!string.IsNullOrWhiteSpace(pluginName))
+                {
+                    // UE 插件资源在材质里常写成 /PluginName/Path.Asset，
+                    // 但实际导出路径可能是 Game/Plugins/PluginName/Content/Path.png。
+                    // 两种 mount point 都入索引，后续材质槽才能稳定命中共享贴图。
+                    yield return $"{pluginName}/content/{afterContent}";
+                    yield return $"{pluginName}/{afterContent}";
+                }
+            }
+        }
+
+        var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length > 2 && string.Equals(parts[1], "content", StringComparison.OrdinalIgnoreCase))
+            yield return parts[0] + "/" + string.Join('/', parts.Skip(2));
     }
 
     private static void AddTextureLookupValue(
