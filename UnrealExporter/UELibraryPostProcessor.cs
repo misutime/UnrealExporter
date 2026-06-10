@@ -547,6 +547,9 @@ internal static class UELibraryPostProcessor
                 try
                 {
                     var row = JObject.Parse(line);
+                    if (IsCatalogCacheRow(root, row))
+                        continue;
+
                     result[BuildCatalogKey(root, row)] = row;
                 }
                 catch (Exception ex)
@@ -582,9 +585,23 @@ internal static class UELibraryPostProcessor
         }
 
         return result.Values
+            .Where(x => !IsCatalogCacheRow(root, x))
             .OrderBy(x => (string?)x["kind"], StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => (string?)x["output"] ?? (string?)x["source"], StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static bool IsCatalogCacheRow(string root, JObject row)
+    {
+        var path = ((string?)row["output"] ?? (string?)row["source"] ?? "").Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        if (Path.IsPathRooted(path))
+            path = MakeRelative(root, Path.GetFullPath(path)).Replace('\\', '/');
+
+        return path.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => part.StartsWith(".", StringComparison.Ordinal));
     }
 
     private static void PreserveExistingField(JObject existing, JObject merged, string name)
@@ -4627,7 +4644,7 @@ internal static class UELibraryPostProcessor
     {
         var textureFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
             .Where(x => TextureExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
-            .Where(x => !MakeRelative(root, x).Replace('\\', '/').StartsWith("Textures/_Shared/", StringComparison.OrdinalIgnoreCase))
+            .Where(x => IsAssetTextureFile(root, x))
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var sharedRoot = Path.Combine(root, "Textures", "_Shared");
@@ -4675,21 +4692,77 @@ internal static class UELibraryPostProcessor
         }
 
         WriteTextureLinks(root, links);
+        var removedStaleSharedFiles = RemoveUnreferencedSharedTextures(root, sharedRoot, links);
         File.WriteAllText(
             Path.Combine(root, "texture_dedupe_summary.json"),
             JsonConvert.SerializeObject(new
             {
                 generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "重复 PNG/HDR 统一复制到 Textures/_Shared，再把重复文件替换为硬链接；文本 glTF 会按 UE 材质槽尽量引用共享贴图。",
+                rule = "素材 PNG/HDR 统一复制到 Textures/_Shared，再把原素材文件替换为硬链接；缓存缩略图和浏览器临时目录不会进入素材贴图索引。",
                 scanned = textureFiles.Length,
                 unique = byHash.Count,
                 copiedToShared = copied,
                 hardLinkedFiles = linked,
-                note = "所有原 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 保持独立预览，文本 glTF 可通过 shared_texture_gltf_links.jsonl 追踪共享贴图改写。",
+                sharedTextureFiles = links.Select(x => x.SharedRelativePath).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                removedStaleSharedFiles,
+                note = "所有素材 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 保持独立预览，文本 glTF 可通过 shared_texture_gltf_links.jsonl 追踪共享贴图改写。",
             }, Formatting.Indented),
             Encoding.UTF8);
         Console.WriteLine($"Texture dedupe finished: scanned={textureFiles.Length}, unique={byHash.Count}, linked={linked}");
         return links;
+    }
+
+    private static bool IsAssetTextureFile(string root, string path)
+    {
+        var relative = MakeRelative(root, path).Replace('\\', '/');
+        if (relative.StartsWith("Textures/_Shared/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // 浏览器缓存、动画预览缓存和其它点号目录不是素材本体，不能污染可用素材库贴图索引。
+        var parts = relative.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return !parts.Any(part => part.StartsWith(".", StringComparison.Ordinal));
+    }
+
+    private static int RemoveUnreferencedSharedTextures(string root, string sharedRoot, List<TextureLinkInfo> links)
+    {
+        if (!Directory.Exists(sharedRoot))
+            return 0;
+
+        var referenced = links
+            .Select(x => Path.GetFullPath(x.SharedPath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var removed = 0;
+        foreach (var path in Directory.EnumerateFiles(sharedRoot, "*.*", SearchOption.AllDirectories).ToArray())
+        {
+            if (referenced.Contains(Path.GetFullPath(path)))
+                continue;
+
+            try
+            {
+                File.Delete(path);
+                removed++;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WARN: stale shared texture cleanup failed {MakeRelative(root, path)} ({ex.Message})");
+            }
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(sharedRoot, "*", SearchOption.AllDirectories)
+                     .OrderByDescending(x => x.Length))
+        {
+            try
+            {
+                if (!Directory.EnumerateFileSystemEntries(directory).Any())
+                    Directory.Delete(directory);
+            }
+            catch
+            {
+                // 空目录清理失败不影响素材关系，下一次后处理还会重试。
+            }
+        }
+
+        return removed;
     }
 
     private static void WriteTextureLinks(string root, List<TextureLinkInfo> links)
