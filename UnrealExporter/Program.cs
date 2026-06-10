@@ -2485,7 +2485,13 @@ public class UnrealExporter
         var notifies = BuildAnimationNotifyEntries(sequenceBase);
         var segments = BuildAnimationSegmentEntries(asset);
         var sections = BuildAnimationSectionEntries(asset);
-        var hasUsefulMetadata = curves.Length > 0 || notifies.Length > 0 || segments.Length > 0 || sections.Length > 0;
+        var hasUsefulMetadata = curves.Length > 0
+            || notifies.Length > 0
+            || segments.Length > 0
+            || sections.Length > 0
+            || sequenceBase?.SequenceLength > 0
+            || !string.IsNullOrWhiteSpace(GetPackageIndexPath(asset.Skeleton))
+            || !string.IsNullOrWhiteSpace(asset.GetPathName());
         if (!hasUsefulMetadata)
             return false;
 
@@ -2519,7 +2525,7 @@ public class UnrealExporter
             additiveType = sequence?.AdditiveAnimType.ToString(),
             additiveBasePoseType = sequence?.RefPoseType.ToString(),
             retargetSource = sequence?.RetargetSource.Text,
-            note = "这是导出失败动画的可读元数据侧车，不是可直接播放的 .ueanim。曲线、通知和容器片段仍可用于素材库检索和后续曲线动画支持。",
+            note = "这是导出失败动画的可读元数据/诊断侧车，不是可直接播放的 .ueanim。曲线、通知、容器片段、时长和 Skeleton 等事实仍可用于素材库检索和后续动画支持。",
         };
         File.WriteAllText(outputPath, JsonConvert.SerializeObject(sidecar, Formatting.Indented));
         return true;

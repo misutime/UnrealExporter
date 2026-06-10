@@ -161,7 +161,7 @@ internal static class UELibraryPostProcessor
                 row["format"] = "json";
                 row["output"] = metadataPath;
                 row["metadataOnly"] = true;
-                row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知或 Montage/Composite 片段，供素材库检索和后续动画支持使用。";
+                row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实，供素材库检索和后续动画支持使用。";
                 if (updateCatalogRow)
                     row["kind"] = "Animation";
 
@@ -187,7 +187,10 @@ internal static class UELibraryPostProcessor
             || JArrayCount(row["segments"]) > 0
             || JArrayCount(row["sections"]) > 0
             || ((int?)row["curveCount"] ?? 0) > 0
-            || ((int?)row["notifyCount"] ?? 0) > 0;
+            || ((int?)row["notifyCount"] ?? 0) > 0
+            || ((double?)row["duration"] ?? 0) > 0
+            || !string.IsNullOrWhiteSpace((string?)row["skeletonPath"])
+            || !string.IsNullOrWhiteSpace((string?)row["objectPath"]);
     }
 
     private static int JArrayCount(JToken? token)
@@ -249,7 +252,7 @@ internal static class UELibraryPostProcessor
             ["additiveType"] = row["additiveType"]?.DeepClone(),
             ["additiveBasePoseType"] = row["additiveBasePoseType"]?.DeepClone(),
             ["retargetSource"] = row["retargetSource"]?.DeepClone(),
-            ["note"] = "这是导出失败动画的可读元数据侧车，不是可直接播放的 .ueanim。曲线、通知和容器片段仍可用于素材库检索和后续曲线动画支持。"
+            ["note"] = "这是导出失败动画的可读元数据/诊断侧车，不是可直接播放的 .ueanim。曲线、通知、容器片段、时长和 Skeleton 等事实仍可用于素材库检索和后续动画支持。"
         };
         File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
     }
