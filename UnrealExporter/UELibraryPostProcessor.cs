@@ -67,6 +67,7 @@ internal static class UELibraryPostProcessor
         WriteModelValidation(root, reports);
         var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
         WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex);
+        WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex);
         WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
@@ -2534,6 +2535,29 @@ internal static class UELibraryPostProcessor
         };
     }
 
+    private static object BuildModelCoverageSignalGroup(string signal, IEnumerable<ModelCoverageRow> rows)
+    {
+        var array = rows.ToArray();
+        return new
+        {
+            signal,
+            total = array.Length,
+            staticModels = array.Count(x => x.IsStatic),
+            skinnedModels = array.Count(x => x.HasSkin),
+            withComponentReferences = array.Count(x => x.ComponentReferenceCount > 0),
+            withAnimationCandidates = array.Count(x => x.AnimationCandidateCount > 0),
+            ok = array.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
+            warnings = array.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
+            examples = array
+                .OrderByDescending(x => x.ComponentReferenceCount)
+                .ThenByDescending(x => x.AnimationCandidateCount)
+                .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                .Take(24)
+                .Select(BuildModelCoverageJsonRow)
+                .ToArray(),
+        };
+    }
+
     private static object BuildModelCoverageJsonRow(ModelCoverageRow row)
         => new
         {
@@ -2579,6 +2603,189 @@ internal static class UELibraryPostProcessor
     {
         if (text.Contains(token))
             signals.Add(signal);
+    }
+
+    private static void WriteLibraryAcceptance(
+        string root,
+        List<JObject> catalogRows,
+        List<ModelValidationEntry> reports,
+        List<TextureLinkInfo> textureLinks,
+        MaterialTextureSlotLink[] materialTextureSlots,
+        ComponentAssetRelationLink[] componentAssetRelations,
+        JArray skeletonGroups,
+        JObject modelAnimationRelations,
+        JObject modelCoverage,
+        AnimationValidationSummary animationValidation,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var assets = catalogRows.ToArray();
+        var models = assets.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var textures = assets.Where(x => string.Equals((string?)x["kind"], "Texture", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var animations = assets.Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var coverageRows = ((JArray?)modelCoverage["models"] ?? [])
+            .OfType<JObject>()
+            .Select(ReadModelCoverageRow)
+            .ToArray();
+        var taskRows = coverageRows
+            .Where(x => x.TaskSignals.Length > 0 || string.Equals(x.ResourceKind, "Prop", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var taskSignalGroups = taskRows
+            .SelectMany(row => (row.TaskSignals.Length == 0 ? ["prop"] : row.TaskSignals).Select(signal => new { signal, row }))
+            .GroupBy(x => x.signal, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => BuildModelCoverageSignalGroup(x.Key, x.Select(y => y.row)))
+            .ToArray();
+        var relationModels = ((JArray?)modelAnimationRelations["relations"] ?? [])
+            .OfType<JObject>()
+            .ToArray();
+        var relationAnimations = relationModels
+            .SelectMany(relation => ((JArray?)relation["animations"] ?? []).OfType<JObject>())
+            .ToArray();
+        var modelRefs = componentAssetRelations.Where(x => IsModelRelation(x.RelationType)).ToArray();
+        var animationRefs = componentAssetRelations.Where(x => IsAnimationRelation(x.RelationType)).ToArray();
+        var materialRefs = componentAssetRelations.Where(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
+
+        var acceptance = JObject.FromObject(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            rule = "可用 UE 素材库验收只汇总已导出资产、UE 源索引关系和后处理验证事实；不按单个游戏私有名称硬猜关系。",
+            sourceIndex = new
+            {
+                sourceIndex.Available,
+                sourceIndex.Path,
+                sourceIndex.Error,
+            },
+            models = new
+            {
+                total = models.Length,
+                ok = reports.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
+                warning = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase)),
+                error = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase)),
+                staticModels = reports.Count(x => x.SkinCount == 0),
+                skinnedModels = reports.Count(x => x.SkinCount > 0),
+                withSkeletonPath = models.Count(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"])),
+                withAnimationCandidates = relationModels.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
+                byResourceKind = coverageRows
+                    .GroupBy(x => x.ResourceKind, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => BuildModelCoverageGroup(x.Key, x))
+                    .ToArray(),
+            },
+            taskAndPropModels = new
+            {
+                total = taskRows.Length,
+                withComponentReferences = taskRows.Count(x => x.ComponentReferenceCount > 0),
+                withAnimationCandidates = taskRows.Count(x => x.AnimationCandidateCount > 0),
+                bySignal = taskSignalGroups,
+                highReferenceExamples = taskRows
+                    .OrderByDescending(x => x.ComponentReferenceCount)
+                    .ThenByDescending(x => x.AnimationCandidateCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(64)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+            },
+            textures = new
+            {
+                catalogRows = textures.Length,
+                dedupeEnabled = textureLinks.Count > 0,
+                scanned = textureLinks.Count,
+                unique = textureLinks.Select(x => x.Hash + x.Extension).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                hardLinked = textureLinks.Count(x => x.HardLinked),
+                linkErrors = textureLinks.Count(x => !string.IsNullOrWhiteSpace(x.LinkError)),
+                materialTextureSlots = materialTextureSlots.Length,
+                matchedMaterialTextureSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase)),
+            },
+            skeletons = new
+            {
+                groups = skeletonGroups.Count,
+                groupsWithAnimations = skeletonGroups.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
+                sourceObjects = skeletonGroups.Sum(x => ((JArray?)x["skeletonSourceObjects"] ?? []).Count),
+            },
+            animations = new
+            {
+                catalogRows = animations.Length,
+                relatedModels = relationModels.Length,
+                relatedAnimations = relationAnimations.Length,
+                validationPairs = animationValidation.Validations.Length,
+                ok = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
+                warning = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase)),
+                error = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase)),
+                containerAnimations = animationValidation.Validations.Count(x => x.IsContainerAnimation),
+                byCategory = animationValidation.Validations
+                    .GroupBy(x => x.ValidationCategory, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new
+                    {
+                        category = x.Key,
+                        total = x.Count(),
+                        ok = x.Count(y => string.Equals(y.Status, "ok", StringComparison.OrdinalIgnoreCase)),
+                        warning = x.Count(y => string.Equals(y.Status, "warning", StringComparison.OrdinalIgnoreCase)),
+                        error = x.Count(y => string.Equals(y.Status, "error", StringComparison.OrdinalIgnoreCase)),
+                    })
+                    .ToArray(),
+            },
+            relations = new
+            {
+                componentAssetRelations = componentAssetRelations.Length,
+                modelReferences = BuildRelationAcceptance(modelRefs),
+                animationReferences = BuildRelationAcceptance(animationRefs),
+                materialReferences = BuildRelationAcceptance(materialRefs),
+            },
+            notes = new[]
+            {
+                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 目前已索引和验证关系，但还未生成可播放 glTF 动画预览。",
+                "任务/道具模型优先看 taskAndPropModels.bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系。",
+                "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
+            },
+        });
+
+        File.WriteAllText(Path.Combine(root, "library_acceptance.json"), acceptance.ToString(Formatting.Indented), Encoding.UTF8);
+    }
+
+    private static object BuildRelationAcceptance(ComponentAssetRelationLink[] links)
+        => new
+        {
+            total = links.Length,
+            matchedOrCovered = links.Count(x =>
+                string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(x.MatchStatus, "skeletonCoveredByModels", StringComparison.OrdinalIgnoreCase)),
+            byStatus = links
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.MatchStatus) ? "unknown" : x.MatchStatus, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(x => x.Count())
+                .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(x => new { status = x.Key, count = x.Count() })
+                .ToArray(),
+        };
+
+    private static ModelCoverageRow ReadModelCoverageRow(JObject row)
+    {
+        var taskSignals = ((JArray?)row["TaskSignals"] ?? [])
+            .Select(x => (string?)x)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToArray();
+        return new ModelCoverageRow
+        {
+            Name = (string?)row["Name"] ?? "",
+            Output = (string?)row["Output"] ?? "",
+            Source = (string?)row["Source"] ?? "",
+            ObjectPath = (string?)row["ObjectPath"],
+            ResourceKind = (string?)row["ResourceKind"] ?? "Unknown",
+            SourceType = (string?)row["SourceType"] ?? "",
+            ValidationStatus = (string?)row["ValidationStatus"] ?? "unknown",
+            IsStatic = (bool?)row["IsStatic"] ?? false,
+            HasSkin = (bool?)row["HasSkin"] ?? false,
+            HasSkeletonPath = (bool?)row["HasSkeletonPath"] ?? false,
+            MaterialCount = (int?)row["MaterialCount"] ?? 0,
+            TextureCount = (int?)row["TextureCount"] ?? 0,
+            ComponentReferenceCount = (int?)row["ComponentReferenceCount"] ?? 0,
+            AnimationCandidateCount = (int?)row["AnimationCandidateCount"] ?? 0,
+            TaskSignals = taskSignals,
+        };
     }
 
     private static void WriteLibraryIndexDb(
@@ -2812,11 +3019,18 @@ internal static class UELibraryPostProcessor
                 source TEXT,
                 output TEXT,
                 status TEXT,
+                validation_category TEXT,
+                validation_reason TEXT,
                 duration REAL,
                 frame_count INTEGER,
                 track_count INTEGER,
+                track_coverage REAL,
+                hierarchy_compatible INTEGER NOT NULL,
+                is_container_animation INTEGER NOT NULL,
                 segment_count INTEGER NOT NULL,
                 referenced_animation_count INTEGER NOT NULL,
+                exported_referenced_animation_count INTEGER NOT NULL,
+                missing_referenced_animation_count INTEGER NOT NULL,
                 section_count INTEGER NOT NULL,
                 raw_json TEXT NOT NULL,
                 FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
@@ -2862,6 +3076,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(status, validation_category);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
 
@@ -3312,11 +3527,15 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO relation_animations (
                 relation_id, name, source, output, status, duration, frame_count, track_count,
-                segment_count, referenced_animation_count, section_count, raw_json
+                validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
+                segment_count, referenced_animation_count, exported_referenced_animation_count,
+                missing_referenced_animation_count, section_count, raw_json
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
-                $segmentCount, $referencedAnimationCount, $sectionCount, $rawJson
+                $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
+                $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
             """;
         Add(command, "$relationId", relationId);
@@ -3324,11 +3543,18 @@ internal static class UELibraryPostProcessor
         Add(command, "$source", (string?)animation["source"]);
         Add(command, "$output", (string?)animation["output"]);
         Add(command, "$status", (string?)animation["status"]);
+        Add(command, "$validationCategory", (string?)animation["validationCategory"]);
+        Add(command, "$validationReason", (string?)animation["validationReason"]);
         Add(command, "$duration", (double?)animation["duration"]);
         Add(command, "$frameCount", (int?)animation["frameCount"]);
         Add(command, "$trackCount", (int?)animation["trackCount"]);
+        Add(command, "$trackCoverage", (double?)animation["trackCoverage"]);
+        Add(command, "$hierarchyCompatible", ((bool?)animation["hierarchyCompatible"] ?? false) ? 1 : 0);
+        Add(command, "$isContainerAnimation", ((bool?)animation["isContainerAnimation"] ?? false) ? 1 : 0);
         Add(command, "$segmentCount", (int?)animation["segmentCount"] ?? 0);
         Add(command, "$referencedAnimationCount", (int?)animation["referencedAnimationCount"] ?? 0);
+        Add(command, "$exportedReferencedAnimationCount", (int?)animation["exportedReferencedAnimationCount"] ?? 0);
+        Add(command, "$missingReferencedAnimationCount", (int?)animation["missingReferencedAnimationCount"] ?? 0);
         Add(command, "$sectionCount", (int?)animation["sectionCount"] ?? 0);
         Add(command, "$rawJson", animation.ToString(Formatting.None));
         command.ExecuteNonQuery();
