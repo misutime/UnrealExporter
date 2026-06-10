@@ -1342,9 +1342,13 @@ public class UnrealExporter
             AddAutoReferencedExportRule(rules, diagnostics, relationType, targetPath, filePath, outputType);
         }
 
+        var sourceRelationResult = AddSourceRelationExportRules(connection, packageFiles, provider, rules, diagnostics);
+        unresolved += sourceRelationResult.Unresolved;
+        ambiguous += sourceRelationResult.Ambiguous;
         var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules, diagnostics);
         unresolved += materialTextureResult.Unresolved;
         ambiguous += materialTextureResult.Ambiguous;
+        unresolved += AddIndexedAnimationExportRules(connection, provider, rules, diagnostics);
         unresolved += AddAnimationSegmentExportRules(connection, provider, rules, diagnostics);
 
         WriteAutoReferencedExportDiagnostics(config, diagnostics);
@@ -1356,6 +1360,80 @@ public class UnrealExporter
             x => x.Key,
             x => x.Value.ToArray(),
             StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static (int Unresolved, int Ambiguous) AddSourceRelationExportRules(
+        SqliteConnection connection,
+        Dictionary<string, string[]> packageFiles,
+        AbstractFileProvider provider,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
+        List<object> diagnostics)
+    {
+        if (!TableExists(connection, "source_relations"))
+            return (0, 0);
+
+        var unresolved = 0;
+        var ambiguous = 0;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT relation_type, target_path
+            FROM source_relations
+            WHERE target_path IS NOT NULL
+              AND target_path != ''
+              AND relation_type IN ('Material', 'Texture', 'Animation', 'Skeleton');
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var relationType = reader.GetString(0);
+            var targetPath = reader.GetString(1);
+            if (relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
+            {
+                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules, diagnostics);
+                continue;
+            }
+
+            var outputType = InferOutputTypeForReferencedAsset(relationType, targetPath);
+            if (outputType == null)
+                continue;
+
+            var result = TryAddPackageBackedAutoRule(packageFiles, rules, diagnostics, relationType, targetPath, outputType);
+            unresolved += result.Unresolved;
+            ambiguous += result.Ambiguous;
+        }
+
+        return (unresolved, ambiguous);
+    }
+
+    private static (int Unresolved, int Ambiguous) TryAddPackageBackedAutoRule(
+        Dictionary<string, string[]> packageFiles,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
+        List<object> diagnostics,
+        string relationType,
+        string targetPath,
+        string outputType)
+    {
+        var suffix = BuildPackageFileSuffix(targetPath);
+        if (string.IsNullOrWhiteSpace(suffix))
+        {
+            diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", relationType, targetPath, null, outputType, "emptyPackageSuffix"));
+            return (1, 0);
+        }
+
+        if (!packageFiles.TryGetValue(suffix, out var matches) || matches.Length == 0)
+        {
+            diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", relationType, targetPath, null, outputType, "sourcePackageNotFound"));
+            return (1, 0);
+        }
+
+        if (matches.Length > 1)
+        {
+            diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "ambiguous", relationType, targetPath, null, outputType, $"matchedPackages={matches.Length}"));
+            return (0, 1);
+        }
+
+        AddAutoReferencedExportRule(rules, diagnostics, relationType, targetPath, matches[0], outputType);
+        return (0, 0);
     }
 
     private static bool ShouldAutoExportReferencedAssets(ConfigObj config)
@@ -1489,6 +1567,45 @@ public class UnrealExporter
             }
 
             AddAutoReferencedExportRule(rules, diagnostics, "AnimationSegment", reader.GetString(0), filePath, "ueanim");
+        }
+
+        return unresolved;
+    }
+
+    private static int AddIndexedAnimationExportRules(
+        SqliteConnection connection,
+        AbstractFileProvider provider,
+        Dictionary<string, List<AutoReferencedExportRule>> rules,
+        List<object> diagnostics)
+    {
+        if (!TableExists(connection, "source_objects"))
+            return 0;
+
+        var unresolved = 0;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT object_path
+            FROM source_objects
+            WHERE object_path IS NOT NULL
+              AND object_path != ''
+              AND (
+                  object_type IN ('UAnimSequence', 'UAnimMontage', 'UAnimComposite')
+                  OR export_type IN ('AnimSequence', 'AnimMontage', 'AnimComposite')
+              );
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var animationPath = reader.GetString(0);
+            var filePath = FindProviderFilePathByObjectPath(provider, animationPath);
+            if (filePath == null)
+            {
+                unresolved++;
+                diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "Animation", animationPath, null, "ueanim", "indexedAnimationSourceNotFound"));
+                continue;
+            }
+
+            AddAutoReferencedExportRule(rules, diagnostics, "Animation", animationPath, filePath, "ueanim");
         }
 
         return unresolved;

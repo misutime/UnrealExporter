@@ -56,6 +56,7 @@ internal static class UESourceIndexBuilder
             InsertSourceFile(connection, transaction, file);
 
         var inspected = 0;
+        var indexedMaterialSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in packageFiles)
         {
             inspected++;
@@ -65,7 +66,7 @@ internal static class UESourceIndexBuilder
                 InsertPackageObjectMaps(connection, transaction, file.Path, package);
                 var exports = package.GetExports().ToArray();
                 foreach (var obj in exports)
-                    InsertSourceObject(connection, transaction, file, obj);
+                    InsertSourceObject(connection, transaction, file, obj, indexedMaterialSlots);
             }
             catch (Exception ex)
             {
@@ -111,12 +112,80 @@ internal static class UESourceIndexBuilder
                 if (separator > 0)
                     patterns.Add(item[..separator]);
             }
+
+            if (config.GenerateLibraryIndexes)
+                patterns.AddRange(BuildLibraryRelationPackagePatterns(config));
         }
 
         return patterns
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Select(x => new Regex("^" + x + "$", RegexOptions.IgnoreCase | RegexOptions.Compiled))
             .ToArray();
+    }
+
+    private static IEnumerable<string> BuildLibraryRelationPackagePatterns(ConfigObj config)
+    {
+        foreach (var prefix in InferStableExportPrefixes(config.Export))
+        {
+            // 源索引必须覆盖关系承载包；这些包不一定直接导出，但会决定任务模型、组件、材质和动画能否补齐。
+            yield return $"{Regex.Escape(prefix)}/.*(?:/Blueprints?/|/BP_|/BPs/|/Actors?/|/Components?/).*\\.uasset";
+            yield return $"{Regex.Escape(prefix)}/.*(?:/Animation/|/Animations/|/Anim/|/Montage/|/Montages/).*\\.uasset";
+        }
+
+        foreach (var contentRoot in InferContentRoots(config.Export))
+        {
+            yield return $"{Regex.Escape(contentRoot)}/Animation/.*\\.uasset";
+            yield return $"{Regex.Escape(contentRoot)}/Animations/.*\\.uasset";
+        }
+    }
+
+    private static string[] InferStableExportPrefixes(IEnumerable<string> exportRules)
+        => exportRules
+            .Select(GetStableExportPrefix)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray()!;
+
+    private static string? GetStableExportPrefix(string exportRule)
+    {
+        var separator = exportRule.LastIndexOf(':');
+        var pattern = separator > 0 ? exportRule[..separator] : exportRule;
+        var firstRegex = pattern.IndexOfAny(['*', '(', '[', '?', '+', '{', '|', '\\']);
+        if (firstRegex < 0)
+            firstRegex = pattern.Length;
+
+        var prefix = pattern[..firstRegex].TrimEnd('/');
+        var slash = prefix.LastIndexOf('/');
+        if (slash > 0)
+            prefix = prefix[..slash].TrimEnd('/');
+
+        var contentIndex = prefix.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+        if (contentIndex < 0)
+            return null;
+
+        var contentRootEnd = contentIndex + "/Content".Length;
+        var afterContent = prefix.Length > contentRootEnd
+            ? prefix[(contentRootEnd + 1)..].Trim('/')
+            : "";
+        if (afterContent.Length == 0 || afterContent.Contains('/') == false)
+            return null;
+
+        return prefix;
+    }
+
+    private static string[] InferContentRoots(IEnumerable<string> exportRules)
+        => exportRules
+            .Select(GetContentRoot)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray()!;
+
+    private static string? GetContentRoot(string exportRule)
+    {
+        var separator = exportRule.LastIndexOf(':');
+        var pattern = separator > 0 ? exportRule[..separator] : exportRule;
+        var contentIndex = pattern.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+        return contentIndex < 0 ? null : pattern[..(contentIndex + "/Content".Length)];
     }
 
     private static void CreateSchema(SqliteConnection connection, SqliteTransaction transaction)
@@ -705,7 +774,8 @@ internal static class UESourceIndexBuilder
         SqliteConnection connection,
         SqliteTransaction transaction,
         GameFile file,
-        UObject obj)
+        UObject obj,
+        HashSet<string> indexedMaterialSlots)
     {
         var skeletalMesh = obj as USkeletalMesh;
         var staticMesh = obj as UStaticMesh;
@@ -770,15 +840,25 @@ internal static class UESourceIndexBuilder
         if (skeletalMesh != null)
         {
             foreach (var material in skeletalMesh.Materials.Where(x => x != null))
+            {
                 InsertRelation(connection, transaction, file.Path, obj.GetPathName(), "Material", material!.GetPathName(), material.Name.Text);
+                if (TryLoadResolvedObject(material, out UMaterialInterface? loadedMaterial) &&
+                    indexedMaterialSlots.Add(loadedMaterial.GetPathName()))
+                    InsertMaterialTextureSlots(connection, transaction, file.Path, loadedMaterial);
+            }
         }
         else if (staticMesh != null)
         {
             foreach (var material in staticMesh.Materials.Where(x => x != null))
+            {
                 InsertRelation(connection, transaction, file.Path, obj.GetPathName(), "Material", material!.GetPathName(), material.Name.Text);
+                if (TryLoadResolvedObject(material, out UMaterialInterface? loadedMaterial) &&
+                    indexedMaterialSlots.Add(loadedMaterial.GetPathName()))
+                    InsertMaterialTextureSlots(connection, transaction, file.Path, loadedMaterial);
+            }
         }
 
-        if (obj is UMaterialInterface materialInterface)
+        if (obj is UMaterialInterface materialInterface && indexedMaterialSlots.Add(materialInterface.GetPathName()))
             InsertMaterialTextureSlots(connection, transaction, file.Path, materialInterface);
 
         if (skeletalMesh != null)
@@ -1348,6 +1428,25 @@ internal static class UESourceIndexBuilder
         catch
         {
             return [];
+        }
+    }
+
+    private static bool TryLoadResolvedObject<T>(ResolvedObject? resolvedObject, [NotNullWhen(true)] out T? loaded)
+        where T : UObject
+    {
+        loaded = null;
+        if (resolvedObject == null)
+            return false;
+
+        try
+        {
+            loaded = resolvedObject.Load<T>();
+            return loaded != null;
+        }
+        catch
+        {
+            // 材质包缺失或类型不匹配时，只跳过贴图槽解析，保留 Mesh -> Material 的显式关系。
+            return false;
         }
     }
 
