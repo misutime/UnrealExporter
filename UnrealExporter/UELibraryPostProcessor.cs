@@ -61,7 +61,7 @@ internal static class UELibraryPostProcessor
         var sharedGltfTextureLinks = RewriteGltfSharedTextureUris(root, reports, materialTextureSlots);
         var componentAssetRelations = WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex);
         var packageObjectMaps = WritePackageObjectMaps(root, sourceIndex);
-        var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex);
+        var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
         WriteModelValidation(root, reports);
         var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
@@ -1840,9 +1840,10 @@ internal static class UELibraryPostProcessor
     private static AnimationValidationSummary WriteAnimationValidation(
         string root,
         List<JObject> catalogRows,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        ComponentAssetRelationLink[] componentAssetRelations)
     {
-        var validations = BuildAnimationValidations(catalogRows, sourceIndex);
+        var validations = BuildAnimationValidations(catalogRows, sourceIndex, componentAssetRelations);
         var summary = new AnimationValidationSummary
         {
             SourceIndexAvailable = sourceIndex.Available,
@@ -1854,7 +1855,7 @@ internal static class UELibraryPostProcessor
         var json = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "只验证 UE Skeleton 原始引用一致的模型动画候选；再检查动画 track 骨骼是否被模型骨架覆盖，以及重叠骨骼父子层级是否兼容。",
+            ["rule"] = "默认只验证显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选；再检查动画 track 骨骼是否被模型骨架覆盖，以及重叠骨骼父子层级是否兼容。",
             ["sourceIndex"] = JObject.FromObject(new
             {
                 available = sourceIndex.Available,
@@ -1906,7 +1907,8 @@ internal static class UELibraryPostProcessor
 
     private static AnimationValidationEntry[] BuildAnimationValidations(
         List<JObject> catalogRows,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        ComponentAssetRelationLink[] componentAssetRelations)
     {
         var models = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -1915,26 +1917,101 @@ internal static class UELibraryPostProcessor
         var animations = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
-            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
-        var allAnimations = animations.Values.SelectMany(x => x).ToArray();
+            .ToArray();
+        var allAnimations = animations;
+        var candidates = BuildModelAnimationCandidates(models, animations, componentAssetRelations);
 
         var result = new List<AnimationValidationEntry>();
-        foreach (var model in models)
-        {
-            var skeletonPath = (string)model["skeletonPath"]!;
-            if (!animations.TryGetValue(skeletonPath, out var matchedAnimations))
-                continue;
-
-            foreach (var animation in matchedAnimations)
-                result.Add(ValidateAnimationPair(model, animation, allAnimations, sourceIndex));
-        }
+        foreach (var candidate in candidates)
+            result.Add(ValidateAnimationPair(candidate.Model, candidate.Animation, allAnimations, sourceIndex));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => x.AnimationOutput, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
+
+    private static ModelAnimationCandidate[] BuildModelAnimationCandidates(
+        JObject[] models,
+        JObject[] animations,
+        ComponentAssetRelationLink[] componentAssetRelations)
+    {
+        var modelsByOutput = BuildUniqueAssetOutputLookup(models);
+        var animationsByOutput = BuildUniqueAssetOutputLookup(animations);
+        var result = new Dictionary<string, ModelAnimationCandidate>(StringComparer.OrdinalIgnoreCase);
+
+        // 同一个 UE owner 同时显式引用模型和动画时，才作为默认推荐候选。
+        foreach (var group in componentAssetRelations
+                     .Where(x => !string.IsNullOrWhiteSpace(x.OwnerObjectPath))
+                     .GroupBy(x => x.OwnerObjectPath!, StringComparer.OrdinalIgnoreCase))
+        {
+            var modelLinks = group
+                .Where(x => IsModelRelation(x.RelationType) && x.MatchStatus == "matched")
+                .Select(x => NormalizeCatalogOutput(x.TargetAssetOutput))
+                .Where(x => !string.IsNullOrWhiteSpace(x) && modelsByOutput.ContainsKey(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var animationLinks = group
+                .Where(x => IsAnimationRelation(x.RelationType) && x.MatchStatus == "matched")
+                .Select(x => NormalizeCatalogOutput(x.TargetAssetOutput))
+                .Where(x => !string.IsNullOrWhiteSpace(x) && animationsByOutput.ContainsKey(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            foreach (var modelOutput in modelLinks)
+            foreach (var animationOutput in animationLinks)
+                AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animationsByOutput[animationOutput], "componentOwner");
+        }
+
+        var modelsBySkeleton = models
+            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+        var animationsBySkeleton = animations
+            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
+        // 如果某个 Skeleton 在当前素材库中只对应一个模型，同骨架动画关系是安全的默认候选。
+        foreach (var (skeletonPath, skeletonModels) in modelsBySkeleton)
+        {
+            if (skeletonModels.Length != 1 || !animationsBySkeleton.TryGetValue(skeletonPath, out var skeletonAnimations))
+                continue;
+
+            foreach (var animation in skeletonAnimations)
+                AddModelAnimationCandidate(result, skeletonModels[0], animation, "uniqueSkeleton");
+        }
+
+        return result.Values
+            .OrderBy(x => (string?)x.Model["output"], StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => (string?)x.Animation["output"], StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static Dictionary<string, JObject> BuildUniqueAssetOutputLookup(JObject[] assets)
+    {
+        return assets
+            .Select(x => new { Output = NormalizeCatalogOutput((string?)x["output"] ?? (string?)x["source"]), Asset = x })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Output))
+            .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+            .Where(x => x.Count() == 1)
+            .ToDictionary(x => x.Key, x => x.First().Asset, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static void AddModelAnimationCandidate(
+        Dictionary<string, ModelAnimationCandidate> candidates,
+        JObject model,
+        JObject animation,
+        string reason)
+    {
+        if (!string.Equals((string?)model["skeletonPath"], (string?)animation["skeletonPath"], StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var key = BuildPairKey(model, animation);
+        if (!candidates.ContainsKey(key))
+            candidates.Add(key, new ModelAnimationCandidate(model, animation, reason));
+    }
+
+    private static string NormalizeCatalogOutput(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "" : value.Replace('\\', '/');
 
     private static AnimationValidationEntry ValidateAnimationPair(
         JObject model,
@@ -2004,9 +2081,18 @@ internal static class UELibraryPostProcessor
         }
         else if (missingTrackBones.Length > 0)
         {
-            status = "error";
-            validationCategory = "missingTrackBones";
-            reason = "动画 track 引用了模型骨架中不存在的骨骼。";
+            if (trackCoverage >= 0.9 || (matchedTrackBones > 0 && missingTrackBones.Length <= 2))
+            {
+                status = "warning";
+                validationCategory = "partialTrackCoverage";
+                reason = "动画有可匹配的骨骼 track，但少量辅助骨骼缺失，需要预览复核。";
+            }
+            else
+            {
+                status = "error";
+                validationCategory = "missingTrackBones";
+                reason = "动画 track 引用了较多模型骨架中不存在的骨骼。";
+            }
         }
         else if (hierarchyMismatches.Length > 0)
         {
@@ -2177,45 +2263,46 @@ internal static class UELibraryPostProcessor
             .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
             .ToArray();
-
-        var animationGroups = animations
-            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+        var animationsByOutput = BuildUniqueAssetOutputLookup(animations);
+        var validationsByModel = animationValidation.Validations
+            .GroupBy(x => NormalizeCatalogOutput(x.ModelOutput), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
 
         var relations = new JArray();
         foreach (var model in models.OrderBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase))
         {
             var skeletonPath = (string)model["skeletonPath"]!;
-            animationGroups.TryGetValue(skeletonPath, out var matchedAnimations);
-            var relationAnimations = (matchedAnimations ?? [])
-                .OrderBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
-                .Select(x =>
+            var modelOutput = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
+            validationsByModel.TryGetValue(modelOutput, out var matchedValidations);
+            var relationAnimations = (matchedValidations ?? [])
+                .OrderBy(x => x.AnimationOutput, StringComparer.OrdinalIgnoreCase)
+                .Select(validation =>
                 {
-                    animationValidation.ByPairKey.TryGetValue(BuildPairKey(model, x), out var validation);
+                    animationsByOutput.TryGetValue(NormalizeCatalogOutput(validation.AnimationOutput), out var animation);
                     return new
                     {
-                        name = x["name"],
-                        source = x["source"],
-                        output = x["output"],
-                        status = x["status"],
-                        duration = x["duration"],
-                        frameCount = x["frameCount"],
-                        trackCount = x["trackCount"],
-                        segmentCount = x["segments"] is JArray segments ? segments.Count : 0,
-                        referencedAnimationCount = CountReferencedAnimations(x["segments"] as JArray),
-                        segments = x["segments"],
-                        sectionCount = x["sections"] is JArray sections ? sections.Count : 0,
-                        sections = x["sections"],
-                        validationStatus = validation?.Status,
-                        validationCategory = validation?.ValidationCategory,
-                        validationReason = validation?.Reason,
-                        trackCoverage = validation?.TrackCoverage,
-                        hierarchyCompatible = validation?.HierarchyCompatible,
-                        isContainerAnimation = validation?.IsContainerAnimation,
-                        exportedReferencedAnimationCount = validation?.ExportedReferencedAnimations.Length,
-                        missingReferencedAnimationCount = validation?.MissingReferencedAnimations.Length,
-                        missingReferencedAnimations = validation?.MissingReferencedAnimations.Take(32).ToArray(),
-                        missingTrackBones = validation?.MissingTrackBones.Take(32).ToArray(),
+                        name = animation?["name"] ?? validation.AnimationName,
+                        source = animation?["source"] ?? validation.AnimationSource,
+                        output = animation?["output"] ?? validation.AnimationOutput,
+                        status = animation?["status"],
+                        duration = animation?["duration"],
+                        frameCount = animation?["frameCount"],
+                        trackCount = animation?["trackCount"],
+                        segmentCount = animation?["segments"] is JArray segments ? segments.Count : 0,
+                        referencedAnimationCount = CountReferencedAnimations(animation?["segments"] as JArray),
+                        segments = animation?["segments"],
+                        sectionCount = animation?["sections"] is JArray sections ? sections.Count : 0,
+                        sections = animation?["sections"],
+                        validationStatus = validation.Status,
+                        validationCategory = validation.ValidationCategory,
+                        validationReason = validation.Reason,
+                        trackCoverage = validation.TrackCoverage,
+                        hierarchyCompatible = validation.HierarchyCompatible,
+                        isContainerAnimation = validation.IsContainerAnimation,
+                        exportedReferencedAnimationCount = validation.ExportedReferencedAnimations.Length,
+                        missingReferencedAnimationCount = validation.MissingReferencedAnimations.Length,
+                        missingReferencedAnimations = validation.MissingReferencedAnimations.Take(32).ToArray(),
+                        missingTrackBones = validation.MissingTrackBones.Take(32).ToArray(),
                     };
                 })
                 .ToArray();
@@ -2235,7 +2322,7 @@ internal static class UELibraryPostProcessor
         var summary = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "只按 UE Skeleton 原始引用匹配模型和动画；不按目录名、角色名或文件名前缀硬猜。",
+            ["rule"] = "默认只输出显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选；不按目录名、角色名或文件名前缀硬猜。",
             ["totals"] = JObject.FromObject(new
             {
                 models = models.Length,
@@ -3914,6 +4001,8 @@ internal static class UELibraryPostProcessor
         public AnimationValidationEntry[] Validations { get; set; } = [];
         public Dictionary<string, AnimationValidationEntry> ByPairKey { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
+
+    private sealed record ModelAnimationCandidate(JObject Model, JObject Animation, string Reason);
 
     private sealed class AnimationValidationEntry
     {
