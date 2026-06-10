@@ -71,7 +71,7 @@ internal static class UELibraryPostProcessor
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
-        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations));
+        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex));
         RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports));
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex));
@@ -2953,7 +2953,8 @@ internal static class UELibraryPostProcessor
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
         ComponentAssetRelationLink[] componentAssetRelations,
-        JObject modelAnimationRelations)
+        JObject modelAnimationRelations,
+        SourceIndexSnapshot sourceIndex)
     {
         var modelRows = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -2979,6 +2980,7 @@ internal static class UELibraryPostProcessor
             .Where(x => !string.IsNullOrWhiteSpace(x.Output))
             .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Sum(y => y.Count), StringComparer.OrdinalIgnoreCase);
+        var sourceIndexObjectsByModel = BuildSourceIndexObjectCounts(modelRows, sourceIndex);
 
         var rows = modelRows
             .Select(model =>
@@ -2989,6 +2991,7 @@ internal static class UELibraryPostProcessor
                 var taskSignals = FindTaskSignals(source);
                 componentRefsByOutput.TryGetValue(output, out var componentRefCount);
                 animationCountsByOutput.TryGetValue(output, out var animationCount);
+                sourceIndexObjectsByModel.TryGetValue(output, out var sourceIndexObjectCount);
                 var hasSkin = report?.SkinCount > 0;
                 return new ModelCoverageRow
                 {
@@ -3006,6 +3009,7 @@ internal static class UELibraryPostProcessor
                     TextureCount = report?.ExternalMaterialTextureCount ?? 0,
                     ComponentReferenceCount = componentRefCount,
                     AnimationCandidateCount = animationCount,
+                    SourceIndexObjectCount = sourceIndexObjectCount,
                     TaskSignals = taskSignals,
                 };
             })
@@ -3034,6 +3038,7 @@ internal static class UELibraryPostProcessor
                 staticModels = x.Count(y => y.row.IsStatic),
                 skinnedModels = x.Count(y => y.row.HasSkin),
                 withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
+                withSourceIndexObjects = x.Count(y => y.row.SourceIndexObjectCount > 0),
                 withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
             })
             .ToArray();
@@ -3052,6 +3057,7 @@ internal static class UELibraryPostProcessor
                 taskOrPropModels = taskRows.Length,
                 environmentModels = rows.Count(x => string.Equals(x.ResourceKind, "Environment", StringComparison.OrdinalIgnoreCase)),
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
+                withSourceIndexObjects = rows.Count(x => x.SourceIndexObjectCount > 0),
                 withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
                 warnings = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
                 errors = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
@@ -3086,6 +3092,7 @@ internal static class UELibraryPostProcessor
             staticModels = array.Count(x => x.IsStatic),
             skinnedModels = array.Count(x => x.HasSkin),
             withComponentReferences = array.Count(x => x.ComponentReferenceCount > 0),
+            withSourceIndexObjects = array.Count(x => x.SourceIndexObjectCount > 0),
             withAnimationCandidates = array.Count(x => x.AnimationCandidateCount > 0),
             warnings = array.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
             errors = array.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
@@ -3102,6 +3109,7 @@ internal static class UELibraryPostProcessor
             staticModels = array.Count(x => x.IsStatic),
             skinnedModels = array.Count(x => x.HasSkin),
             withComponentReferences = array.Count(x => x.ComponentReferenceCount > 0),
+            withSourceIndexObjects = array.Count(x => x.SourceIndexObjectCount > 0),
             withAnimationCandidates = array.Count(x => x.AnimationCandidateCount > 0),
             ok = array.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
             warnings = array.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
@@ -3131,9 +3139,53 @@ internal static class UELibraryPostProcessor
             row.MaterialCount,
             row.TextureCount,
             row.ComponentReferenceCount,
+            row.SourceIndexObjectCount,
             row.AnimationCandidateCount,
             row.TaskSignals,
         };
+
+    private static Dictionary<string, int> BuildSourceIndexObjectCounts(JObject[] modelRows, SourceIndexSnapshot sourceIndex)
+    {
+        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (!sourceIndex.Available || sourceIndex.PackageObjectMaps.Length == 0)
+            return result;
+
+        var byObjectPath = sourceIndex.PackageObjectMaps
+            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+            .GroupBy(x => NormalizePackageObjectPath(x.ObjectPath!), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+        var bySourcePath = sourceIndex.PackageObjectMaps
+            .Where(x => !string.IsNullOrWhiteSpace(x.SourcePath))
+            .GroupBy(x => NormalizeCatalogOutput(x.SourcePath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var model in modelRows)
+        {
+            var output = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
+            if (string.IsNullOrWhiteSpace(output))
+                continue;
+
+            var count = 0;
+            var objectPath = (string?)model["objectPath"];
+            if (!string.IsNullOrWhiteSpace(objectPath) &&
+                byObjectPath.TryGetValue(NormalizePackageObjectPath(objectPath), out var objectCount))
+            {
+                count += objectCount;
+            }
+
+            var source = (string?)model["source"];
+            if (!string.IsNullOrWhiteSpace(source) &&
+                bySourcePath.TryGetValue(NormalizeCatalogOutput(source), out var sourceCount))
+            {
+                count = Math.Max(count, sourceCount);
+            }
+
+            if (count > 0)
+                result[output] = count;
+        }
+
+        return result;
+    }
 
     private static string[] FindTaskSignals(string path)
     {
@@ -3334,6 +3386,15 @@ internal static class UELibraryPostProcessor
         var pathOnlyRows = taskRows
             .Where(x => x.ComponentReferenceCount == 0)
             .ToArray();
+        var sourceIndexedRows = taskRows
+            .Where(x => x.SourceIndexObjectCount > 0)
+            .ToArray();
+        var sourceIndexedWithoutComponentRows = taskRows
+            .Where(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0)
+            .ToArray();
+        var purePathOnlyRows = taskRows
+            .Where(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount == 0)
+            .ToArray();
         var warningRows = taskRows
             .Where(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase))
             .ToArray();
@@ -3360,7 +3421,10 @@ internal static class UELibraryPostProcessor
             {
                 usableModelQuality = taskRows.Length - qualityIssueRows.Length,
                 withExplicitComponentReferences = explicitRelationRows.Length,
+                withSourceIndexObjects = sourceIndexedRows.Length,
+                sourceIndexedWithoutComponentReferences = sourceIndexedWithoutComponentRows.Length,
                 pathOnlyUsableModels = pathOnlyRows.Length - pathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
+                purePathOnlyUsableModels = purePathOnlyRows.Length - purePathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
                 withAnimationCandidates = animatedRows.Length,
                 okValidation = taskRows.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
             },
@@ -3374,6 +3438,8 @@ internal static class UELibraryPostProcessor
             relationNeedsReview = new
             {
                 pathOnlyWithoutComponentReferences = pathOnlyRows.Length,
+                sourceIndexedWithoutComponentReferences = sourceIndexedWithoutComponentRows.Length,
+                purePathOnlyWithoutSourceIndexObject = purePathOnlyRows.Length,
             },
             bySourceType = taskRows
                 .GroupBy(x => string.IsNullOrWhiteSpace(x.SourceType) ? "unknown" : x.SourceType, StringComparer.OrdinalIgnoreCase)
@@ -3384,6 +3450,7 @@ internal static class UELibraryPostProcessor
                     sourceType = x.Key,
                     total = x.Count(),
                     withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
+                    withSourceIndexObjects = x.Count(y => y.SourceIndexObjectCount > 0),
                     withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
                 })
                 .ToArray(),
@@ -3459,7 +3526,10 @@ internal static class UELibraryPostProcessor
                 usableModelQuality = rows.Length - qualityIssueRows.Length,
                 qualityIssueModels = qualityIssueRows.Length,
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
+                withSourceIndexObjects = rows.Count(x => x.SourceIndexObjectCount > 0),
+                sourceIndexedWithoutComponentReferences = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0),
                 pathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0),
+                purePathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount == 0),
                 withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
                 validationWarnings = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
                 validationErrors = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
@@ -3479,6 +3549,8 @@ internal static class UELibraryPostProcessor
                     needsReview = x.Count(y => BuildTaskQualityIssueReasons(y.row).Length > 0),
                     relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y.row).Length > 0),
                     withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
+                    withSourceIndexObjects = x.Count(y => y.row.SourceIndexObjectCount > 0),
+                    purePathOnlyRelation = x.Count(y => y.row.ComponentReferenceCount == 0 && y.row.SourceIndexObjectCount == 0),
                     withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
                 })
                 .ToArray(),
@@ -3494,6 +3566,8 @@ internal static class UELibraryPostProcessor
                     needsReview = x.Count(y => BuildTaskQualityIssueReasons(y).Length > 0),
                     relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y).Length > 0),
                     withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
+                    withSourceIndexObjects = x.Count(y => y.SourceIndexObjectCount > 0),
+                    purePathOnlyRelation = x.Count(y => y.ComponentReferenceCount == 0 && y.SourceIndexObjectCount == 0),
                     withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
                 })
                 .ToArray(),
@@ -3528,7 +3602,11 @@ internal static class UELibraryPostProcessor
     {
         var reasons = new List<string>();
         if (row.ComponentReferenceCount == 0)
-            reasons.Add("pathOnlyRelation");
+        {
+            reasons.Add(row.SourceIndexObjectCount > 0
+                ? "sourceIndexedButNoComponentReference"
+                : "pathOnlyRelation");
+        }
         return reasons.ToArray();
     }
 
@@ -3562,6 +3640,7 @@ internal static class UELibraryPostProcessor
             row.MaterialCount,
             row.TextureCount,
             row.ComponentReferenceCount,
+            row.SourceIndexObjectCount,
             row.AnimationCandidateCount,
             row.TaskSignals,
             NeedsReview = BuildTaskQualityIssueReasons(row).Length > 0,
@@ -3592,7 +3671,9 @@ internal static class UELibraryPostProcessor
             $"关系待补: {relationReviewRows.Length}",
             $"模型质量问题: {qualityIssueCount}",
             $"有 UE 组件引用: {rows.Count(x => x.ComponentReferenceCount > 0)}",
-            $"仅路径/分类命中: {rows.Count(x => x.ComponentReferenceCount == 0)}",
+            $"源索引确认资产: {rows.Count(x => x.SourceIndexObjectCount > 0)}",
+            $"源索引确认但暂无组件引用: {rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0)}",
+            $"仅路径/分类命中: {rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount == 0)}",
             $"有动画候选: {rows.Count(x => x.AnimationCandidateCount > 0)}",
             $"模型验证 warning/error: {warningCount}/{errorCount}",
             $"缺材质/无外部贴图槽: {rows.Count(x => x.MaterialCount == 0)}/{rows.Count(x => x.TextureCount == 0)}",
@@ -3615,7 +3696,8 @@ internal static class UELibraryPostProcessor
         lines.Add("");
         lines.Add("## 关系待补");
         lines.Add("");
-        lines.Add($"- pathOnlyRelation: {relationReviewRows.Length}");
+        lines.Add($"- sourceIndexedButNoComponentReference: {relationReviewRows.Count(x => x.SourceIndexObjectCount > 0)}");
+        lines.Add($"- pathOnlyRelation: {relationReviewRows.Count(x => x.SourceIndexObjectCount == 0)}");
 
         lines.Add("");
         lines.Add("## 复查样例");
@@ -3654,6 +3736,7 @@ internal static class UELibraryPostProcessor
             MaterialCount = (int?)row["MaterialCount"] ?? 0,
             TextureCount = (int?)row["TextureCount"] ?? 0,
             ComponentReferenceCount = (int?)row["ComponentReferenceCount"] ?? 0,
+            SourceIndexObjectCount = (int?)row["SourceIndexObjectCount"] ?? 0,
             AnimationCandidateCount = (int?)row["AnimationCandidateCount"] ?? 0,
             TaskSignals = taskSignals,
         };
@@ -3744,6 +3827,7 @@ internal static class UELibraryPostProcessor
                 material_count INTEGER NOT NULL,
                 texture_count INTEGER NOT NULL,
                 component_reference_count INTEGER NOT NULL,
+                source_index_object_count INTEGER NOT NULL,
                 animation_candidate_count INTEGER NOT NULL,
                 is_task_or_prop INTEGER NOT NULL,
                 is_path_only_task INTEGER NOT NULL,
@@ -3939,6 +4023,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
@@ -4111,14 +4196,14 @@ internal static class UELibraryPostProcessor
                 INSERT INTO model_coverage (
                     name, output, source, object_path, resource_kind, source_type, validation_status,
                     is_static, has_skin, has_skeleton_path, material_count, texture_count,
-                    component_reference_count, animation_candidate_count,
+                    component_reference_count, source_index_object_count, animation_candidate_count,
                     is_task_or_prop, is_path_only_task, missing_materials, no_external_texture_slots, needs_review,
                     task_signals_json, raw_json
                 )
                 VALUES (
                     $name, $output, $source, $objectPath, $resourceKind, $sourceType, $validationStatus,
                     $isStatic, $hasSkin, $hasSkeletonPath, $materialCount, $textureCount,
-                    $componentReferenceCount, $animationCandidateCount,
+                    $componentReferenceCount, $sourceIndexObjectCount, $animationCandidateCount,
                     $isTaskOrProp, $isPathOnlyTask, $missingMaterials, $noExternalTextureSlots, $needsReview,
                     $taskSignalsJson, $rawJson
                 );
@@ -4136,6 +4221,7 @@ internal static class UELibraryPostProcessor
             Add(command, "$materialCount", materialCount);
             Add(command, "$textureCount", textureCount);
             Add(command, "$componentReferenceCount", componentReferenceCount);
+            Add(command, "$sourceIndexObjectCount", (int?)row["SourceIndexObjectCount"] ?? 0);
             Add(command, "$animationCandidateCount", (int?)row["AnimationCandidateCount"] ?? 0);
             Add(command, "$isTaskOrProp", isTaskOrProp ? 1 : 0);
             Add(command, "$isPathOnlyTask", isPathOnlyTask ? 1 : 0);
@@ -5521,6 +5607,7 @@ internal static class UELibraryPostProcessor
         public int MaterialCount { get; set; }
         public int TextureCount { get; set; }
         public int ComponentReferenceCount { get; set; }
+        public int SourceIndexObjectCount { get; set; }
         public int AnimationCandidateCount { get; set; }
         public string[] TaskSignals { get; set; } = [];
     }
