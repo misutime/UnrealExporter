@@ -1185,11 +1185,7 @@ internal static class UELibraryPostProcessor
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["output"]) || !string.IsNullOrWhiteSpace((string?)x["source"]))
             .ToArray();
 
-        var byObjectPath = exportedAssets
-            .Where(x => !string.IsNullOrWhiteSpace((string?)x["objectPath"]))
-            .GroupBy(x => (string)x["objectPath"]!, StringComparer.OrdinalIgnoreCase)
-            .Where(x => x.Count() == 1)
-            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var assetLookup = BuildExportedAssetLookup(root, exportedAssets);
         var packageObjectsByPath = sourceIndex.PackageObjectMaps
             .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
             .GroupBy(x => x.ObjectPath!, StringComparer.OrdinalIgnoreCase)
@@ -1198,8 +1194,8 @@ internal static class UELibraryPostProcessor
         var result = new List<ComponentAssetRelationLink>(sourceIndex.ComponentAssetRelations.Length);
         foreach (var relation in sourceIndex.ComponentAssetRelations)
         {
-            var matched = FindExportedAssetForTarget(root, relation, exportedAssets, byObjectPath);
-            var matchStatus = BuildComponentRelationMatchStatus(relation, matched, exportedAssets, packageObjectsByPath);
+            var matched = FindExportedAssetForTarget(relation, assetLookup);
+            var matchStatus = BuildComponentRelationMatchStatus(relation, matched, assetLookup, packageObjectsByPath);
             var matchReason = BuildComponentRelationMatchReason(relation, matched, matchStatus);
             result.Add(new ComponentAssetRelationLink
             {
@@ -1228,10 +1224,65 @@ internal static class UELibraryPostProcessor
         return result.ToArray();
     }
 
+    private static ExportedAssetLookup BuildExportedAssetLookup(string root, JObject[] exportedAssets)
+    {
+        var byObjectPath = exportedAssets
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["objectPath"]))
+            .GroupBy(x => (string)x["objectPath"]!, StringComparer.OrdinalIgnoreCase)
+            .Where(x => x.Count() == 1)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var bySuffix = new Dictionary<string, List<JObject>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var asset in exportedAssets)
+        {
+            var relative = AssetRelativeWithoutExtension(root, (string?)asset["output"] ?? (string?)asset["source"]);
+            AddAssetSuffix(bySuffix, relative, asset);
+            var contentIndex = relative.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+            if (contentIndex >= 0)
+                AddAssetSuffix(bySuffix, relative[contentIndex..], asset);
+            if (relative.StartsWith("Engine/Content/", StringComparison.OrdinalIgnoreCase))
+                AddAssetSuffix(bySuffix, relative, asset);
+        }
+
+        var uniqueBySuffix = bySuffix
+            .Where(x => x.Value.Count == 1)
+            .ToDictionary(x => x.Key, x => x.Value[0], StringComparer.OrdinalIgnoreCase);
+        var bySkeleton = exportedAssets
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .GroupBy(x => (string)x["skeletonPath"]!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+        return new ExportedAssetLookup(byObjectPath, uniqueBySuffix, bySkeleton);
+    }
+
+    private static void AddAssetSuffix(Dictionary<string, List<JObject>> bySuffix, string suffix, JObject asset)
+    {
+        if (string.IsNullOrWhiteSpace(suffix))
+            return;
+
+        var key = suffix.Replace('\\', '/').TrimStart('/');
+        if (!bySuffix.TryGetValue(key, out var list))
+        {
+            list = [];
+            bySuffix[key] = list;
+        }
+
+        list.Add(asset);
+        if (!key.StartsWith("/", StringComparison.Ordinal))
+        {
+            var slashKey = "/" + key;
+            if (!bySuffix.TryGetValue(slashKey, out var slashList))
+            {
+                slashList = [];
+                bySuffix[slashKey] = slashList;
+            }
+
+            slashList.Add(asset);
+        }
+    }
+
     private static string BuildComponentRelationMatchStatus(
         SourceComponentAssetRelation relation,
         JObject? matched,
-        JObject[] exportedAssets,
+        ExportedAssetLookup assetLookup,
         Dictionary<string, SourcePackageObjectMap> packageObjectsByPath)
     {
         if (matched != null)
@@ -1241,7 +1292,7 @@ internal static class UELibraryPostProcessor
             return "componentOnly";
 
         if (relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
-            return HasExportedModelForSkeleton(relation.TargetPath, exportedAssets)
+            return HasExportedModelForSkeleton(relation.TargetPath, assetLookup)
                 ? "skeletonCoveredByModels"
                 : "skeletonMetadata";
 
@@ -1277,14 +1328,13 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static bool HasExportedModelForSkeleton(string? skeletonPath, JObject[] exportedAssets)
+    private static bool HasExportedModelForSkeleton(string? skeletonPath, ExportedAssetLookup assetLookup)
     {
         if (string.IsNullOrWhiteSpace(skeletonPath))
             return false;
 
-        return exportedAssets.Any(x =>
-            string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals((string?)x["skeletonPath"], skeletonPath, StringComparison.OrdinalIgnoreCase));
+        return assetLookup.BySkeletonPath.TryGetValue(skeletonPath, out var matches) &&
+               matches.Any(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsClassReferenceRelation(string relationType)
@@ -1308,13 +1358,11 @@ internal static class UELibraryPostProcessor
     }
 
     private static JObject? FindExportedAssetForTarget(
-        string root,
         SourceComponentAssetRelation relation,
-        JObject[] exportedAssets,
-        Dictionary<string, JObject> byObjectPath)
+        ExportedAssetLookup assetLookup)
     {
         if (!string.IsNullOrWhiteSpace(relation.TargetPath) &&
-            byObjectPath.TryGetValue(relation.TargetPath, out var byPath))
+            assetLookup.ByObjectPath.TryGetValue(relation.TargetPath, out var byPath))
             return byPath;
 
         if (string.IsNullOrWhiteSpace(relation.TargetPath))
@@ -1322,9 +1370,8 @@ internal static class UELibraryPostProcessor
 
         if (relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
         {
-            var skeletonMatches = exportedAssets
-                .Where(x => string.Equals((string?)x["skeletonPath"], relation.TargetPath, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
+            assetLookup.BySkeletonPath.TryGetValue(relation.TargetPath, out var skeletonMatches);
+            skeletonMatches ??= [];
             var modelMatches = skeletonMatches
                 .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
                 .ToArray();
@@ -1338,11 +1385,10 @@ internal static class UELibraryPostProcessor
         if (string.IsNullOrWhiteSpace(packageSuffix))
             return null;
 
-        var matches = exportedAssets
-            .Where(x => AssetRelativeWithoutExtension(root, (string?)x["output"] ?? (string?)x["source"])
-                .EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        return matches.Length == 1 ? matches[0] : null;
+        var key = packageSuffix.Replace('\\', '/').TrimStart('/');
+        if (assetLookup.ByRelativeSuffix.TryGetValue(key, out var match))
+            return match;
+        return assetLookup.ByRelativeSuffix.TryGetValue("/" + key, out match) ? match : null;
     }
 
     private static string AssetRelativeWithoutExtension(string root, string? path)
@@ -3019,6 +3065,7 @@ internal static class UELibraryPostProcessor
                 source TEXT,
                 output TEXT,
                 status TEXT,
+                validation_status TEXT,
                 validation_category TEXT,
                 validation_reason TEXT,
                 duration REAL,
@@ -3076,7 +3123,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(status, validation_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
 
@@ -3527,13 +3574,13 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO relation_animations (
                 relation_id, name, source, output, status, duration, frame_count, track_count,
-                validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
+                validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
                 segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count, raw_json
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
-                $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
                 $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
@@ -3543,6 +3590,7 @@ internal static class UELibraryPostProcessor
         Add(command, "$source", (string?)animation["source"]);
         Add(command, "$output", (string?)animation["output"]);
         Add(command, "$status", (string?)animation["status"]);
+        Add(command, "$validationStatus", (string?)animation["validationStatus"]);
         Add(command, "$validationCategory", (string?)animation["validationCategory"]);
         Add(command, "$validationReason", (string?)animation["validationReason"]);
         Add(command, "$duration", (double?)animation["duration"]);
@@ -4392,6 +4440,11 @@ internal static class UELibraryPostProcessor
         public string? PublicExportHash { get; set; }
         public string RawJson { get; set; } = "{}";
     }
+
+    private sealed record ExportedAssetLookup(
+        Dictionary<string, JObject> ByObjectPath,
+        Dictionary<string, JObject> ByRelativeSuffix,
+        Dictionary<string, JObject[]> BySkeletonPath);
 
     private sealed class MaterialTextureSlotLink
     {
