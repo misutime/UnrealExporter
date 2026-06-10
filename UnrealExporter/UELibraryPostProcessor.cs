@@ -2040,7 +2040,7 @@ internal static class UELibraryPostProcessor
         SourceIndexSnapshot sourceIndex,
         ComponentAssetRelationLink[] componentAssetRelations)
     {
-        var validations = BuildAnimationValidations(catalogRows, sourceIndex, componentAssetRelations);
+        var validations = BuildAnimationValidations(root, catalogRows, sourceIndex, componentAssetRelations);
         var summary = new AnimationValidationSummary
         {
             SourceIndexAvailable = sourceIndex.Available,
@@ -2082,6 +2082,7 @@ internal static class UELibraryPostProcessor
                 skeletonName = x.SkeletonName,
                 modelBoneCount = x.ModelBoneCount,
                 animationTrackCount = x.AnimationTrackCount,
+                trackSource = x.TrackSource,
                 matchedTrackBones = x.MatchedTrackBones,
                 missingTrackBoneCount = x.MissingTrackBones.Length,
                 missingTrackBones = x.MissingTrackBones.Take(64).ToArray(),
@@ -2103,6 +2104,7 @@ internal static class UELibraryPostProcessor
     }
 
     private static AnimationValidationEntry[] BuildAnimationValidations(
+        string root,
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex,
         ComponentAssetRelationLink[] componentAssetRelations)
@@ -2114,13 +2116,14 @@ internal static class UELibraryPostProcessor
         var animations = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .Where(x => IsExportedAnimationFileAvailable(root, x))
             .ToArray();
         var allAnimations = animations;
         var candidates = BuildModelAnimationCandidates(models, animations, componentAssetRelations);
 
         var result = new List<AnimationValidationEntry>();
         foreach (var candidate in candidates)
-            result.Add(ValidateAnimationPair(candidate.Model, candidate.Animation, allAnimations, sourceIndex));
+            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
@@ -2193,6 +2196,17 @@ internal static class UELibraryPostProcessor
             .ToDictionary(x => x.Key, x => x.First().Asset, StringComparer.OrdinalIgnoreCase);
     }
 
+    private static bool IsExportedAnimationFileAvailable(string root, JObject animation)
+    {
+        if (!string.Equals((string?)animation["status"], "ok", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var output = ResolveCatalogFile(root, (string?)animation["output"]);
+        return !string.IsNullOrWhiteSpace(output)
+               && File.Exists(output)
+               && output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void AddModelAnimationCandidate(
         Dictionary<string, ModelAnimationCandidate> candidates,
         JObject model,
@@ -2211,6 +2225,7 @@ internal static class UELibraryPostProcessor
         => string.IsNullOrWhiteSpace(value) ? "" : value.Replace('\\', '/');
 
     private static AnimationValidationEntry ValidateAnimationPair(
+        string root,
         JObject model,
         JObject animation,
         JObject[] allAnimations,
@@ -2218,7 +2233,12 @@ internal static class UELibraryPostProcessor
     {
         var skeletonPath = (string?)model["skeletonPath"];
         var modelBones = FindModelBones(model, skeletonPath, sourceIndex);
-        var animationTracks = FindAnimationTracks(animation, sourceIndex);
+        var animationTracks = FindAnimationTracks(root, animation, sourceIndex);
+        var trackSource = animationTracks.Any(x => x.FromExportedUEAnim)
+            ? "exportedUEAnim"
+            : animationTracks.Length > 0
+                ? "sourceIndex"
+                : "none";
         var missingTrackBones = animationTracks
             .Where(x => !string.IsNullOrWhiteSpace(x.BoneName))
             .Where(x => !modelBones.ByName.ContainsKey(x.BoneName!))
@@ -2273,7 +2293,7 @@ internal static class UELibraryPostProcessor
             {
                 status = "warning";
                 validationCategory = "missingAnimationTracks";
-                reason = "源索引中没有找到动画 track，暂时只能依赖 UE Skeleton 路径。";
+                reason = "源索引和已导出的 .ueanim 中都没有找到动画 track，暂时只能依赖 UE Skeleton 路径。";
             }
         }
         else if (missingTrackBones.Length > 0)
@@ -2316,6 +2336,7 @@ internal static class UELibraryPostProcessor
             SkeletonName = (string?)model["skeletonName"],
             ModelBoneCount = modelBones.Bones.Length,
             AnimationTrackCount = animationTracks.Length,
+            TrackSource = trackSource,
             MatchedTrackBones = matchedTrackBones,
             MissingTrackBones = missingTrackBones,
             TrackCoverage = trackCoverage,
@@ -2348,7 +2369,18 @@ internal static class UELibraryPostProcessor
                || normalized.Contains("tail", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("ribbon", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("accessory", StringComparison.OrdinalIgnoreCase)
-               || normalized.Contains("weapon", StringComparison.OrdinalIgnoreCase);
+               || normalized.Contains("weapon", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("hat", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("cap", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("hood", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("sock", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("shoe", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("scarf", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("strap", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("band", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("ornament", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("pendant", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("piaodai", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsContainerAnimation(JObject animation)
@@ -2414,13 +2446,52 @@ internal static class UELibraryPostProcessor
         return new ModelBoneLookup([]);
     }
 
-    private static SourceAnimationTrack[] FindAnimationTracks(JObject animation, SourceIndexSnapshot sourceIndex)
+    private static SourceAnimationTrack[] FindAnimationTracks(string root, JObject animation, SourceIndexSnapshot sourceIndex)
     {
         var objectPath = (string?)animation["objectPath"];
         if (!string.IsNullOrWhiteSpace(objectPath) && sourceIndex.TracksByAnimation.TryGetValue(objectPath, out var byObjectPath))
             return byObjectPath;
 
-        return [];
+        return ReadExportedUEAnimTracks(root, animation);
+    }
+
+    private static SourceAnimationTrack[] ReadExportedUEAnimTracks(string root, JObject animation)
+    {
+        var output = ResolveCatalogFile(root, (string?)animation["output"]);
+        if (string.IsNullOrWhiteSpace(output) || !File.Exists(output) || !output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase))
+            return [];
+
+        try
+        {
+            var data = UEAnimReader.Read(output);
+            return data.Tracks
+                .Select((track, index) => new SourceAnimationTrack
+                {
+                    SourcePath = output,
+                    AnimationObjectPath = (string?)animation["objectPath"] ?? "",
+                    SkeletonPath = (string?)animation["skeletonPath"],
+                    TrackIndex = index,
+                    BoneIndex = -1,
+                    BoneName = track.BoneName,
+                    FromExportedUEAnim = true,
+                })
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARN: exported ueanim track read failed {MakeRelative(root, output)} ({ex.Message})");
+            return [];
+        }
+    }
+
+    private static string ResolveCatalogFile(string root, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        return Path.IsPathRooted(value)
+            ? Path.GetFullPath(value)
+            : Path.GetFullPath(Path.Combine(root, value));
     }
 
     private static string[] CompareHierarchy(
@@ -2484,6 +2555,7 @@ internal static class UELibraryPostProcessor
         var animations = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase))
             .Where(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"]))
+            .Where(x => IsExportedAnimationFileAvailable(root, x))
             .ToArray();
         var animationsByOutput = BuildUniqueAssetOutputLookup(animations);
         var validationsByModel = animationValidation.Validations
@@ -4145,6 +4217,7 @@ internal static class UELibraryPostProcessor
                 validation.SkeletonPath,
                 validation.ModelBoneCount,
                 validation.AnimationTrackCount,
+                validation.TrackSource,
                 validation.MatchedTrackBones,
                 validation.TrackCoverage,
                 validation.HierarchyCompatible,
@@ -4384,11 +4457,13 @@ internal static class UELibraryPostProcessor
         var modelErrors = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
         var validationErrors = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
         var validationWarnings = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
+        var exportedAnimations = animations.Count(x => IsExportedAnimationFileAvailable(root, x));
+        var failedAnimations = animations.Count(x => string.Equals((string?)x["status"], "error", StringComparison.OrdinalIgnoreCase));
         var linkErrors = textureLinks.Count(x => !string.IsNullOrWhiteSpace(x.LinkError));
 
         var healthStatus =
-            modelErrors > 0 || validationErrors > 0 ? "error" :
-            modelWarnings > 0 || missingComponentRefs > 0 || actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 || linkErrors > 0 || validationWarnings > 0 ? "warning" :
+            modelErrors > 0 ? "error" :
+            modelWarnings > 0 || missingComponentRefs > 0 || actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 || linkErrors > 0 || validationErrors > 0 || validationWarnings > 0 ? "warning" :
             "ok";
 
         var issues = new JArray();
@@ -4413,12 +4488,19 @@ internal static class UELibraryPostProcessor
             });
         if (missingComponentRefs > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "components", ["message"] = $"有 {missingComponentRefs} 个蓝图/组件显式资源引用没有匹配到已导出素材。" });
+        if (failedAnimations > 0)
+            issues.Add(new JObject
+            {
+                ["level"] = "warning",
+                ["area"] = "animations",
+                ["message"] = $"有 {failedAnimations} 个动画没有成功导出为 .ueanim，已从默认模型动画候选中排除。",
+            });
         if (validationErrors > 0 || validationWarnings > 0)
             issues.Add(new JObject
             {
-                ["level"] = validationErrors > 0 ? "error" : "warning",
+                ["level"] = "warning",
                 ["area"] = "animations",
-                ["message"] = $"动画骨架验证存在 error={validationErrors}, warning={validationWarnings}。",
+                ["message"] = $"动画骨架验证存在 error={validationErrors}, warning={validationWarnings}；error 候选不会进入默认可用动画列表。",
             });
         if (linkErrors > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "textures", ["message"] = $"有 {linkErrors} 个共享贴图硬链接创建失败。" });
@@ -4508,6 +4590,8 @@ internal static class UELibraryPostProcessor
             ["animations"] = JObject.FromObject(new
             {
                 catalogRows = animations.Length,
+                exported = exportedAnimations,
+                failed = failedAnimations,
                 relationModels = animationRelations.Count,
                 matchedModels = matchedModelAnimationRelations,
                 validationPairs = animationValidation.Validations.Length,
@@ -4957,6 +5041,7 @@ internal static class UELibraryPostProcessor
         public int TrackIndex { get; set; }
         public int BoneIndex { get; set; }
         public string? BoneName { get; set; }
+        public bool FromExportedUEAnim { get; set; }
     }
 
     private sealed class SourceMaterialTextureSlot
@@ -5177,6 +5262,7 @@ internal static class UELibraryPostProcessor
         public string? SkeletonName { get; set; }
         public int ModelBoneCount { get; set; }
         public int AnimationTrackCount { get; set; }
+        public string TrackSource { get; set; } = "none";
         public int MatchedTrackBones { get; set; }
         public string[] MissingTrackBones { get; set; } = [];
         public double TrackCoverage { get; set; }
