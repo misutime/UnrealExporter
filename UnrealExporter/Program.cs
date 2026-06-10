@@ -1348,7 +1348,8 @@ public class UnrealExporter
         var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules, diagnostics);
         unresolved += materialTextureResult.Unresolved;
         ambiguous += materialTextureResult.Ambiguous;
-        unresolved += AddIndexedAnimationExportRules(connection, provider, rules, diagnostics);
+        if (ShouldAutoExportCompatibleAnimations(config))
+            unresolved += AddIndexedAnimationExportRules(connection, provider, rules, diagnostics);
         unresolved += AddAnimationSegmentExportRules(connection, provider, rules, diagnostics);
 
         WriteAutoReferencedExportDiagnostics(config, diagnostics);
@@ -1445,6 +1446,12 @@ public class UnrealExporter
         return config.GenerateLibraryIndexes && config.GenerateSourceIndex;
     }
 
+    private static bool ShouldAutoExportCompatibleAnimations(ConfigObj config)
+    {
+        // 只靠同 Skeleton 兼容不足以证明动画属于当前模型，默认只补显式引用和动画片段。
+        return config.AutoExportCompatibleAnimations == true;
+    }
+
     private static int AddSkeletonMeshExportRules(
         SqliteConnection connection,
         AbstractFileProvider provider,
@@ -1455,18 +1462,21 @@ public class UnrealExporter
         var unresolved = 0;
         using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT DISTINCT source_path
+            SELECT DISTINCT source_path, owner_object_path
             FROM skeleton_bones
             WHERE skeleton_path = $skeletonPath
               AND owner_type = 'SkeletalMesh'
               AND source_path IS NOT NULL
-              AND source_path != '';
+              AND source_path != ''
+              AND owner_object_path IS NOT NULL
+              AND owner_object_path != '';
             """;
         command.Parameters.AddWithValue("$skeletonPath", skeletonPath);
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
             var sourcePath = NormalizeAssetPath(reader.GetString(0));
+            var meshObjectPath = reader.GetString(1);
             var file = provider.Files.Values.FirstOrDefault(x =>
                 NormalizeAssetPath(x.Path).Equals(sourcePath, StringComparison.OrdinalIgnoreCase));
             if (file == null)
@@ -1476,7 +1486,7 @@ public class UnrealExporter
                 continue;
             }
 
-            AddAutoReferencedExportRule(rules, diagnostics, "Skeleton", skeletonPath, file.Path, "glb");
+            AddAutoReferencedExportRule(rules, diagnostics, "SkeletonMesh", meshObjectPath, file.Path, "glb");
         }
 
         return unresolved;
@@ -1584,10 +1594,21 @@ public class UnrealExporter
         var unresolved = 0;
         using var command = connection.CreateCommand();
         command.CommandText = """
+            WITH model_skeletons AS (
+                SELECT DISTINCT skeleton_path
+                FROM source_objects
+                WHERE skeleton_path IS NOT NULL
+                  AND skeleton_path != ''
+                  AND (
+                      object_type = 'USkeletalMesh'
+                      OR export_type = 'SkeletalMesh'
+                  )
+            )
             SELECT DISTINCT object_path
             FROM source_objects
             WHERE object_path IS NOT NULL
               AND object_path != ''
+              AND skeleton_path IN (SELECT skeleton_path FROM model_skeletons)
               AND (
                   object_type IN ('UAnimSequence', 'UAnimMontage', 'UAnimComposite')
                   OR export_type IN ('AnimSequence', 'AnimMontage', 'AnimComposite')
@@ -2891,6 +2912,7 @@ public class ConfigObj
     public bool UseSharedTextures { get; set; }
     public bool GenerateSourceIndex { get; set; }
     public bool? AutoExportReferencedAssets { get; set; }
+    public bool? AutoExportCompatibleAnimations { get; set; }
     public List<string>? SourceIndexRegex { get; set; }
     public int SourceIndexLimit { get; set; }
     public required List<string> Export { get; set; }

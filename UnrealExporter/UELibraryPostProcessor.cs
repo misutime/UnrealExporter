@@ -1188,12 +1188,17 @@ internal static class UELibraryPostProcessor
             .GroupBy(x => (string)x["objectPath"]!, StringComparer.OrdinalIgnoreCase)
             .Where(x => x.Count() == 1)
             .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var packageObjectsByPath = sourceIndex.PackageObjectMaps
+            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+            .GroupBy(x => x.ObjectPath!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
 
         var result = new List<ComponentAssetRelationLink>(sourceIndex.ComponentAssetRelations.Length);
         foreach (var relation in sourceIndex.ComponentAssetRelations)
         {
             var matched = FindExportedAssetForTarget(root, relation, exportedAssets, byObjectPath);
-            var isComponentOnly = relation.RelationType.Equals("Component", StringComparison.OrdinalIgnoreCase);
+            var matchStatus = BuildComponentRelationMatchStatus(relation, matched, exportedAssets, packageObjectsByPath);
+            var matchReason = BuildComponentRelationMatchReason(relation, matched, matchStatus);
             result.Add(new ComponentAssetRelationLink
             {
                 SourcePath = relation.SourcePath,
@@ -1210,16 +1215,8 @@ internal static class UELibraryPostProcessor
                 TargetAssetName = (string?)matched?["name"],
                 TargetAssetKind = (string?)matched?["kind"],
                 TargetAssetOutput = (string?)matched?["output"] ?? (string?)matched?["source"],
-                MatchStatus = matched == null
-                    ? (isComponentOnly ? "componentOnly" : "missingExportedAsset")
-                    : "matched",
-                MatchReason = matched == null
-                    ? (isComponentOnly
-                        ? "这是 UE 组件实例/模板节点，用于组合结构和 transform，不是需要导出的独立素材。"
-                        : "源索引记录了 UE 组件/蓝图资源关系，但当前导出目录没有找到对应资产。")
-                    : relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
-                        ? "通过 UE Skeleton 原始引用匹配到同 skeletonPath 的已导出模型。"
-                        : "通过 UE object path 或包路径后缀匹配到已导出素材。",
+                MatchStatus = matchStatus,
+                MatchReason = matchReason,
                 SocketName = relation.SocketName,
                 ParentComponentPath = relation.ParentComponentPath,
                 Transform = BuildTransformObject(relation),
@@ -1227,6 +1224,85 @@ internal static class UELibraryPostProcessor
         }
 
         return result.ToArray();
+    }
+
+    private static string BuildComponentRelationMatchStatus(
+        SourceComponentAssetRelation relation,
+        JObject? matched,
+        JObject[] exportedAssets,
+        Dictionary<string, SourcePackageObjectMap> packageObjectsByPath)
+    {
+        if (matched != null)
+            return "matched";
+
+        if (relation.RelationType.Equals("Component", StringComparison.OrdinalIgnoreCase))
+            return "componentOnly";
+
+        if (relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
+            return HasExportedModelForSkeleton(relation.TargetPath, exportedAssets)
+                ? "skeletonCoveredByModels"
+                : "skeletonMetadata";
+
+        if (IsClassReferenceRelation(relation.RelationType))
+            return "classReference";
+
+        if (IsUnsupportedAnimationAsset(relation, packageObjectsByPath))
+            return "unsupportedAnimationAsset";
+
+        return "missingExportedAsset";
+    }
+
+    private static string BuildComponentRelationMatchReason(
+        SourceComponentAssetRelation relation,
+        JObject? matched,
+        string matchStatus)
+    {
+        if (matched != null)
+        {
+            return relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
+                ? "通过 UE Skeleton 原始引用匹配到同 skeletonPath 的已导出模型。"
+                : "通过 UE object path 或包路径后缀匹配到已导出素材。";
+        }
+
+        return matchStatus switch
+        {
+            "componentOnly" => "这是 UE 组件实例/模板节点，用于组合结构和 transform，不是需要导出的独立素材。",
+            "skeletonCoveredByModels" => "UE Skeleton 已由同 skeletonPath 的已导出 skinned model 覆盖，骨架本身作为元数据保留。",
+            "skeletonMetadata" => "UE Skeleton 是骨架元数据引用，当前没有可直接导出的独立素材文件。",
+            "classReference" => "这是 UE 蓝图/动画类引用，用于运行时逻辑或组件类型，不是模型、贴图、材质或动画素材文件。",
+            "unsupportedAnimationAsset" => "这是 UE 动画容器或编辑器资产引用，当前只作为关系元数据保留，不按 ueanim 直接导出。",
+            _ => "源索引记录了 UE 组件/蓝图资源关系，但当前导出目录没有找到对应资产。",
+        };
+    }
+
+    private static bool HasExportedModelForSkeleton(string? skeletonPath, JObject[] exportedAssets)
+    {
+        if (string.IsNullOrWhiteSpace(skeletonPath))
+            return false;
+
+        return exportedAssets.Any(x =>
+            string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals((string?)x["skeletonPath"], skeletonPath, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsClassReferenceRelation(string relationType)
+        => relationType.Equals("AnimClass", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("BlueprintClass", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUnsupportedAnimationAsset(
+        SourceComponentAssetRelation relation,
+        Dictionary<string, SourcePackageObjectMap> packageObjectsByPath)
+    {
+        if (!relation.RelationType.Equals("Animation", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(relation.TargetPath) ||
+            !packageObjectsByPath.TryGetValue(relation.TargetPath, out var target))
+            return false;
+
+        var typeText = $"{target.ClassName} {target.ClassPath} {target.ObjectName}";
+        return typeText.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase)
+               || typeText.Contains("AimOffset", StringComparison.OrdinalIgnoreCase)
+               || typeText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase);
     }
 
     private static JObject? FindExportedAssetForTarget(
@@ -1332,14 +1408,14 @@ internal static class UELibraryPostProcessor
                         .Count(),
                     modelReferenceCount = group.Count(x => IsModelRelation(x.RelationType)),
                     exportedModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && x.MatchStatus == "matched"),
-                    missingModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && x.MatchStatus != "matched"),
+                    missingModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && IsMissingAssetRelation(x)),
                     animationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType)),
                     exportedAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && x.MatchStatus == "matched"),
-                    missingAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && x.MatchStatus != "matched"),
+                    missingAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && IsMissingAssetRelation(x)),
                     materialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)),
                     exportedMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && x.MatchStatus == "matched"),
-                    missingMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && x.MatchStatus != "matched"),
-                    missingReferenceCount = group.Count(x => IsTrackedAssetRelation(x.RelationType) && x.MatchStatus != "matched"),
+                    missingMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && IsMissingAssetRelation(x)),
+                    missingReferenceCount = group.Count(IsMissingAssetRelation),
                     relationSources = group.Select(x => x.RelationSource)
                         .Where(x => !string.IsNullOrWhiteSpace(x))
                         .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1435,7 +1511,7 @@ internal static class UELibraryPostProcessor
                         })
                         .ToArray(),
                     missingReferences = group
-                        .Where(x => IsTrackedAssetRelation(x.RelationType) && x.MatchStatus != "matched")
+                        .Where(IsMissingAssetRelation)
                         .DistinctBy(x => $"{x.RelationType}|{x.TargetPath}|{x.ComponentObjectPath}", StringComparer.OrdinalIgnoreCase)
                         .Select(x => new
                         {
@@ -1478,8 +1554,7 @@ internal static class UELibraryPostProcessor
            || relationType.Equals("SkeletalMesh", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAnimationRelation(string relationType)
-        => relationType.Equals("Animation", StringComparison.OrdinalIgnoreCase)
-           || relationType.Equals("AnimClass", StringComparison.OrdinalIgnoreCase);
+        => relationType.Equals("Animation", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTrackedAssetRelation(string relationType)
         => IsModelRelation(relationType)
@@ -1489,6 +1564,18 @@ internal static class UELibraryPostProcessor
            || relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase)
            || relationType.Equals("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase)
            || relationType.Equals("BlueprintClass", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsMissingAssetRelation(ComponentAssetRelationLink link)
+        => IsTrackedAssetRelation(link.RelationType)
+           && !string.Equals(link.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase)
+           && !IsMetadataOnlyMatchStatus(link.MatchStatus);
+
+    private static bool IsMetadataOnlyMatchStatus(string status)
+        => status.Equals("componentOnly", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("classReference", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("skeletonMetadata", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("skeletonCoveredByModels", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("unsupportedAnimationAsset", StringComparison.OrdinalIgnoreCase);
 
     private static SharedGltfTextureLink[] RewriteGltfSharedTextureUris(
         string root,
@@ -3261,8 +3348,13 @@ internal static class UELibraryPostProcessor
                 modelReferences = componentGroups.Sum(x => x.ModelReferenceCount),
                 exportedModelReferences = componentGroups.Sum(x => x.ExportedModelReferenceCount),
                 skeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase)),
-                exportedSkeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) && x.MatchStatus == "matched"),
-                missingSkeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) && x.MatchStatus != "matched"),
+                exportedSkeletonReferences = componentAssetRelations.Count(x =>
+                    string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) &&
+                    (string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(x.MatchStatus, "skeletonCoveredByModels", StringComparison.OrdinalIgnoreCase))),
+                missingSkeletonReferences = componentAssetRelations.Count(x =>
+                    string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) &&
+                    IsMissingAssetRelation(x)),
                 animationReferences = componentGroups.Sum(x => x.AnimationReferenceCount),
                 exportedAnimationReferences = componentGroups.Sum(x => x.ExportedAnimationReferenceCount),
                 materialReferences = componentGroups.Sum(x => x.MaterialReferenceCount),
