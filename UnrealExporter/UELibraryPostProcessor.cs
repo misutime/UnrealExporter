@@ -3044,6 +3044,11 @@ internal static class UELibraryPostProcessor
                 texture_count INTEGER NOT NULL,
                 component_reference_count INTEGER NOT NULL,
                 animation_candidate_count INTEGER NOT NULL,
+                is_task_or_prop INTEGER NOT NULL,
+                is_path_only_task INTEGER NOT NULL,
+                missing_materials INTEGER NOT NULL,
+                no_external_texture_slots INTEGER NOT NULL,
+                needs_review INTEGER NOT NULL,
                 task_signals_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
             );
@@ -3232,7 +3237,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
-        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(component_reference_count, animation_candidate_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
         Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
@@ -3383,33 +3389,59 @@ internal static class UELibraryPostProcessor
         {
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
+            // 这些质量标记只来自覆盖报告里的通用字段，方便浏览器直接筛出需要复查的任务/道具模型。
+            var taskSignals = ((JArray?)row["TaskSignals"] ?? []);
+            var resourceKind = (string?)row["ResourceKind"];
+            var validationStatus = (string?)row["ValidationStatus"] ?? "unknown";
+            var componentReferenceCount = (int?)row["ComponentReferenceCount"] ?? 0;
+            var materialCount = (int?)row["MaterialCount"] ?? 0;
+            var textureCount = (int?)row["TextureCount"] ?? 0;
+            var isTaskOrProp = taskSignals.Count > 0 || string.Equals(resourceKind, "Prop", StringComparison.OrdinalIgnoreCase);
+            var isPathOnlyTask = isTaskOrProp && componentReferenceCount == 0;
+            var missingMaterials = isTaskOrProp && materialCount == 0;
+            var noExternalTextureSlots = isTaskOrProp && textureCount == 0;
+            var needsReview = isTaskOrProp && (
+                isPathOnlyTask ||
+                missingMaterials ||
+                noExternalTextureSlots ||
+                string.Equals(validationStatus, "warning", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase));
             command.CommandText = """
                 INSERT INTO model_coverage (
                     name, output, source, object_path, resource_kind, source_type, validation_status,
                     is_static, has_skin, has_skeleton_path, material_count, texture_count,
-                    component_reference_count, animation_candidate_count, task_signals_json, raw_json
+                    component_reference_count, animation_candidate_count,
+                    is_task_or_prop, is_path_only_task, missing_materials, no_external_texture_slots, needs_review,
+                    task_signals_json, raw_json
                 )
                 VALUES (
                     $name, $output, $source, $objectPath, $resourceKind, $sourceType, $validationStatus,
                     $isStatic, $hasSkin, $hasSkeletonPath, $materialCount, $textureCount,
-                    $componentReferenceCount, $animationCandidateCount, $taskSignalsJson, $rawJson
+                    $componentReferenceCount, $animationCandidateCount,
+                    $isTaskOrProp, $isPathOnlyTask, $missingMaterials, $noExternalTextureSlots, $needsReview,
+                    $taskSignalsJson, $rawJson
                 );
                 """;
             Add(command, "$name", (string?)row["Name"]);
             Add(command, "$output", (string?)row["Output"] ?? "");
             Add(command, "$source", (string?)row["Source"]);
             Add(command, "$objectPath", (string?)row["ObjectPath"]);
-            Add(command, "$resourceKind", (string?)row["ResourceKind"]);
+            Add(command, "$resourceKind", resourceKind);
             Add(command, "$sourceType", (string?)row["SourceType"]);
-            Add(command, "$validationStatus", (string?)row["ValidationStatus"]);
+            Add(command, "$validationStatus", validationStatus);
             Add(command, "$isStatic", ((bool?)row["IsStatic"] ?? false) ? 1 : 0);
             Add(command, "$hasSkin", ((bool?)row["HasSkin"] ?? false) ? 1 : 0);
             Add(command, "$hasSkeletonPath", ((bool?)row["HasSkeletonPath"] ?? false) ? 1 : 0);
-            Add(command, "$materialCount", (int?)row["MaterialCount"] ?? 0);
-            Add(command, "$textureCount", (int?)row["TextureCount"] ?? 0);
-            Add(command, "$componentReferenceCount", (int?)row["ComponentReferenceCount"] ?? 0);
+            Add(command, "$materialCount", materialCount);
+            Add(command, "$textureCount", textureCount);
+            Add(command, "$componentReferenceCount", componentReferenceCount);
             Add(command, "$animationCandidateCount", (int?)row["AnimationCandidateCount"] ?? 0);
-            Add(command, "$taskSignalsJson", ((JArray?)row["TaskSignals"] ?? []).ToString(Formatting.None));
+            Add(command, "$isTaskOrProp", isTaskOrProp ? 1 : 0);
+            Add(command, "$isPathOnlyTask", isPathOnlyTask ? 1 : 0);
+            Add(command, "$missingMaterials", missingMaterials ? 1 : 0);
+            Add(command, "$noExternalTextureSlots", noExternalTextureSlots ? 1 : 0);
+            Add(command, "$needsReview", needsReview ? 1 : 0);
+            Add(command, "$taskSignalsJson", taskSignals.ToString(Formatting.None));
             Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
         }
