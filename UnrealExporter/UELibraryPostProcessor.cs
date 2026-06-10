@@ -11,6 +11,7 @@ namespace UnrealExporter;
 internal static class UELibraryPostProcessor
 {
     private static readonly string[] TextureExtensions = [".png", ".hdr"];
+    private const int MaxSharedSkeletonAnimationsPerModel = 256;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
@@ -2283,7 +2284,7 @@ internal static class UELibraryPostProcessor
         var json = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "默认只验证显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选；再检查动画 track 骨骼是否被模型骨架覆盖，以及重叠骨骼父子层级是否兼容。",
+            ["rule"] = "默认验证显式组件关系、唯一 Skeleton 关系，以及共享 Skeleton 可复用动画；再检查动画 track 骨骼是否被模型骨架覆盖，以及重叠骨骼父子层级是否兼容。",
             ["sourceIndex"] = JObject.FromObject(new
             {
                 available = sourceIndex.Available,
@@ -2301,6 +2302,7 @@ internal static class UELibraryPostProcessor
             ["validations"] = JArray.FromObject(validations.Select(x => new
             {
                 status = x.Status,
+                candidateReason = x.CandidateReason,
                 validationCategory = x.ValidationCategory,
                 reason = x.Reason,
                 model = x.ModelOutput,
@@ -2353,8 +2355,10 @@ internal static class UELibraryPostProcessor
         var candidates = BuildModelAnimationCandidates(models, animations, componentAssetRelations);
 
         var result = new List<AnimationValidationEntry>();
+        var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
+        var animationTrackCache = new Dictionary<string, SourceAnimationTrack[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var candidate in candidates)
-            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex));
+            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
@@ -2411,6 +2415,18 @@ internal static class UELibraryPostProcessor
                 AddModelAnimationCandidate(result, skeletonModels[0], animation, "uniqueSkeleton");
         }
 
+        // UE 项目里角色换装、NPC 变体、头/身部件经常共享同一个 USkeleton。
+        // 只要后续骨骼覆盖验证通过，同 Skeleton 动画就是可复用候选；这里保留来源标记，避免伪装成组件显式引用。
+        foreach (var (skeletonPath, skeletonModels) in modelsBySkeleton)
+        {
+            if (skeletonModels.Length <= 1 || !animationsBySkeleton.TryGetValue(skeletonPath, out var skeletonAnimations))
+                continue;
+
+            foreach (var model in skeletonModels)
+            foreach (var animation in PickSharedSkeletonAnimations(model, skeletonAnimations))
+                AddModelAnimationCandidate(result, model, animation, "sharedSkeleton");
+        }
+
         return result.Values
             .OrderBy(x => (string?)x.Model["output"], StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => (string?)x.Animation["output"], StringComparer.OrdinalIgnoreCase)
@@ -2425,6 +2441,40 @@ internal static class UELibraryPostProcessor
             .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
             .Where(x => x.Count() == 1)
             .ToDictionary(x => x.Key, x => x.First().Asset, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static JObject[] PickSharedSkeletonAnimations(JObject model, JObject[] skeletonAnimations)
+    {
+        if (skeletonAnimations.Length <= MaxSharedSkeletonAnimationsPerModel)
+            return skeletonAnimations;
+
+        var modelSource = NormalizeCatalogOutput((string?)model["source"] ?? (string?)model["output"]);
+        return skeletonAnimations
+            .OrderByDescending(x => CountCommonPathPrefixSegments(
+                modelSource,
+                NormalizeCatalogOutput((string?)x["source"] ?? (string?)x["output"])))
+            .ThenBy(x => (string?)x["source"] ?? (string?)x["output"], StringComparer.OrdinalIgnoreCase)
+            .Take(MaxSharedSkeletonAnimationsPerModel)
+            .ToArray();
+    }
+
+    private static int CountCommonPathPrefixSegments(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            return 0;
+
+        var leftParts = left.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var rightParts = right.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var length = Math.Min(leftParts.Length, rightParts.Length);
+        var count = 0;
+        for (var i = 0; i < length; i++)
+        {
+            if (!string.Equals(leftParts[i], rightParts[i], StringComparison.OrdinalIgnoreCase))
+                break;
+            count++;
+        }
+
+        return count;
     }
 
     private static bool IsExportedAnimationFileAvailable(string root, JObject animation)
@@ -2460,11 +2510,16 @@ internal static class UELibraryPostProcessor
         JObject model,
         JObject animation,
         JObject[] allAnimations,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        string candidateReason = "",
+        Dictionary<string, ModelBoneLookup>? modelBoneCache = null,
+        Dictionary<string, SourceAnimationTrack[]>? animationTrackCache = null)
     {
         var skeletonPath = (string?)model["skeletonPath"];
-        var modelBones = FindModelBones(model, skeletonPath, sourceIndex);
-        var animationTracks = FindAnimationTracks(root, animation, sourceIndex);
+        var modelKey = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
+        var animationKey = NormalizeCatalogOutput((string?)animation["output"] ?? (string?)animation["source"]);
+        var modelBones = GetOrBuildModelBones(model, skeletonPath, sourceIndex, modelKey, modelBoneCache);
+        var animationTracks = GetOrBuildAnimationTracks(root, animation, sourceIndex, animationKey, animationTrackCache);
         var trackSource = animationTracks.Any(x => x.FromExportedUEAnim)
             ? "exportedUEAnim"
             : animationTracks.Length > 0
@@ -2554,6 +2609,7 @@ internal static class UELibraryPostProcessor
         return new AnimationValidationEntry
         {
             PairKey = BuildPairKey(model, animation),
+            CandidateReason = candidateReason,
             Status = status,
             ValidationCategory = validationCategory,
             Reason = reason,
@@ -2578,6 +2634,44 @@ internal static class UELibraryPostProcessor
             MissingReferencedAnimations = missingReferencedAnimations,
             HierarchyMismatches = hierarchyMismatches,
         };
+    }
+
+    private static ModelBoneLookup GetOrBuildModelBones(
+        JObject model,
+        string? skeletonPath,
+        SourceIndexSnapshot sourceIndex,
+        string modelKey,
+        Dictionary<string, ModelBoneLookup>? cache)
+    {
+        if (cache == null || string.IsNullOrWhiteSpace(modelKey))
+            return FindModelBones(model, skeletonPath, sourceIndex);
+
+        if (!cache.TryGetValue(modelKey, out var lookup))
+        {
+            lookup = FindModelBones(model, skeletonPath, sourceIndex);
+            cache[modelKey] = lookup;
+        }
+
+        return lookup;
+    }
+
+    private static SourceAnimationTrack[] GetOrBuildAnimationTracks(
+        string root,
+        JObject animation,
+        SourceIndexSnapshot sourceIndex,
+        string animationKey,
+        Dictionary<string, SourceAnimationTrack[]>? cache)
+    {
+        if (cache == null || string.IsNullOrWhiteSpace(animationKey))
+            return FindAnimationTracks(root, animation, sourceIndex);
+
+        if (!cache.TryGetValue(animationKey, out var tracks))
+        {
+            tracks = FindAnimationTracks(root, animation, sourceIndex);
+            cache[animationKey] = tracks;
+        }
+
+        return tracks;
     }
 
     private static bool IsOnlyAuxiliaryMissingTrackBones(string[] missingTrackBones)
@@ -2823,6 +2917,7 @@ internal static class UELibraryPostProcessor
                         validationStatus = validation.Status,
                         validationCategory = validation.ValidationCategory,
                         validationReason = validation.Reason,
+                        relationSource = validation.CandidateReason,
                         trackCoverage = validation.TrackCoverage,
                         hierarchyCompatible = validation.HierarchyCompatible,
                         isContainerAnimation = validation.IsContainerAnimation,
@@ -2835,6 +2930,13 @@ internal static class UELibraryPostProcessor
                 })
                 .ToArray();
             var usableAnimationCount = relationAnimations.Count(x => x.isUsableCandidate);
+            var confidence = usableAnimationCount <= 0
+                ? relationAnimations.Length > 0 ? "RelatedButNotUsable" : "NoMatchingAnimationExported"
+                : relationAnimations.Any(x => string.Equals(x.relationSource, "componentOwner", StringComparison.OrdinalIgnoreCase))
+                    ? "ExplicitComponent"
+                    : relationAnimations.Any(x => string.Equals(x.relationSource, "uniqueSkeleton", StringComparison.OrdinalIgnoreCase))
+                        ? "UniqueSkeleton"
+                        : "SharedSkeletonCompatible";
 
             relations.Add(JObject.FromObject(new
             {
@@ -2843,7 +2945,7 @@ internal static class UELibraryPostProcessor
                 modelSource = model["source"],
                 skeletonPath,
                 skeletonName = model["skeletonName"],
-                confidence = usableAnimationCount > 0 ? "ExplicitSkeleton" : relationAnimations.Length > 0 ? "RelatedButNotUsable" : "NoMatchingAnimationExported",
+                confidence,
                 totalAnimationCount = relationAnimations.Length,
                 usableAnimationCount,
                 animations = relationAnimations,
@@ -2853,7 +2955,7 @@ internal static class UELibraryPostProcessor
         var summary = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "默认只输出显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选；不按目录名、角色名或文件名前缀硬猜。",
+            ["rule"] = "默认输出显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 可复用动画；不按目录名、角色名或文件名前缀硬猜。",
             ["totals"] = JObject.FromObject(new
             {
                 models = models.Length,
@@ -3979,6 +4081,7 @@ internal static class UELibraryPostProcessor
                 source TEXT,
                 output TEXT,
                 status TEXT,
+                relation_source TEXT,
                 validation_status TEXT,
                 validation_category TEXT,
                 validation_reason TEXT,
@@ -4005,6 +4108,7 @@ internal static class UELibraryPostProcessor
                 animation TEXT NOT NULL,
                 skeleton_path TEXT,
                 status TEXT NOT NULL,
+                candidate_reason TEXT,
                 validation_category TEXT,
                 reason TEXT,
                 model_bone_count INTEGER NOT NULL,
@@ -4180,10 +4284,11 @@ internal static class UELibraryPostProcessor
             var resourceKind = (string?)row["ResourceKind"];
             var validationStatus = (string?)row["ValidationStatus"] ?? "unknown";
             var componentReferenceCount = (int?)row["ComponentReferenceCount"] ?? 0;
+            var sourceIndexObjectCount = (int?)row["SourceIndexObjectCount"] ?? 0;
             var materialCount = (int?)row["MaterialCount"] ?? 0;
             var textureCount = (int?)row["TextureCount"] ?? 0;
             var isTaskOrProp = taskSignals.Count > 0 || string.Equals(resourceKind, "Prop", StringComparison.OrdinalIgnoreCase);
-            var isPathOnlyTask = isTaskOrProp && componentReferenceCount == 0;
+            var isPathOnlyTask = isTaskOrProp && componentReferenceCount == 0 && sourceIndexObjectCount == 0;
             var missingMaterials = isTaskOrProp && materialCount == 0;
             var noExternalTextureSlots = isTaskOrProp && textureCount == 0;
             // pathOnly 只是“关系待补”，不代表模型质量不可用；质量复查只看验证、材质和贴图事实。
@@ -4221,7 +4326,7 @@ internal static class UELibraryPostProcessor
             Add(command, "$materialCount", materialCount);
             Add(command, "$textureCount", textureCount);
             Add(command, "$componentReferenceCount", componentReferenceCount);
-            Add(command, "$sourceIndexObjectCount", (int?)row["SourceIndexObjectCount"] ?? 0);
+            Add(command, "$sourceIndexObjectCount", sourceIndexObjectCount);
             Add(command, "$animationCandidateCount", (int?)row["AnimationCandidateCount"] ?? 0);
             Add(command, "$isTaskOrProp", isTaskOrProp ? 1 : 0);
             Add(command, "$isPathOnlyTask", isPathOnlyTask ? 1 : 0);
@@ -4518,13 +4623,13 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO relation_animations (
                 relation_id, name, source, output, status, duration, frame_count, track_count,
-                validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
+                relation_source, validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
                 is_usable_candidate, segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count, raw_json
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
-                $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                $relationSource, $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
                 $isUsableCandidate, $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
@@ -4534,6 +4639,7 @@ internal static class UELibraryPostProcessor
         Add(command, "$source", (string?)animation["source"]);
         Add(command, "$output", (string?)animation["output"]);
         Add(command, "$status", (string?)animation["status"]);
+        Add(command, "$relationSource", (string?)animation["relationSource"]);
         Add(command, "$validationStatus", (string?)animation["validationStatus"]);
         Add(command, "$validationCategory", (string?)animation["validationCategory"]);
         Add(command, "$validationReason", (string?)animation["validationReason"]);
@@ -4563,6 +4669,7 @@ internal static class UELibraryPostProcessor
             var rawJson = JObject.FromObject(new
             {
                 validation.Status,
+                validation.CandidateReason,
                 validation.ValidationCategory,
                 validation.Reason,
                 model = validation.ModelOutput,
@@ -4583,14 +4690,14 @@ internal static class UELibraryPostProcessor
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO animation_validation (
-                    model, animation, skeleton_path, status, reason,
+                    model, animation, skeleton_path, status, candidate_reason, reason,
                     validation_category,
                     model_bone_count, animation_track_count, matched_track_bones,
                     track_coverage, hierarchy_compatible, is_container_animation,
                     missing_track_bones_json, hierarchy_mismatches_json, raw_json
                 )
                 VALUES (
-                    $model, $animation, $skeletonPath, $status, $reason,
+                    $model, $animation, $skeletonPath, $status, $candidateReason, $reason,
                     $validationCategory,
                     $modelBoneCount, $animationTrackCount, $matchedTrackBones,
                     $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
@@ -4601,6 +4708,7 @@ internal static class UELibraryPostProcessor
             Add(command, "$animation", validation.AnimationOutput);
             Add(command, "$skeletonPath", validation.SkeletonPath);
             Add(command, "$status", validation.Status);
+            Add(command, "$candidateReason", validation.CandidateReason);
             Add(command, "$reason", validation.Reason);
             Add(command, "$validationCategory", validation.ValidationCategory);
             Add(command, "$modelBoneCount", validation.ModelBoneCount);
@@ -5615,6 +5723,7 @@ internal static class UELibraryPostProcessor
     private sealed class AnimationValidationEntry
     {
         public string PairKey { get; set; } = string.Empty;
+        public string CandidateReason { get; set; } = string.Empty;
         public string Status { get; set; } = "unknown";
         public string ValidationCategory { get; set; } = "unknown";
         public string Reason { get; set; } = string.Empty;
