@@ -69,7 +69,7 @@ public class UnrealExporter
         // For Oodle to work from outside of project directory
         Directory.SetCurrentDirectory(RootDir);
 
-        if (TryRunPostProcessCommand(args) || TryRunUEAnimationPreviewCommand(args))
+        if (TryRunPostProcessCommand(args) || TryRunTaskModelQualityCommand(args) || TryRunUEAnimationPreviewCommand(args))
             return;
 
         double trueStart = Now();
@@ -175,6 +175,28 @@ public class UnrealExporter
         }
 
         Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report);
+        return true;
+    }
+
+    private static bool TryRunTaskModelQualityCommand(string[] args)
+    {
+        if (args.Length == 0)
+            return false;
+
+        if (
+            !args[0].Equals("--refresh-task-model-quality", StringComparison.OrdinalIgnoreCase)
+            && !args[0].Equals("refresh-task-model-quality", StringComparison.OrdinalIgnoreCase)
+        )
+            return false;
+
+        if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
+        {
+            Console.WriteLine("ERROR: --refresh-task-model-quality requires an exported library root path.");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --refresh-task-model-quality <outputDir>");
+            return true;
+        }
+
+        UELibraryPostProcessor.RefreshTaskModelQualityReport(args[1]);
         return true;
     }
 

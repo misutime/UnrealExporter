@@ -70,6 +70,7 @@ internal static class UELibraryPostProcessor
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
         var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations));
+        RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports));
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex));
         RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
@@ -78,6 +79,21 @@ internal static class UELibraryPostProcessor
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
+    }
+
+    public static void RefreshTaskModelQualityReport(string libraryRoot)
+    {
+        if (string.IsNullOrWhiteSpace(libraryRoot))
+            throw new ArgumentException("Library root is required.", nameof(libraryRoot));
+
+        var root = Path.GetFullPath(libraryRoot);
+        var coveragePath = Path.Combine(root, "model_coverage.json");
+        if (!File.Exists(coveragePath))
+            throw new FileNotFoundException("model_coverage.json not found.", coveragePath);
+
+        var modelCoverage = JObject.Parse(File.ReadAllText(coveragePath));
+        WriteTaskModelQualityReport(root, modelCoverage);
+        Console.WriteLine($"UE task model quality report refreshed: {root}");
     }
 
     private static T RunStage<T>(string name, Func<T> action)
@@ -3070,6 +3086,181 @@ internal static class UELibraryPostProcessor
                     .ToArray(),
             },
         };
+    }
+
+    private static void WriteTaskModelQualityReport(string root, JObject modelCoverage)
+    {
+        var rows = ((JArray?)modelCoverage["models"] ?? [])
+            .OfType<JObject>()
+            .Select(ReadModelCoverageRow)
+            .Where(IsTaskOrPropCoverageRow)
+            .OrderByDescending(x => BuildTaskReviewReasons(x).Length)
+            .ThenByDescending(x => x.AnimationCandidateCount)
+            .ThenByDescending(x => x.ComponentReferenceCount)
+            .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var readyRows = rows.Where(x => BuildTaskReviewReasons(x).Length == 0).ToArray();
+        var reviewRows = rows.Where(x => BuildTaskReviewReasons(x).Length > 0).ToArray();
+        var byReason = reviewRows
+            .SelectMany(row => BuildTaskReviewReasons(row).Select(reason => new { reason, row }))
+            .GroupBy(x => x.reason, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new
+            {
+                reason = x.Key,
+                count = x.Count(),
+                examples = x.Select(y => BuildTaskQualityRow(y.row)).Take(32).ToArray(),
+            })
+            .ToArray();
+
+        var json = JObject.FromObject(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            rule = "任务/道具质量报告只基于 UE 通用路径语义、组件引用、模型验证、材质和动画候选事实；pathOnly 表示可浏览但暂未解析到 UE 组件显式引用，不代表模型不可用。",
+            totals = new
+            {
+                taskOrPropModels = rows.Length,
+                ready = readyRows.Length,
+                needsReview = reviewRows.Length,
+                withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
+                pathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0),
+                withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
+                validationWarnings = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
+                validationErrors = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
+                missingMaterials = rows.Count(x => x.MaterialCount == 0),
+                noExternalTextureSlots = rows.Count(x => x.TextureCount == 0),
+            },
+            bySignal = rows
+                .SelectMany(row => (row.TaskSignals.Length == 0 ? ["prop"] : row.TaskSignals).Select(signal => new { signal, row }))
+                .GroupBy(x => x.signal, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(x => x.Count())
+                .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(x => new
+                {
+                    signal = x.Key,
+                    total = x.Count(),
+                    ready = x.Count(y => BuildTaskReviewReasons(y.row).Length == 0),
+                    needsReview = x.Count(y => BuildTaskReviewReasons(y.row).Length > 0),
+                    withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
+                    withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
+                })
+                .ToArray(),
+            bySourceType = rows
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.SourceType) ? "unknown" : x.SourceType, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(x => x.Count())
+                .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(x => new
+                {
+                    sourceType = x.Key,
+                    total = x.Count(),
+                    ready = x.Count(y => BuildTaskReviewReasons(y).Length == 0),
+                    needsReview = x.Count(y => BuildTaskReviewReasons(y).Length > 0),
+                    withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
+                    withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
+                })
+                .ToArray(),
+            byReviewReason = byReason,
+            reviewModels = reviewRows.Select(BuildTaskQualityRow).ToArray(),
+            readyExamples = readyRows
+                .OrderByDescending(x => x.ComponentReferenceCount)
+                .ThenByDescending(x => x.AnimationCandidateCount)
+                .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                .Take(128)
+                .Select(BuildTaskQualityRow)
+                .ToArray(),
+        });
+
+        File.WriteAllText(Path.Combine(root, "task_model_quality.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
+        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows);
+    }
+
+    private static bool IsTaskOrPropCoverageRow(ModelCoverageRow row)
+        => row.TaskSignals.Length > 0 || string.Equals(row.ResourceKind, "Prop", StringComparison.OrdinalIgnoreCase);
+
+    private static string[] BuildTaskReviewReasons(ModelCoverageRow row)
+    {
+        var reasons = new List<string>();
+        if (row.ComponentReferenceCount == 0)
+            reasons.Add("pathOnlyRelation");
+        if (string.Equals(row.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase))
+            reasons.Add("modelValidationWarning");
+        if (string.Equals(row.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase))
+            reasons.Add("modelValidationError");
+        if (row.MaterialCount == 0)
+            reasons.Add("missingMaterials");
+        if (row.TextureCount == 0)
+            reasons.Add("noExternalTextureSlots");
+        return reasons.ToArray();
+    }
+
+    private static object BuildTaskQualityRow(ModelCoverageRow row)
+        => new
+        {
+            row.Name,
+            row.Output,
+            row.Source,
+            row.ObjectPath,
+            row.ResourceKind,
+            row.SourceType,
+            row.ValidationStatus,
+            row.IsStatic,
+            row.HasSkin,
+            row.HasSkeletonPath,
+            row.MaterialCount,
+            row.TextureCount,
+            row.ComponentReferenceCount,
+            row.AnimationCandidateCount,
+            row.TaskSignals,
+            NeedsReview = BuildTaskReviewReasons(row).Length > 0,
+            ReviewReasons = BuildTaskReviewReasons(row),
+        };
+
+    private static void WriteTaskModelQualityReadme(
+        string root,
+        ModelCoverageRow[] rows,
+        ModelCoverageRow[] readyRows,
+        ModelCoverageRow[] reviewRows)
+    {
+        var warningCount = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase));
+        var errorCount = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase));
+        var lines = new List<string>
+        {
+            "# UE 任务/道具模型质量报告",
+            "",
+            "本报告用于快速确认任务模型、交互道具和 Prop 是否已经作为可浏览素材进入库。`pathOnlyRelation` 表示模型来自任务/道具路径或 Prop 分类，但当前没有解析到 UE 组件显式引用；这类模型仍然保留为可用素材，只是关系需要后续补强。",
+            "",
+            $"总数: {rows.Length}",
+            $"可直接使用: {readyRows.Length}",
+            $"需要复查: {reviewRows.Length}",
+            $"有 UE 组件引用: {rows.Count(x => x.ComponentReferenceCount > 0)}",
+            $"仅路径/分类命中: {rows.Count(x => x.ComponentReferenceCount == 0)}",
+            $"有动画候选: {rows.Count(x => x.AnimationCandidateCount > 0)}",
+            $"模型验证 warning/error: {warningCount}/{errorCount}",
+            $"缺材质/无外部贴图槽: {rows.Count(x => x.MaterialCount == 0)}/{rows.Count(x => x.TextureCount == 0)}",
+            "",
+            "详细机器报告: `task_model_quality.json`",
+            "",
+            "## 复查原因",
+            "",
+        };
+
+        var reasonGroups = reviewRows
+            .SelectMany(row => BuildTaskReviewReasons(row).Select(reason => new { reason, row }))
+            .GroupBy(x => x.reason, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        foreach (var group in reasonGroups)
+            lines.Add($"- {group.Key}: {group.Count()}");
+
+        lines.Add("");
+        lines.Add("## 复查样例");
+        lines.Add("");
+        foreach (var row in reviewRows.Take(40))
+            lines.Add($"- {row.Name} [{string.Join(", ", BuildTaskReviewReasons(row))}] `{row.Output}`");
+
+        File.WriteAllLines(Path.Combine(root, "TASK_MODEL_QUALITY.md"), lines, Encoding.UTF8);
     }
 
     private static ModelCoverageRow ReadModelCoverageRow(JObject row)
