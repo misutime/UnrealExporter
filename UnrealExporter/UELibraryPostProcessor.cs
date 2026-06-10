@@ -3101,6 +3101,7 @@ internal static class UELibraryPostProcessor
             .ToArray();
         var readyRows = rows.Where(x => BuildTaskReviewReasons(x).Length == 0).ToArray();
         var reviewRows = rows.Where(x => BuildTaskReviewReasons(x).Length > 0).ToArray();
+        var qualityIssueRows = rows.Where(x => BuildTaskQualityIssueReasons(x).Length > 0).ToArray();
         var byReason = reviewRows
             .SelectMany(row => BuildTaskReviewReasons(row).Select(reason => new { reason, row }))
             .GroupBy(x => x.reason, StringComparer.OrdinalIgnoreCase)
@@ -3123,6 +3124,8 @@ internal static class UELibraryPostProcessor
                 taskOrPropModels = rows.Length,
                 ready = readyRows.Length,
                 needsReview = reviewRows.Length,
+                usableModelQuality = rows.Length - qualityIssueRows.Length,
+                qualityIssueModels = qualityIssueRows.Length,
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
                 pathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0),
                 withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
@@ -3162,6 +3165,7 @@ internal static class UELibraryPostProcessor
                 .ToArray(),
             byReviewReason = byReason,
             reviewModels = reviewRows.Select(BuildTaskQualityRow).ToArray(),
+            qualityIssueModels = qualityIssueRows.Select(BuildTaskQualityRow).ToArray(),
             readyExamples = readyRows
                 .OrderByDescending(x => x.ComponentReferenceCount)
                 .ThenByDescending(x => x.AnimationCandidateCount)
@@ -3183,6 +3187,13 @@ internal static class UELibraryPostProcessor
         var reasons = new List<string>();
         if (row.ComponentReferenceCount == 0)
             reasons.Add("pathOnlyRelation");
+        reasons.AddRange(BuildTaskQualityIssueReasons(row));
+        return reasons.ToArray();
+    }
+
+    private static string[] BuildTaskQualityIssueReasons(ModelCoverageRow row)
+    {
+        var reasons = new List<string>();
         if (string.Equals(row.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase))
             reasons.Add("modelValidationWarning");
         if (string.Equals(row.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase))
@@ -3224,6 +3235,7 @@ internal static class UELibraryPostProcessor
     {
         var warningCount = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase));
         var errorCount = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase));
+        var qualityIssueCount = rows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0);
         var lines = new List<string>
         {
             "# UE 任务/道具模型质量报告",
@@ -3233,6 +3245,7 @@ internal static class UELibraryPostProcessor
             $"总数: {rows.Length}",
             $"可直接使用: {readyRows.Length}",
             $"需要复查: {reviewRows.Length}",
+            $"模型质量问题: {qualityIssueCount}",
             $"有 UE 组件引用: {rows.Count(x => x.ComponentReferenceCount > 0)}",
             $"仅路径/分类命中: {rows.Count(x => x.ComponentReferenceCount == 0)}",
             $"有动画候选: {rows.Count(x => x.AnimationCandidateCount > 0)}",
