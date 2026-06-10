@@ -1168,16 +1168,37 @@ public class UnrealExporter
                                                 Console.WriteLine(
                                                     $"ERROR: Failed to export {file.Value.Path} as {outputType}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}."
                                                 );
-                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", label));
-                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", label);
+                                                var error = label ?? "exporter returned false";
+                                                var metadataPath = objectOutputPath + "." + outputType + ".metadata.json";
+                                                if (TryWriteAnimationMetadataSidecar(config, file.Value.Path, animationAsset, metadataPath, "metadata", error))
+                                                {
+                                                    AppendExportManifest(config, file.Value.Path, obj, metadataPath, "AnimationMetadata");
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataPath, "json", "metadata", error));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataPath, "metadata", error);
+                                                }
+                                                else
+                                                {
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", error));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", error);
+                                                }
                                             }
                                             catch (Exception ex)
                                             {
                                                 Console.WriteLine(
                                                     $"WARN: Skipped animation {file.Value.Path} ({ex.Message})"
                                                 );
-                                                AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", ex.Message));
-                                                AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", ex.Message);
+                                                var metadataPath = objectOutputPath + "." + outputType + ".metadata.json";
+                                                if (TryWriteAnimationMetadataSidecar(config, file.Value.Path, animationAsset, metadataPath, "metadata", ex.Message))
+                                                {
+                                                    AppendExportManifest(config, file.Value.Path, obj, metadataPath, "AnimationMetadata");
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataPath, "json", "metadata", ex.Message));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataPath, "metadata", ex.Message);
+                                                }
+                                                else
+                                                {
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "error", ex.Message));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "error", ex.Message);
+                                                }
                                             }
                                         }
                                     }
@@ -2425,6 +2446,61 @@ public class UnrealExporter
             skeletonGuid = asset.SkeletonGuid.ToString(),
         };
         File.WriteAllText(outputPath, JsonConvert.SerializeObject(diagnostic, Formatting.Indented));
+    }
+
+    private static bool TryWriteAnimationMetadataSidecar(
+        ConfigObj config,
+        string sourcePath,
+        UAnimationAsset asset,
+        string outputPath,
+        string status,
+        string error)
+    {
+        var sequence = asset as UAnimSequence;
+        var sequenceBase = asset as UAnimSequenceBase;
+        var trackMap = sequence?.GetTrackMap();
+        var curves = BuildAnimationCurveEntries(sequence);
+        var notifies = BuildAnimationNotifyEntries(sequenceBase);
+        var segments = BuildAnimationSegmentEntries(asset);
+        var sections = BuildAnimationSectionEntries(asset);
+        var hasUsefulMetadata = curves.Length > 0 || notifies.Length > 0 || segments.Length > 0 || sections.Length > 0;
+        if (!hasUsefulMetadata)
+            return false;
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var sidecar = new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            gameTitle = config.GameTitle,
+            kind = "AnimationMetadata",
+            status,
+            error,
+            source = sourcePath,
+            sourceType = asset.GetType().Name,
+            name = asset.Name,
+            objectPath = asset.GetPathName(),
+            skeletonPath = GetPackageIndexPath(asset.Skeleton),
+            skeletonName = asset.Skeleton.Name,
+            skeletonGuid = asset.SkeletonGuid.ToString(),
+            duration = sequenceBase?.SequenceLength,
+            frameCount = sequence?.NumFrames,
+            trackCount = sequence?.GetNumTracks(),
+            trackBoneIndexes = trackMap?.Select(x => x.BoneTreeIndex).ToArray(),
+            notifyCount = sequenceBase?.Notifies.Length ?? 0,
+            notifies,
+            curveCount = CountAnimationCurves(sequence),
+            curves,
+            segments,
+            sections,
+            compression = sequence?.CompressedDataStructure?.GetType().Name,
+            requiresAcl = NeedsAclNative(asset),
+            additiveType = sequence?.AdditiveAnimType.ToString(),
+            additiveBasePoseType = sequence?.RefPoseType.ToString(),
+            retargetSource = sequence?.RetargetSource.Text,
+            note = "这是导出失败动画的可读元数据侧车，不是可直接播放的 .ueanim。曲线、通知和容器片段仍可用于素材库检索和后续曲线动画支持。",
+        };
+        File.WriteAllText(outputPath, JsonConvert.SerializeObject(sidecar, Formatting.Indented));
+        return true;
     }
 
     private static bool NeedsAclNative(UAnimationAsset? asset)

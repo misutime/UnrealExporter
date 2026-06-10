@@ -2816,6 +2816,8 @@ internal static class UELibraryPostProcessor
                 models = rows.Length,
                 staticModels = rows.Count(x => x.IsStatic),
                 skinnedModels = rows.Count(x => x.HasSkin),
+                characterModels = rows.Count(x => string.Equals(x.ResourceKind, "Character", StringComparison.OrdinalIgnoreCase)),
+                skinnedCharacterModels = rows.Count(x => x.HasSkin && string.Equals(x.ResourceKind, "Character", StringComparison.OrdinalIgnoreCase)),
                 taskOrPropModels = taskRows.Length,
                 environmentModels = rows.Count(x => string.Equals(x.ResourceKind, "Environment", StringComparison.OrdinalIgnoreCase)),
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
@@ -4458,6 +4460,7 @@ internal static class UELibraryPostProcessor
         var validationErrors = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
         var validationWarnings = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
         var exportedAnimations = animations.Count(x => IsExportedAnimationFileAvailable(root, x));
+        var metadataAnimations = animations.Count(x => string.Equals((string?)x["status"], "metadata", StringComparison.OrdinalIgnoreCase));
         var failedAnimations = animations.Count(x => string.Equals((string?)x["status"], "error", StringComparison.OrdinalIgnoreCase));
         var linkErrors = textureLinks.Count(x => !string.IsNullOrWhiteSpace(x.LinkError));
 
@@ -4591,6 +4594,7 @@ internal static class UELibraryPostProcessor
             {
                 catalogRows = animations.Length,
                 exported = exportedAnimations,
+                metadata = metadataAnimations,
                 failed = failedAnimations,
                 relationModels = animationRelations.Count,
                 matchedModels = matchedModelAnimationRelations,
@@ -4906,17 +4910,17 @@ internal static class UELibraryPostProcessor
     private static string InferResourceKind(string path)
     {
         var text = path.Replace('\\', '/').ToLowerInvariant();
-        if (IsTaskOrPropLikePath(text))
-            return "Prop";
         if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/") ||
             text.Contains("/grappling/") || text.Contains("/grapplegun/"))
             return "Weapon";
+        if (text.Contains("/characters/") || text.Contains("/character/"))
+            return "Character";
+        if (IsTaskOrPropLikePath(text))
+            return "Prop";
         if (text.Contains("/environment/") || text.Contains("/scenery/") || text.Contains("/building/") || text.Contains("/plants/"))
             return "Environment";
         if (text.Contains("/vehicle") || text.Contains("/vehicles/"))
             return "Vehicle";
-        if (text.Contains("/characters/") || text.Contains("/character/"))
-            return "Character";
         return "Unknown";
     }
 
