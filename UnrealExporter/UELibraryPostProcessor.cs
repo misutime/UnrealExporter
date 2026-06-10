@@ -63,10 +63,11 @@ internal static class UELibraryPostProcessor
         var packageObjectMaps = WritePackageObjectMaps(root, sourceIndex);
         var animationValidation = WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations);
         var modelAnimationRelations = WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation);
+        var modelCoverage = WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations);
         WriteModelValidation(root, reports);
         var skeletonGroups = WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex);
-        WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, animationValidation, sourceIndex);
-        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, animationValidation);
+        WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex);
+        WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation);
         WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps);
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -2394,6 +2395,192 @@ internal static class UELibraryPostProcessor
             Encoding.UTF8);
     }
 
+    private static JObject WriteModelCoverage(
+        string root,
+        List<JObject> catalogRows,
+        List<ModelValidationEntry> reports,
+        ComponentAssetRelationLink[] componentAssetRelations,
+        JObject modelAnimationRelations)
+    {
+        var modelRows = catalogRows
+            .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var reportsByPath = reports
+            .GroupBy(x => NormalizeCatalogOutput(x.RelativePath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var componentRefsByOutput = componentAssetRelations
+            .Where(x => IsModelRelation(x.RelationType) && string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase))
+            .Select(x => NormalizeCatalogOutput(x.TargetAssetOutput))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+        var animationCountsByOutput = ((JArray?)modelAnimationRelations["relations"] ?? [])
+            .OfType<JObject>()
+            .Select(x => new
+            {
+                Output = NormalizeCatalogOutput((string?)x["model"]),
+                Count = ((JArray?)x["animations"] ?? []).Count,
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Output))
+            .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Sum(y => y.Count), StringComparer.OrdinalIgnoreCase);
+
+        var rows = modelRows
+            .Select(model =>
+            {
+                var output = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
+                reportsByPath.TryGetValue(output, out var report);
+                var source = (string?)model["source"] ?? "";
+                var taskSignals = FindTaskSignals(source);
+                componentRefsByOutput.TryGetValue(output, out var componentRefCount);
+                animationCountsByOutput.TryGetValue(output, out var animationCount);
+                var hasSkin = report?.SkinCount > 0;
+                return new ModelCoverageRow
+                {
+                    Name = (string?)model["name"] ?? report?.Name ?? Path.GetFileNameWithoutExtension(output),
+                    Output = output,
+                    Source = source,
+                    ObjectPath = (string?)model["objectPath"],
+                    ResourceKind = (string?)model["resourceKind"] ?? report?.ResourceKind ?? InferResourceKind(output),
+                    SourceType = (string?)model["sourceType"] ?? (report?.SkinCount > 0 ? "SkeletalOrSkinnedMeshGltf" : "StaticMeshGltf"),
+                    ValidationStatus = report?.Status ?? (string?)model["validationStatus"] ?? "unknown",
+                    IsStatic = !hasSkin,
+                    HasSkin = hasSkin,
+                    HasSkeletonPath = !string.IsNullOrWhiteSpace((string?)model["skeletonPath"]),
+                    MaterialCount = report?.MaterialCount ?? 0,
+                    TextureCount = report?.ExternalMaterialTextureCount ?? 0,
+                    ComponentReferenceCount = componentRefCount,
+                    AnimationCandidateCount = animationCount,
+                    TaskSignals = taskSignals,
+                };
+            })
+            .OrderBy(x => x.ResourceKind, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var byResourceKind = rows
+            .GroupBy(x => x.ResourceKind, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => BuildModelCoverageGroup(x.Key, x))
+            .ToArray();
+        var taskRows = rows
+            .Where(x => x.TaskSignals.Length > 0 || string.Equals(x.ResourceKind, "Prop", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var byTaskSignal = taskRows
+            .SelectMany(row => (row.TaskSignals.Length == 0 ? ["prop"] : row.TaskSignals).Select(signal => new { signal, row }))
+            .GroupBy(x => x.signal, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new
+            {
+                signal = x.Key,
+                total = x.Count(),
+                staticModels = x.Count(y => y.row.IsStatic),
+                skinnedModels = x.Count(y => y.row.HasSkin),
+                withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
+                withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
+            })
+            .ToArray();
+
+        var json = JObject.FromObject(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            rule = "模型覆盖报告只按导出 catalog、GLB 验证和 UE 显式组件引用统计；任务/交互/目标模型来自通用路径词元，不按单个游戏名称硬猜。",
+            totals = new
+            {
+                models = rows.Length,
+                staticModels = rows.Count(x => x.IsStatic),
+                skinnedModels = rows.Count(x => x.HasSkin),
+                taskOrPropModels = taskRows.Length,
+                environmentModels = rows.Count(x => string.Equals(x.ResourceKind, "Environment", StringComparison.OrdinalIgnoreCase)),
+                withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
+                withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
+                warnings = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
+                errors = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
+            },
+            byResourceKind,
+            taskCoverage = new
+            {
+                total = taskRows.Length,
+                bySignal = byTaskSignal,
+                examples = taskRows
+                    .OrderByDescending(x => x.ComponentReferenceCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(200)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+            },
+            models = rows.Select(BuildModelCoverageJsonRow).ToArray(),
+        });
+
+        File.WriteAllText(Path.Combine(root, "model_coverage.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
+        return json;
+    }
+
+    private static object BuildModelCoverageGroup(string resourceKind, IEnumerable<ModelCoverageRow> rows)
+    {
+        var array = rows.ToArray();
+        return new
+        {
+            resourceKind,
+            total = array.Length,
+            staticModels = array.Count(x => x.IsStatic),
+            skinnedModels = array.Count(x => x.HasSkin),
+            withComponentReferences = array.Count(x => x.ComponentReferenceCount > 0),
+            withAnimationCandidates = array.Count(x => x.AnimationCandidateCount > 0),
+            warnings = array.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
+            errors = array.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)),
+        };
+    }
+
+    private static object BuildModelCoverageJsonRow(ModelCoverageRow row)
+        => new
+        {
+            row.Name,
+            row.Output,
+            row.Source,
+            row.ObjectPath,
+            row.ResourceKind,
+            row.SourceType,
+            row.ValidationStatus,
+            row.IsStatic,
+            row.HasSkin,
+            row.HasSkeletonPath,
+            row.MaterialCount,
+            row.TextureCount,
+            row.ComponentReferenceCount,
+            row.AnimationCandidateCount,
+            row.TaskSignals,
+        };
+
+    private static string[] FindTaskSignals(string path)
+    {
+        var text = path.Replace('\\', '/').ToLowerInvariant();
+        var signals = new List<string>();
+        AddTaskSignal(signals, text, "/item/", "item");
+        AddTaskSignal(signals, text, "/items/", "items");
+        AddTaskSignal(signals, text, "/props/", "props");
+        AddTaskSignal(signals, text, "/prop/", "prop");
+        AddTaskSignal(signals, text, "/collectable", "collectable");
+        AddTaskSignal(signals, text, "/collectible", "collectible");
+        AddTaskSignal(signals, text, "/targets/", "targets");
+        AddTaskSignal(signals, text, "/target/", "target");
+        AddTaskSignal(signals, text, "/quest", "quest");
+        AddTaskSignal(signals, text, "/mission", "mission");
+        AddTaskSignal(signals, text, "/objective", "objective");
+        AddTaskSignal(signals, text, "/interact", "interact");
+        AddTaskSignal(signals, text, "/pickup", "pickup");
+        AddTaskSignal(signals, text, "/anomaly/", "anomaly");
+        return signals.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static void AddTaskSignal(List<string> signals, string text, string token, string signal)
+    {
+        if (text.Contains(token))
+            signals.Add(signal);
+    }
+
     private static void WriteLibraryIndexDb(
         string root,
         List<JObject> catalogRows,
@@ -2405,6 +2592,7 @@ internal static class UELibraryPostProcessor
         SourcePackageObjectMap[] packageObjectMaps,
         JArray skeletonGroups,
         JObject modelAnimationRelations,
+        JObject modelCoverage,
         AnimationValidationSummary animationValidation)
     {
         var dbPath = Path.Combine(root, "library_index.db");
@@ -2460,6 +2648,27 @@ internal static class UELibraryPostProcessor
                 skeleton_hash TEXT,
                 bbox_json TEXT,
                 notes_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_coverage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                output TEXT NOT NULL,
+                source TEXT,
+                object_path TEXT,
+                resource_kind TEXT,
+                source_type TEXT,
+                validation_status TEXT,
+                is_static INTEGER NOT NULL,
+                has_skin INTEGER NOT NULL,
+                has_skeleton_path INTEGER NOT NULL,
+                material_count INTEGER NOT NULL,
+                texture_count INTEGER NOT NULL,
+                component_reference_count INTEGER NOT NULL,
+                animation_candidate_count INTEGER NOT NULL,
+                task_signals_json TEXT NOT NULL,
+                raw_json TEXT NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -2636,6 +2845,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(component_reference_count, animation_candidate_count);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
         Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
@@ -2662,6 +2873,8 @@ internal static class UELibraryPostProcessor
 
         foreach (var report in reports)
             InsertModelValidation(connection, transaction, report);
+
+        InsertModelCoverage(connection, transaction, modelCoverage);
 
         foreach (var slot in materialTextureSlots)
             InsertMaterialTextureSlot(connection, transaction, slot);
@@ -2775,6 +2988,44 @@ internal static class UELibraryPostProcessor
         Add(command, "$bboxJson", report.BBox == null ? null : JsonConvert.SerializeObject(report.BBox));
         Add(command, "$notesJson", JsonConvert.SerializeObject(report.Notes));
         command.ExecuteNonQuery();
+    }
+
+    private static void InsertModelCoverage(SqliteConnection connection, SqliteTransaction transaction, JObject modelCoverage)
+    {
+        foreach (var row in ((JArray?)modelCoverage["models"] ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO model_coverage (
+                    name, output, source, object_path, resource_kind, source_type, validation_status,
+                    is_static, has_skin, has_skeleton_path, material_count, texture_count,
+                    component_reference_count, animation_candidate_count, task_signals_json, raw_json
+                )
+                VALUES (
+                    $name, $output, $source, $objectPath, $resourceKind, $sourceType, $validationStatus,
+                    $isStatic, $hasSkin, $hasSkeletonPath, $materialCount, $textureCount,
+                    $componentReferenceCount, $animationCandidateCount, $taskSignalsJson, $rawJson
+                );
+                """;
+            Add(command, "$name", (string?)row["Name"]);
+            Add(command, "$output", (string?)row["Output"] ?? "");
+            Add(command, "$source", (string?)row["Source"]);
+            Add(command, "$objectPath", (string?)row["ObjectPath"]);
+            Add(command, "$resourceKind", (string?)row["ResourceKind"]);
+            Add(command, "$sourceType", (string?)row["SourceType"]);
+            Add(command, "$validationStatus", (string?)row["ValidationStatus"]);
+            Add(command, "$isStatic", ((bool?)row["IsStatic"] ?? false) ? 1 : 0);
+            Add(command, "$hasSkin", ((bool?)row["HasSkin"] ?? false) ? 1 : 0);
+            Add(command, "$hasSkeletonPath", ((bool?)row["HasSkeletonPath"] ?? false) ? 1 : 0);
+            Add(command, "$materialCount", (int?)row["MaterialCount"] ?? 0);
+            Add(command, "$textureCount", (int?)row["TextureCount"] ?? 0);
+            Add(command, "$componentReferenceCount", (int?)row["ComponentReferenceCount"] ?? 0);
+            Add(command, "$animationCandidateCount", (int?)row["AnimationCandidateCount"] ?? 0);
+            Add(command, "$taskSignalsJson", ((JArray?)row["TaskSignals"] ?? []).ToString(Formatting.None));
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
     }
 
     private static void InsertMaterialTextureSlot(
@@ -3319,6 +3570,7 @@ internal static class UELibraryPostProcessor
         SourcePackageObjectMap[] packageObjectMaps,
         JArray skeletonGroups,
         JObject modelAnimationRelations,
+        JObject modelCoverage,
         AnimationValidationSummary animationValidation,
         SourceIndexSnapshot sourceIndex)
     {
@@ -3398,6 +3650,7 @@ internal static class UELibraryPostProcessor
                 withSkeletonPath = models.Count(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"])),
                 withEmbeddedAnimation = reports.Count(x => x.AnimationCount > 0),
                 missingMaterialSidecars = reports.Sum(x => x.MissingMaterialSidecars.Length),
+                coverage = modelCoverage["totals"],
             }),
             ["textures"] = JObject.FromObject(new
             {
@@ -3514,7 +3767,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 自动补导计划和执行结果，记录关系来源、目标对象、源包、输出类型和失败原因。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
-        sb.AppendLine("| `model_animations.json` | 只按 UE Skeleton 原始引用生成的模型动画匹配，并回填动画验证结果。 |");
+        sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
+        sb.AppendLine("| `model_animations.json` | 默认只输出显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选，并回填动画验证结果。 |");
         sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
         sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组，并合并 UE Skeleton、源骨架对象和同 Skeleton 动画。 |");
@@ -4003,6 +4257,25 @@ internal static class UELibraryPostProcessor
     }
 
     private sealed record ModelAnimationCandidate(JObject Model, JObject Animation, string Reason);
+
+    private sealed class ModelCoverageRow
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Output { get; set; } = string.Empty;
+        public string Source { get; set; } = string.Empty;
+        public string? ObjectPath { get; set; }
+        public string ResourceKind { get; set; } = "Unknown";
+        public string SourceType { get; set; } = string.Empty;
+        public string ValidationStatus { get; set; } = "unknown";
+        public bool IsStatic { get; set; }
+        public bool HasSkin { get; set; }
+        public bool HasSkeletonPath { get; set; }
+        public int MaterialCount { get; set; }
+        public int TextureCount { get; set; }
+        public int ComponentReferenceCount { get; set; }
+        public int AnimationCandidateCount { get; set; }
+        public string[] TaskSignals { get; set; } = [];
+    }
 
     private sealed class AnimationValidationEntry
     {
