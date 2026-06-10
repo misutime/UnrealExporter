@@ -2327,12 +2327,14 @@ internal static class UELibraryPostProcessor
                 .Select(validation =>
                 {
                     animationsByOutput.TryGetValue(NormalizeCatalogOutput(validation.AnimationOutput), out var animation);
+                    var exportStatus = (string?)animation?["status"];
+                    var isUsableCandidate = IsUsableAnimationCandidate(exportStatus, validation.Status);
                     return new
                     {
                         name = animation?["name"] ?? validation.AnimationName,
                         source = animation?["source"] ?? validation.AnimationSource,
                         output = animation?["output"] ?? validation.AnimationOutput,
-                        status = animation?["status"],
+                        status = exportStatus,
                         duration = animation?["duration"],
                         frameCount = animation?["frameCount"],
                         trackCount = animation?["trackCount"],
@@ -2351,9 +2353,11 @@ internal static class UELibraryPostProcessor
                         missingReferencedAnimationCount = validation.MissingReferencedAnimations.Length,
                         missingReferencedAnimations = validation.MissingReferencedAnimations.Take(32).ToArray(),
                         missingTrackBones = validation.MissingTrackBones.Take(32).ToArray(),
+                        isUsableCandidate,
                     };
                 })
                 .ToArray();
+            var usableAnimationCount = relationAnimations.Count(x => x.isUsableCandidate);
 
             relations.Add(JObject.FromObject(new
             {
@@ -2362,7 +2366,9 @@ internal static class UELibraryPostProcessor
                 modelSource = model["source"],
                 skeletonPath,
                 skeletonName = model["skeletonName"],
-                confidence = relationAnimations.Length > 0 ? "ExplicitSkeleton" : "NoMatchingAnimationExported",
+                confidence = usableAnimationCount > 0 ? "ExplicitSkeleton" : relationAnimations.Length > 0 ? "RelatedButNotUsable" : "NoMatchingAnimationExported",
+                totalAnimationCount = relationAnimations.Length,
+                usableAnimationCount,
                 animations = relationAnimations,
             }));
         }
@@ -2375,13 +2381,36 @@ internal static class UELibraryPostProcessor
             {
                 models = models.Length,
                 animations = animations.Length,
-                matchedModels = relations.Count(x => ((JArray)x["animations"]!).Count > 0),
+                matchedModels = relations.Count(x => ((int?)x["usableAnimationCount"] ?? 0) > 0),
+                relatedModels = relations.Count(x => ((JArray)x["animations"]!).Count > 0),
+                relatedAnimations = relations.Sum(x => ((JArray)x["animations"]!).Count),
+                usableAnimations = relations.Sum(x => (int?)x["usableAnimationCount"] ?? 0),
             }),
             ["relations"] = relations,
         };
 
         File.WriteAllText(Path.Combine(root, "model_animations.json"), summary.ToString(Formatting.Indented));
         return summary;
+    }
+
+    private static bool IsUsableAnimationCandidate(string? exportStatus, string validationStatus)
+    {
+        if (!string.IsNullOrWhiteSpace(exportStatus) &&
+            !string.Equals(exportStatus, "ok", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return !string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsUsableRelationAnimation(JObject animation)
+    {
+        var explicitFlag = (bool?)animation["isUsableCandidate"];
+        if (explicitFlag != null)
+            return explicitFlag.Value;
+
+        return IsUsableAnimationCandidate(
+            (string?)animation["status"],
+            (string?)animation["validationStatus"] ?? "");
     }
 
     private static int CountReferencedAnimations(JArray? segments)
@@ -2466,7 +2495,9 @@ internal static class UELibraryPostProcessor
             .Select(x => new
             {
                 Output = NormalizeCatalogOutput((string?)x["model"]),
-                Count = ((JArray?)x["animations"] ?? []).Count,
+                Count = (int?)x["usableAnimationCount"] ?? ((JArray?)x["animations"] ?? [])
+                    .OfType<JObject>()
+                    .Count(IsUsableRelationAnimation),
             })
             .Where(x => !string.IsNullOrWhiteSpace(x.Output))
             .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
@@ -2688,6 +2719,9 @@ internal static class UELibraryPostProcessor
         var relationAnimations = relationModels
             .SelectMany(relation => ((JArray?)relation["animations"] ?? []).OfType<JObject>())
             .ToArray();
+        var usableRelationAnimations = relationAnimations
+            .Where(IsUsableRelationAnimation)
+            .ToArray();
         var modelRefs = componentAssetRelations.Where(x => IsModelRelation(x.RelationType)).ToArray();
         var animationRefs = componentAssetRelations.Where(x => IsAnimationRelation(x.RelationType)).ToArray();
         var materialRefs = componentAssetRelations.Where(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -2711,7 +2745,8 @@ internal static class UELibraryPostProcessor
                 staticModels = reports.Count(x => x.SkinCount == 0),
                 skinnedModels = reports.Count(x => x.SkinCount > 0),
                 withSkeletonPath = models.Count(x => !string.IsNullOrWhiteSpace((string?)x["skeletonPath"])),
-                withAnimationCandidates = relationModels.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
+                withAnimationCandidates = relationModels.Count(x => ((int?)x["usableAnimationCount"] ?? 0) > 0),
+                withRelatedAnimations = relationModels.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
                 byResourceKind = coverageRows
                     .GroupBy(x => x.ResourceKind, StringComparer.OrdinalIgnoreCase)
                     .OrderByDescending(x => x.Count())
@@ -2755,6 +2790,9 @@ internal static class UELibraryPostProcessor
                 catalogRows = animations.Length,
                 relatedModels = relationModels.Length,
                 relatedAnimations = relationAnimations.Length,
+                usableRelatedAnimations = usableRelationAnimations.Length,
+                exportFailedRelatedAnimations = relationAnimations.Count(x =>
+                    !string.Equals((string?)x["status"], "ok", StringComparison.OrdinalIgnoreCase)),
                 validationPairs = animationValidation.Validations.Length,
                 ok = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
                 warning = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase)),
@@ -3074,6 +3112,7 @@ internal static class UELibraryPostProcessor
                 track_coverage REAL,
                 hierarchy_compatible INTEGER NOT NULL,
                 is_container_animation INTEGER NOT NULL,
+                is_usable_candidate INTEGER NOT NULL,
                 segment_count INTEGER NOT NULL,
                 referenced_animation_count INTEGER NOT NULL,
                 exported_referenced_animation_count INTEGER NOT NULL,
@@ -3575,13 +3614,13 @@ internal static class UELibraryPostProcessor
             INSERT INTO relation_animations (
                 relation_id, name, source, output, status, duration, frame_count, track_count,
                 validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
-                segment_count, referenced_animation_count, exported_referenced_animation_count,
+                is_usable_candidate, segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count, raw_json
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
                 $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
-                $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
+                $isUsableCandidate, $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
             """;
@@ -3599,6 +3638,7 @@ internal static class UELibraryPostProcessor
         Add(command, "$trackCoverage", (double?)animation["trackCoverage"]);
         Add(command, "$hierarchyCompatible", ((bool?)animation["hierarchyCompatible"] ?? false) ? 1 : 0);
         Add(command, "$isContainerAnimation", ((bool?)animation["isContainerAnimation"] ?? false) ? 1 : 0);
+        Add(command, "$isUsableCandidate", ((bool?)animation["isUsableCandidate"] ?? false) ? 1 : 0);
         Add(command, "$segmentCount", (int?)animation["segmentCount"] ?? 0);
         Add(command, "$referencedAnimationCount", (int?)animation["referencedAnimationCount"] ?? 0);
         Add(command, "$exportedReferencedAnimationCount", (int?)animation["exportedReferencedAnimationCount"] ?? 0);
