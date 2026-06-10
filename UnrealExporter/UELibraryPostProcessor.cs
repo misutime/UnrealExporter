@@ -3687,6 +3687,7 @@ internal static class UELibraryPostProcessor
                 missingReferenceCount = missingComponentRefs,
                 modelReferences = componentGroups.Sum(x => x.ModelReferenceCount),
                 exportedModelReferences = componentGroups.Sum(x => x.ExportedModelReferenceCount),
+                modelReferenceStatus = BuildComponentRelationStatusSummary(componentAssetRelations, IsModelRelation),
                 skeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase)),
                 exportedSkeletonReferences = componentAssetRelations.Count(x =>
                     string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) &&
@@ -3697,14 +3698,18 @@ internal static class UELibraryPostProcessor
                     IsMissingAssetRelation(x)),
                 animationReferences = componentGroups.Sum(x => x.AnimationReferenceCount),
                 exportedAnimationReferences = componentGroups.Sum(x => x.ExportedAnimationReferenceCount),
+                animationReferenceStatus = BuildComponentRelationStatusSummary(componentAssetRelations, IsAnimationRelation),
                 materialReferences = componentGroups.Sum(x => x.MaterialReferenceCount),
                 exportedMaterialReferences = componentGroups.Sum(x => x.ExportedMaterialReferenceCount),
+                materialReferenceStatus = BuildComponentRelationStatusSummary(
+                    componentAssetRelations,
+                    relationType => string.Equals(relationType, "Material", StringComparison.OrdinalIgnoreCase)),
             }),
             ["skeletons"] = JObject.FromObject(new
             {
                 groupCount = skeletonGroups.Count,
                 groupsWithAnimations = skeletonGroups.Count(x => ((JArray?)x["animations"] ?? []).Count > 0),
-                sourceSkeletonObjects = skeletonGroups.Sum(x => ((JArray?)x["sourceSkeletonObjects"] ?? []).Count),
+                skeletonSourceObjects = skeletonGroups.Sum(x => ((JArray?)x["skeletonSourceObjects"] ?? []).Count),
             }),
             ["animations"] = JObject.FromObject(new
             {
@@ -3733,6 +3738,26 @@ internal static class UELibraryPostProcessor
         };
 
         File.WriteAllText(Path.Combine(root, "library_health.json"), health.ToString(Formatting.Indented), Encoding.UTF8);
+    }
+
+    private static object[] BuildComponentRelationStatusSummary(
+        ComponentAssetRelationLink[] links,
+        Func<string, bool> relationTypeFilter)
+    {
+        return links
+            .Where(x => relationTypeFilter(x.RelationType))
+            .GroupBy(x => string.IsNullOrWhiteSpace(x.MatchStatus) ? "unknown" : x.MatchStatus, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new
+            {
+                status = x.Key,
+                count = x.Count(),
+                exportedOrCovered = x.Count(y =>
+                    string.Equals(y.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(y.MatchStatus, "skeletonCoveredByModels", StringComparison.OrdinalIgnoreCase)),
+            })
+            .ToArray<object>();
     }
 
     private static void WriteLibraryReadme(

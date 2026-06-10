@@ -9,15 +9,20 @@
     "keepDirectoryStructure": true,
     "lang": "English",
     "maxDegreeOfParallelism": 12,
+    "generateLibraryIndexes": true,
+    "useSharedTextures": true,
+    "generateSourceIndex": true,
     "createNewCheckpoint": false,
     "useCheckpointFile": "",
     "export": [
       "HT/Content/Characters/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "HT/Content/Characters/(?:Player|Npc|NPC|Monster|Animal)/.*(?:skin|Skin|body|Body|head|Head|hair|Hair).*\\.uasset:glb",
       "HT/Content/Environment/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
       "HT/Content/Vehicle/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
       "HT/Content/Vehicles/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
       "HT/Content/Weapon/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
       "HT/Content/Weapons/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
+      "HT/Content/.*/(?:Items|Item|Props|Prop|Targets|Interact|Objective|Mission|Quest|Anomaly)/.*/(?:SM|SK)_[^/]*\\.uasset:glb",
       "HT/Content/Characters/.*/Textures/.*\\.uasset:png",
       "HT/Content/Environment/.*/Textures/.*\\.uasset:png",
       "HT/Content/Vehicle/.*/Textures/.*\\.uasset:png",
@@ -29,7 +34,18 @@
       "HT/Content/Vehicle/.*/T_[^/]*\\.uasset:png",
       "HT/Content/Vehicles/.*/T_[^/]*\\.uasset:png",
       "HT/Content/Weapon/.*/T_[^/]*\\.uasset:png",
-      "HT/Content/Weapons/.*/T_[^/]*\\.uasset:png"
+      "HT/Content/Weapons/.*/T_[^/]*\\.uasset:png",
+      "HT/Content/.*/(?:Items|Item|Props|Prop|Targets|Interact|Objective|Mission|Quest|Anomaly)/.*/Textures/.*\\.uasset:png",
+      "HT/Content/.*/(?:Items|Item|Props|Prop|Targets|Interact|Objective|Mission|Quest|Anomaly)/.*/T_[^/]*\\.uasset:png"
+    ],
+    "sourceIndexRegex": [
+      "HT/Content/Characters/(?:Player|Npc|NPC|Monster|Animal)/.*(?:skin|Skin|body|Body|head|Head|hair|Hair|Mesh|mesh).*\\.uasset",
+      "HT/Content/Characters/(?:Player|Npc|NPC|Monster|Animal)/.*(?:Animation|animation|ACTanimation|DHanimation|montage|Montage|AnimBP|AimOffset|Move).*\\.uasset",
+      "HT/Content/Characters/(?:Player|Npc|NPC|Monster|Animal)/.*(?:BP_|Blueprint|AnimBlueprint).*\\.uasset",
+      "HT/Content/Environment/.*/(?:SM|SK)_[^/]*\\.uasset",
+      "HT/Content/Vehicle.*/.*(?:SM|SK)_[^/]*\\.uasset",
+      "HT/Content/Weapon.*/.*(?:SM|SK)_[^/]*\\.uasset",
+      "HT/Content/.*/(?:Items|Item|Props|Prop|Targets|Interact|Objective|Mission|Quest|Anomaly)/.*\\.uasset"
     ],
     "exclude": [
       "HT/Content/Dialogue/.*",
