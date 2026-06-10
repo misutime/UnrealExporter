@@ -2581,6 +2581,7 @@ internal static class UELibraryPostProcessor
             taskCoverage = new
             {
                 total = taskRows.Length,
+                quality = BuildTaskModelQuality(taskRows),
                 bySignal = byTaskSignal,
                 examples = taskRows
                     .OrderByDescending(x => x.ComponentReferenceCount)
@@ -2759,6 +2760,7 @@ internal static class UELibraryPostProcessor
                 total = taskRows.Length,
                 withComponentReferences = taskRows.Count(x => x.ComponentReferenceCount > 0),
                 withAnimationCandidates = taskRows.Count(x => x.AnimationCandidateCount > 0),
+                quality = BuildTaskModelQuality(taskRows),
                 bySignal = taskSignalGroups,
                 highReferenceExamples = taskRows
                     .OrderByDescending(x => x.ComponentReferenceCount)
@@ -2822,7 +2824,7 @@ internal static class UELibraryPostProcessor
             notes = new[]
             {
                 "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
-                "任务/道具模型优先看 taskAndPropModels.bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系。",
+                "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但路径语义明确时保留为可浏览素材并标记为关系待补。",
                 "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
             },
         });
@@ -2844,6 +2846,90 @@ internal static class UELibraryPostProcessor
                 .Select(x => new { status = x.Key, count = x.Count() })
                 .ToArray(),
         };
+
+    private static object BuildTaskModelQuality(ModelCoverageRow[] taskRows)
+    {
+        var explicitRelationRows = taskRows
+            .Where(x => x.ComponentReferenceCount > 0)
+            .ToArray();
+        var pathOnlyRows = taskRows
+            .Where(x => x.ComponentReferenceCount == 0)
+            .ToArray();
+        var warningRows = taskRows
+            .Where(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var errorRows = taskRows
+            .Where(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var missingMaterialRows = taskRows
+            .Where(x => x.MaterialCount == 0)
+            .ToArray();
+        var noTextureRows = taskRows
+            .Where(x => x.TextureCount == 0)
+            .ToArray();
+        var animatedRows = taskRows
+            .Where(x => x.AnimationCandidateCount > 0)
+            .ToArray();
+
+        return new
+        {
+            total = taskRows.Length,
+            ready = new
+            {
+                withExplicitComponentReferences = explicitRelationRows.Length,
+                withAnimationCandidates = animatedRows.Length,
+                okValidation = taskRows.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
+            },
+            needsReview = new
+            {
+                pathOnlyWithoutComponentReferences = pathOnlyRows.Length,
+                warnings = warningRows.Length,
+                errors = errorRows.Length,
+                missingMaterials = missingMaterialRows.Length,
+                noExternalTextureSlots = noTextureRows.Length,
+            },
+            bySourceType = taskRows
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.SourceType) ? "unknown" : x.SourceType, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(x => x.Count())
+                .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(x => new
+                {
+                    sourceType = x.Key,
+                    total = x.Count(),
+                    withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
+                    withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
+                })
+                .ToArray(),
+            reviewExamples = new
+            {
+                pathOnly = pathOnlyRows
+                    .OrderByDescending(x => x.AnimationCandidateCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(32)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+                warnings = warningRows
+                    .OrderByDescending(x => x.ComponentReferenceCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(32)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+                missingMaterials = missingMaterialRows
+                    .OrderByDescending(x => x.ComponentReferenceCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(32)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+                animated = animatedRows
+                    .OrderByDescending(x => x.AnimationCandidateCount)
+                    .ThenByDescending(x => x.ComponentReferenceCount)
+                    .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                    .Take(32)
+                    .Select(BuildModelCoverageJsonRow)
+                    .ToArray(),
+            },
+        };
+    }
 
     private static ModelCoverageRow ReadModelCoverageRow(JObject row)
     {
