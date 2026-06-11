@@ -11,6 +11,7 @@ namespace UnrealExporter;
 internal static class UELibraryPostProcessor
 {
     private static readonly string[] TextureExtensions = [".png", ".hdr"];
+    private const int ModelValidationCacheVersion = 2;
     private const int MaxSharedSkeletonAnimationsPerModel = 16;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -535,7 +536,7 @@ internal static class UELibraryPostProcessor
         {
             var modelInfo = new FileInfo(glbPath);
             var json = JObject.Parse(File.ReadAllText(path));
-            if ((int?)json["cacheVersion"] != 1 ||
+            if ((int?)json["cacheVersion"] != ModelValidationCacheVersion ||
                 !string.Equals((string?)json["materialIndexSignature"], materialIndexSignature, StringComparison.Ordinal) ||
                 (long?)json["modelSizeBytes"] != modelInfo.Length ||
                 (long?)json["modelLastWriteUtcTicks"] != modelInfo.LastWriteTimeUtc.Ticks)
@@ -567,7 +568,7 @@ internal static class UELibraryPostProcessor
             var modelInfo = new FileInfo(glbPath);
             var json = new JObject
             {
-                ["cacheVersion"] = 1,
+                ["cacheVersion"] = ModelValidationCacheVersion,
                 ["modelSizeBytes"] = modelInfo.Length,
                 ["modelLastWriteUtcTicks"] = modelInfo.LastWriteTimeUtc.Ticks,
                 ["materialIndexSignature"] = materialIndexSignature,
@@ -4360,6 +4361,9 @@ internal static class UELibraryPostProcessor
                 missing_materials INTEGER NOT NULL,
                 no_external_texture_slots INTEGER NOT NULL,
                 needs_review INTEGER NOT NULL,
+                review_reasons_json TEXT NOT NULL,
+                relation_needs_review INTEGER NOT NULL,
+                relation_review_reasons_json TEXT NOT NULL,
                 task_signals_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
             );
@@ -4721,18 +4725,19 @@ internal static class UELibraryPostProcessor
             var isPathOnlyTask = isTaskOrProp && componentReferenceCount == 0 && sourceIndexObjectCount == 0;
             var missingMaterials = isTaskOrProp && materialCount == 0;
             var noExternalTextureSlots = isTaskOrProp && textureCount == 0;
+            var coverageRow = ReadModelCoverageRow(row);
+            var reviewReasons = isTaskOrProp ? BuildTaskQualityIssueReasons(coverageRow) : [];
+            var relationReviewReasons = isTaskOrProp ? BuildTaskRelationReviewReasons(coverageRow) : [];
             // pathOnly 只是“关系待补”，不代表模型质量不可用；质量复查只看验证、材质和贴图事实。
-            var needsReview = isTaskOrProp && (
-                missingMaterials ||
-                noExternalTextureSlots ||
-                string.Equals(validationStatus, "warning", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase));
+            var needsReview = reviewReasons.Length > 0;
+            var relationNeedsReview = relationReviewReasons.Length > 0;
             command.CommandText = """
                 INSERT INTO model_coverage (
                     name, output, source, object_path, resource_kind, source_type, validation_status,
                     is_static, has_skin, has_skeleton_path, material_count, texture_count,
                     component_reference_count, source_index_object_count, animation_candidate_count,
                     is_task_or_prop, is_path_only_task, missing_materials, no_external_texture_slots, needs_review,
+                    review_reasons_json, relation_needs_review, relation_review_reasons_json,
                     task_signals_json, raw_json
                 )
                 VALUES (
@@ -4740,6 +4745,7 @@ internal static class UELibraryPostProcessor
                     $isStatic, $hasSkin, $hasSkeletonPath, $materialCount, $textureCount,
                     $componentReferenceCount, $sourceIndexObjectCount, $animationCandidateCount,
                     $isTaskOrProp, $isPathOnlyTask, $missingMaterials, $noExternalTextureSlots, $needsReview,
+                    $reviewReasonsJson, $relationNeedsReview, $relationReviewReasonsJson,
                     $taskSignalsJson, $rawJson
                 );
                 """;
@@ -4763,6 +4769,9 @@ internal static class UELibraryPostProcessor
             Add(command, "$missingMaterials", missingMaterials ? 1 : 0);
             Add(command, "$noExternalTextureSlots", noExternalTextureSlots ? 1 : 0);
             Add(command, "$needsReview", needsReview ? 1 : 0);
+            Add(command, "$reviewReasonsJson", JsonConvert.SerializeObject(reviewReasons));
+            Add(command, "$relationNeedsReview", relationNeedsReview ? 1 : 0);
+            Add(command, "$relationReviewReasonsJson", JsonConvert.SerializeObject(relationReviewReasons));
             Add(command, "$taskSignalsJson", taskSignals.ToString(Formatting.None));
             Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
@@ -5864,6 +5873,9 @@ internal static class UELibraryPostProcessor
         if (text.Contains("/weapon") || text.Contains("/weapons/") || text.Contains("/gadgets/") ||
             text.Contains("/grappling/") || text.Contains("/grapplegun/"))
             return "Weapon";
+        if (text.Contains("/characters/item/") || text.Contains("/characters/items/") ||
+            text.Contains("/characters/props/") || text.Contains("/characters/prop/"))
+            return "Prop";
         if (text.Contains("/characters/") || text.Contains("/character/"))
             return "Character";
         if (IsTaskOrPropLikePath(text))
