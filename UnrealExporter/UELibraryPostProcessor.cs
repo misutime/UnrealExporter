@@ -2911,7 +2911,7 @@ internal static class UELibraryPostProcessor
         var skeletonPath = (string?)model["skeletonPath"];
         var modelKey = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
         var animationKey = NormalizeCatalogOutput((string?)animation["output"] ?? (string?)animation["source"]);
-        var modelBones = GetOrBuildModelBones(model, skeletonPath, sourceIndex, modelKey, modelBoneCache);
+        var modelBones = GetOrBuildModelBones(root, model, skeletonPath, sourceIndex, modelKey, modelBoneCache);
         var animationTracks = GetOrBuildAnimationTracks(root, animation, sourceIndex, animationKey, animationTrackCache);
         var trackSource = animationTracks.Any(x => x.FromExportedUEAnim)
             ? "exportedUEAnim"
@@ -3030,6 +3030,7 @@ internal static class UELibraryPostProcessor
     }
 
     private static ModelBoneLookup GetOrBuildModelBones(
+        string root,
         JObject model,
         string? skeletonPath,
         SourceIndexSnapshot sourceIndex,
@@ -3037,11 +3038,11 @@ internal static class UELibraryPostProcessor
         Dictionary<string, ModelBoneLookup>? cache)
     {
         if (cache == null || string.IsNullOrWhiteSpace(modelKey))
-            return FindModelBones(model, skeletonPath, sourceIndex);
+            return FindModelBones(root, model, skeletonPath, sourceIndex);
 
         if (!cache.TryGetValue(modelKey, out var lookup))
         {
-            lookup = FindModelBones(model, skeletonPath, sourceIndex);
+            lookup = FindModelBones(root, model, skeletonPath, sourceIndex);
             cache[modelKey] = lookup;
         }
 
@@ -3175,7 +3176,7 @@ internal static class UELibraryPostProcessor
                normalized.EndsWith(packageSuffix, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static ModelBoneLookup FindModelBones(JObject model, string? skeletonPath, SourceIndexSnapshot sourceIndex)
+    private static ModelBoneLookup FindModelBones(string root, JObject model, string? skeletonPath, SourceIndexSnapshot sourceIndex)
     {
         var objectPath = (string?)model["objectPath"];
         if (!string.IsNullOrWhiteSpace(objectPath) && sourceIndex.BonesByOwner.TryGetValue(objectPath, out var byOwner))
@@ -3187,7 +3188,98 @@ internal static class UELibraryPostProcessor
             return new ModelBoneLookup(singleOwner ?? []);
         }
 
-        return new ModelBoneLookup([]);
+        // 源索引偶尔漏掉道具骨骼；已导出的 GLB skin 是模型自身的可靠验证证据。
+        return TryBuildModelBonesFromExportedGltf(root, model, skeletonPath);
+    }
+
+    private static ModelBoneLookup TryBuildModelBonesFromExportedGltf(string root, JObject model, string? skeletonPath)
+    {
+        var outputPath = ResolveCatalogFile(root, (string?)model["output"]);
+        if (string.IsNullOrWhiteSpace(outputPath) || !File.Exists(outputPath) || !IsSupportedGltfModel(outputPath))
+            return new ModelBoneLookup([]);
+
+        try
+        {
+            var (gltf, _) = ReadGltfModel(outputPath);
+            var nodes = ArrayOf(gltf, "nodes");
+            var skins = ArrayOf(gltf, "skins");
+            var bones = BuildBonesFromGltfSkins(outputPath, model, skeletonPath, nodes, skins);
+            return new ModelBoneLookup(bones);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARN: exported glTF skin read failed {MakeRelative(root, outputPath)} ({ex.Message})");
+            return new ModelBoneLookup([]);
+        }
+    }
+
+    private static SourceBone[] BuildBonesFromGltfSkins(
+        string outputPath,
+        JObject model,
+        string? skeletonPath,
+        JObject[] nodes,
+        JObject[] skins)
+    {
+        if (nodes.Length == 0 || skins.Length == 0)
+            return [];
+
+        var jointNodes = new List<int>();
+        foreach (var skin in skins)
+        {
+            foreach (var joint in skin["joints"]?.Select(x => (int?)x) ?? [])
+            {
+                if (joint is >= 0 && joint < nodes.Length && !jointNodes.Contains(joint.Value))
+                    jointNodes.Add(joint.Value);
+            }
+        }
+
+        if (jointNodes.Count == 0)
+            return [];
+
+        var parentNodeByChild = BuildGltfParentNodeLookup(nodes);
+        var boneIndexByNode = jointNodes
+            .Select((nodeIndex, boneIndex) => new { nodeIndex, boneIndex })
+            .ToDictionary(x => x.nodeIndex, x => x.boneIndex);
+        var owner = (string?)model["objectPath"] ?? (string?)model["output"] ?? outputPath;
+
+        return jointNodes
+            .Select((nodeIndex, boneIndex) =>
+            {
+                var parentIndex = -1;
+                if (parentNodeByChild.TryGetValue(nodeIndex, out var parentNodeIndex) &&
+                    boneIndexByNode.TryGetValue(parentNodeIndex, out var parentBoneIndex))
+                {
+                    parentIndex = parentBoneIndex;
+                }
+
+                return new SourceBone
+                {
+                    SourcePath = outputPath,
+                    OwnerObjectPath = owner,
+                    OwnerType = "ExportedGltfSkin",
+                    SkeletonPath = skeletonPath,
+                    BoneIndex = boneIndex,
+                    BoneName = ((string?)nodes[nodeIndex]["name"]) ?? $"node_{nodeIndex}",
+                    ParentIndex = parentIndex,
+                };
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.BoneName))
+            .ToArray();
+    }
+
+    private static Dictionary<int, int> BuildGltfParentNodeLookup(JObject[] nodes)
+    {
+        var parentNodeByChild = new Dictionary<int, int>();
+        for (var parentIndex = 0; parentIndex < nodes.Length; parentIndex++)
+        {
+            foreach (var child in nodes[parentIndex]["children"]?.Select(x => (int?)x) ?? [])
+            {
+                if (child is >= 0 && child < nodes.Length)
+                    parentNodeByChild[child.Value] = parentIndex;
+            }
+        }
+
+        return parentNodeByChild;
     }
 
     private static SourceAnimationTrack[] FindAnimationTracks(string root, JObject animation, SourceIndexSnapshot sourceIndex)
