@@ -1019,7 +1019,12 @@ internal static class UELibraryPostProcessor
     private static SourceIndexSnapshot LoadSourceIndex(string root)
     {
         var dbPath = Path.Combine(root, "ue_source_index.db");
-        var snapshot = new SourceIndexSnapshot { Path = dbPath, Available = File.Exists(dbPath) };
+        var snapshot = new SourceIndexSnapshot
+        {
+            Path = dbPath,
+            Available = File.Exists(dbPath),
+            UnsupportedAutoReferencedAnimationPaths = LoadUnsupportedAutoReferencedAnimationPaths(root),
+        };
         if (!snapshot.Available)
             return snapshot;
 
@@ -1297,6 +1302,48 @@ internal static class UELibraryPostProcessor
             var typeText = $"{GetString(reader, 1)} {GetString(reader, 2)} {GetString(reader, 3)} {objectPath}";
             if (IsUnsupportedAnimationTypeText(typeText))
                 result.Add(objectPath);
+        }
+
+        return result;
+    }
+
+    private static HashSet<string> LoadUnsupportedAutoReferencedAnimationPaths(string root)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var path = Path.Combine(root, "auto_referenced_exports.jsonl");
+        if (!File.Exists(path))
+            return result;
+
+        foreach (var line in File.ReadLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            try
+            {
+                var row = JObject.Parse(line);
+                var stage = (string?)row["stage"];
+                var status = (string?)row["status"];
+                var relationType = (string?)row["relationType"];
+                var outputType = (string?)row["outputType"];
+                var reason = (string?)row["reason"];
+                var targetPath = (string?)row["targetPath"];
+                if (string.Equals(stage, "export", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(status, "notExported", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(relationType, "Animation", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(outputType, "ueanim", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(reason, "matchedPackageButNoExportedObject", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(targetPath))
+                {
+                    // 包存在但没有 UAnimSequence/Montage/Composite 可写对象，说明这是容器/编辑器动画资产。
+                    // 它应作为关系元数据保留，不能继续报成“缺少已导出素材”。
+                    result.Add(targetPath!);
+                }
+            }
+            catch (JsonException)
+            {
+                // 旧日志里如果混入截断行，跳过该行即可；源索引仍是主要证据。
+            }
         }
 
         return result;
@@ -1961,6 +2008,9 @@ internal static class UELibraryPostProcessor
             return false;
 
         if (sourceIndex.UnsupportedAnimationObjectPaths.Contains(relation.TargetPath))
+            return true;
+
+        if (sourceIndex.UnsupportedAutoReferencedAnimationPaths.Contains(relation.TargetPath))
             return true;
 
         var typeText = $"{relation.TargetName} {relation.TargetPath}";
@@ -6746,6 +6796,7 @@ internal static class UELibraryPostProcessor
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
         public HashSet<string> UnsupportedAnimationObjectPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> UnsupportedAutoReferencedAnimationPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
         public int PackageObjectMapCount { get; set; }
     }
