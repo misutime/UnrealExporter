@@ -11,7 +11,7 @@ namespace UnrealExporter;
 internal static class UELibraryPostProcessor
 {
     private static readonly string[] TextureExtensions = [".png", ".hdr"];
-    private const int MaxSharedSkeletonAnimationsPerModel = 256;
+    private const int MaxSharedSkeletonAnimationsPerModel = 16;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
@@ -26,7 +26,8 @@ internal static class UELibraryPostProcessor
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
         Console.WriteLine($"UE Library postprocess root: {root}");
-        var modelFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
+        var modelFiles = new[] { "*.glb", "*.gltf" }
+            .SelectMany(pattern => Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
             .Where(x => !IsIgnoredLibraryPath(root, x))
             .Where(IsSupportedGltfModel)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -58,7 +59,7 @@ internal static class UELibraryPostProcessor
 
         var textureLinks = dedupeTextures
             ? RunStage("共享贴图去重/硬链接", () => DeduplicateTextureFilesCore(root))
-            : [];
+            : RunStage("读取已有共享贴图索引", () => LoadExistingTextureLinks(root));
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
@@ -848,7 +849,8 @@ internal static class UELibraryPostProcessor
             snapshot.SegmentsByAnimation = LoadSegmentsByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
             snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
-            snapshot.PackageObjectMaps = LoadSourcePackageObjectMaps(connection);
+            snapshot.PackageObjectMapCount = CountTableRows(connection, "package_object_maps");
+            snapshot.PackageObjectMaps = [];
         }
         catch (Exception ex)
         {
@@ -1138,6 +1140,16 @@ internal static class UELibraryPostProcessor
         }
 
         return false;
+    }
+
+    private static int CountTableRows(SqliteConnection connection, string tableName)
+    {
+        if (!TableExists(connection, tableName))
+            return 0;
+
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {tableName};";
+        return Convert.ToInt32(command.ExecuteScalar());
     }
 
     private static MaterialTextureSlotLink[] WriteMaterialTextureSlotLinks(
@@ -1486,6 +1498,18 @@ internal static class UELibraryPostProcessor
         var rows = sourceIndex.Available ? sourceIndex.PackageObjectMaps : [];
         var path = Path.Combine(root, "package_object_maps.jsonl");
         using var writer = new StreamWriter(path, false, Encoding.UTF8);
+        if (rows.Length == 0 && sourceIndex.PackageObjectMapCount > 0)
+        {
+            writer.WriteLine(JsonConvert.SerializeObject(new
+            {
+                kind = "PackageObjectMapSummary",
+                sourceIndex = MakeRelative(root, sourceIndex.Path),
+                sourcePackageObjectMapCount = sourceIndex.PackageObjectMapCount,
+                note = "完整 UE ImportMap/ExportMap 保留在 ue_source_index.db。Library 索引不复制全量 package_object_maps，避免大库后处理和 Browser 读取被数百万行源映射拖慢。"
+            }));
+            return rows;
+        }
+
         foreach (var row in rows.OrderBy(x => x.SourcePath, StringComparer.OrdinalIgnoreCase)
                      .ThenBy(x => x.MapType, StringComparer.OrdinalIgnoreCase)
                      .ThenBy(x => x.MapIndex))
@@ -1691,11 +1715,11 @@ internal static class UELibraryPostProcessor
         Dictionary<string, SourcePackageObjectMap> packageObjectsByPath)
     {
         if (!relation.RelationType.Equals("Animation", StringComparison.OrdinalIgnoreCase) ||
-            string.IsNullOrWhiteSpace(relation.TargetPath) ||
-            !packageObjectsByPath.TryGetValue(relation.TargetPath, out var target))
+            string.IsNullOrWhiteSpace(relation.TargetPath))
             return false;
 
-        var typeText = $"{target.ClassName} {target.ClassPath} {target.ObjectName}";
+        packageObjectsByPath.TryGetValue(relation.TargetPath, out var target);
+        var typeText = $"{target?.ClassName} {target?.ClassPath} {target?.ObjectName} {relation.TargetName} {relation.TargetPath}";
         return typeText.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase)
                || typeText.Contains("AimOffset", StringComparison.OrdinalIgnoreCase)
                || typeText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase);
@@ -2350,41 +2374,55 @@ internal static class UELibraryPostProcessor
                 error = validations.Count(x => x.Status == "error"),
                 containerAnimations = validations.Count(x => x.IsContainerAnimation),
             }),
-            ["validations"] = JArray.FromObject(validations.Select(x => new
-            {
-                status = x.Status,
-                candidateReason = x.CandidateReason,
-                validationCategory = x.ValidationCategory,
-                reason = x.Reason,
-                model = x.ModelOutput,
-                modelName = x.ModelName,
-                modelSource = x.ModelSource,
-                animation = x.AnimationOutput,
-                animationName = x.AnimationName,
-                animationSource = x.AnimationSource,
-                skeletonPath = x.SkeletonPath,
-                skeletonName = x.SkeletonName,
-                modelBoneCount = x.ModelBoneCount,
-                animationTrackCount = x.AnimationTrackCount,
-                trackSource = x.TrackSource,
-                matchedTrackBones = x.MatchedTrackBones,
-                missingTrackBoneCount = x.MissingTrackBones.Length,
-                missingTrackBones = x.MissingTrackBones.Take(64).ToArray(),
-                trackCoverage = x.TrackCoverage,
-                hierarchyCompatible = x.HierarchyCompatible,
-                isContainerAnimation = x.IsContainerAnimation,
-                referencedAnimationCount = x.ReferencedAnimations.Length,
-                exportedReferencedAnimationCount = x.ExportedReferencedAnimations.Length,
-                missingReferencedAnimationCount = x.MissingReferencedAnimations.Length,
-                referencedAnimations = x.ReferencedAnimations.Take(64).ToArray(),
-                missingReferencedAnimations = x.MissingReferencedAnimations.Take(64).ToArray(),
-                hierarchyMismatchCount = x.HierarchyMismatches.Length,
-                hierarchyMismatches = x.HierarchyMismatches.Take(32).ToArray(),
-            })),
+            ["detailFile"] = "animation_validation.jsonl",
         };
 
         File.WriteAllText(Path.Combine(root, "animation_validation.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
+        WriteAnimationValidationJsonLines(root, validations);
         return summary;
+    }
+
+    private static void WriteAnimationValidationJsonLines(string root, AnimationValidationEntry[] validations)
+    {
+        var path = Path.Combine(root, "animation_validation.jsonl");
+        using var writer = new StreamWriter(path, false, Encoding.UTF8);
+        foreach (var validation in validations)
+            writer.WriteLine(BuildAnimationValidationJson(validation).ToString(Formatting.None));
+    }
+
+    private static JObject BuildAnimationValidationJson(AnimationValidationEntry x)
+    {
+        return JObject.FromObject(new
+        {
+            status = x.Status,
+            candidateReason = x.CandidateReason,
+            validationCategory = x.ValidationCategory,
+            reason = x.Reason,
+            model = x.ModelOutput,
+            modelName = x.ModelName,
+            modelSource = x.ModelSource,
+            animation = x.AnimationOutput,
+            animationName = x.AnimationName,
+            animationSource = x.AnimationSource,
+            skeletonPath = x.SkeletonPath,
+            skeletonName = x.SkeletonName,
+            modelBoneCount = x.ModelBoneCount,
+            animationTrackCount = x.AnimationTrackCount,
+            trackSource = x.TrackSource,
+            matchedTrackBones = x.MatchedTrackBones,
+            missingTrackBoneCount = x.MissingTrackBones.Length,
+            missingTrackBones = x.MissingTrackBones.Take(64).ToArray(),
+            trackCoverage = x.TrackCoverage,
+            hierarchyCompatible = x.HierarchyCompatible,
+            isContainerAnimation = x.IsContainerAnimation,
+            referencedAnimationCount = x.ReferencedAnimations.Length,
+            exportedReferencedAnimationCount = x.ExportedReferencedAnimations.Length,
+            missingReferencedAnimationCount = x.MissingReferencedAnimations.Length,
+            referencedAnimations = x.ReferencedAnimations.Take(64).ToArray(),
+            missingReferencedAnimations = x.MissingReferencedAnimations.Take(64).ToArray(),
+            hierarchyMismatchCount = x.HierarchyMismatches.Length,
+            hierarchyMismatches = x.HierarchyMismatches.Take(32).ToArray(),
+        });
     }
 
     private static AnimationValidationEntry[] BuildAnimationValidations(
@@ -2404,6 +2442,7 @@ internal static class UELibraryPostProcessor
             .ToArray();
         var allAnimations = animations;
         var candidates = BuildModelAnimationCandidates(models, animations, sourceIndex, componentAssetRelations);
+        Console.WriteLine($"UE animation validation candidates: models={models.Length}, animations={animations.Length}, pairs={candidates.Length}");
 
         var result = new List<AnimationValidationEntry>();
         var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
@@ -4346,32 +4385,6 @@ internal static class UELibraryPostProcessor
                 raw_json TEXT NOT NULL
             );
             """);
-        Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
-        Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
-        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
-        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
-        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
-        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
-        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
-        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
-        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
-        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_status ON shared_gltf_texture_links(status);");
-        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_owner ON component_asset_relations(owner_object_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_target ON component_asset_relations(relation_type, target_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_match ON component_asset_relations(match_status, target_asset_output);");
-        Execute(connection, transaction, "CREATE INDEX idx_component_groups_model_refs ON component_groups(model_reference_count, exported_model_reference_count);");
-        Execute(connection, transaction, "CREATE INDEX idx_component_groups_missing ON component_groups(missing_reference_count, missing_model_reference_count, missing_material_reference_count);");
-        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
-        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
-        Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
-        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
-        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
-        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
-
         foreach (var row in catalogRows)
             InsertAsset(connection, transaction, row);
 
@@ -4401,8 +4414,40 @@ internal static class UELibraryPostProcessor
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
 
+        CreateLibraryIndexDbIndexes(connection, transaction);
         transaction.Commit();
         FinalizeSqliteOutput(connection);
+    }
+
+    private static void CreateLibraryIndexDbIndexes(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        // 大库里 package_object_maps / material_texture_slots 往往是几十万到百万级。
+        // 先写数据、最后建索引，能避免每插入一行都维护 BTree，NTE 这类库会快很多。
+        Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
+        Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
+        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
+        Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_status ON shared_gltf_texture_links(status);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_owner ON component_asset_relations(owner_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_target ON component_asset_relations(relation_type, target_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_asset_relations_match ON component_asset_relations(match_status, target_asset_output);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_groups_model_refs ON component_groups(model_reference_count, exported_model_reference_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_component_groups_missing ON component_groups(missing_reference_count, missing_model_reference_count, missing_material_reference_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
     }
 
     private static void FinalizeSqliteOutput(SqliteConnection connection)
@@ -4828,12 +4873,32 @@ internal static class UELibraryPostProcessor
             Add(command, "$skeletonName", (string?)relationObj["skeletonName"]);
             Add(command, "$confidence", (string?)relationObj["confidence"] ?? "Unknown");
             Add(command, "$animationCount", animations.Count);
-            Add(command, "$rawJson", relationObj.ToString(Formatting.None));
+            Add(command, "$rawJson", BuildModelAnimationRelationDbRawJson(relationObj, animations));
             var relationId = (long)command.ExecuteScalar()!;
 
             foreach (var animation in animations.OfType<JObject>())
                 InsertRelationAnimation(connection, transaction, relationId, animation);
         }
+    }
+
+    private static string BuildModelAnimationRelationDbRawJson(JObject relationObj, JArray animations)
+    {
+        // 完整动画数组已经逐条写入 relation_animations，也会保留在 model_animations.json。
+        // SQLite 这一列只保留模型级摘要，避免大库里把同一批动画 JSON 重复写两遍。
+        var summary = new JObject();
+        foreach (var property in relationObj.Properties())
+        {
+            if (!string.Equals(property.Name, "animations", StringComparison.OrdinalIgnoreCase))
+                summary[property.Name] = property.Value.DeepClone();
+        }
+
+        summary["totalAnimationCount"] = animations.Count;
+        summary["usableAnimationCount"] = animations
+            .OfType<JObject>()
+            .Count(x => (bool?)x["isUsableCandidate"] ?? false);
+        summary["sqliteRawJsonMode"] = "summaryOnly";
+        summary["sqliteRawJsonNote"] = "动画明细存放在 relation_animations；完整模型动画关系仍保留在 model_animations.json。";
+        return summary.ToString(Formatting.None);
     }
 
     private static void InsertRelationAnimation(
@@ -5344,7 +5409,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine($"- 材质 JSON: `{materials.Count()}`");
         sb.AppendLine($"- 模型内动画: `{reports.Count(x => x.AnimationCount > 0)}`");
         sb.AppendLine($"- 蓝图/组件资源关系: `{componentAssetRelations.Length}`");
-        sb.AppendLine($"- UE 包 Import/Export 记录: `{packageObjectMaps.Length}`");
+        sb.AppendLine($"- UE 包 Import/Export 摘要: `{packageObjectMaps.Length}`（完整记录见 `ue_source_index.db`）");
         sb.AppendLine();
         sb.AppendLine("## 索引文件");
         sb.AppendLine();
@@ -5367,7 +5432,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `component_asset_relations.jsonl` | 蓝图、组件、默认对象到模型/材质/动画/Skeleton 的显式 UE 关系。 |");
         sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要，包含组件节点、父子关系、socket 和 transform。 |");
-        sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 原始依赖和导出对象记录。 |");
+        sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 摘要；完整原始依赖和导出对象记录保留在 `ue_source_index.db`。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
         sb.AppendLine("## 下一步");
@@ -5409,6 +5474,48 @@ internal static class UELibraryPostProcessor
     public static void DeduplicateTextureFiles(string root)
     {
         DeduplicateTextureFilesCore(root);
+    }
+
+    private static List<TextureLinkInfo> LoadExistingTextureLinks(string root)
+    {
+        var path = Path.Combine(root, "texture_links.jsonl");
+        if (!File.Exists(path))
+            return [];
+
+        var result = new List<TextureLinkInfo>();
+        foreach (var line in File.ReadLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            try
+            {
+                var row = JObject.Parse(line);
+                var source = (string?)row["source"];
+                var shared = (string?)row["shared"];
+                if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(shared))
+                    continue;
+
+                result.Add(new TextureLinkInfo
+                {
+                    Path = Path.Combine(root, source.Replace('/', Path.DirectorySeparatorChar)),
+                    RelativePath = source,
+                    SharedPath = Path.Combine(root, shared.Replace('/', Path.DirectorySeparatorChar)),
+                    SharedRelativePath = shared,
+                    Hash = (string?)row["sha256"] ?? "",
+                    SizeBytes = (long?)row["sizeBytes"] ?? 0,
+                    Extension = (string?)row["extension"] ?? Path.GetExtension(source),
+                    HardLinked = (bool?)row["hardLinked"] ?? false,
+                    LinkError = (string?)row["linkError"] ?? "",
+                });
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+
+        return result;
     }
 
     private static List<TextureLinkInfo> DeduplicateTextureFilesCore(string root)
@@ -5708,6 +5815,7 @@ internal static class UELibraryPostProcessor
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
         public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
+        public int PackageObjectMapCount { get; set; }
     }
 
     private sealed class SourceBone
