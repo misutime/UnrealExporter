@@ -4566,7 +4566,8 @@ internal static class UELibraryPostProcessor
                 withExplicitComponentReferences = explicitRelationRows.Length,
                 withSourceIndexObjects = sourceIndexedRows.Length,
                 sourceIndexedWithoutComponentReferences = sourceIndexedWithoutComponentRows.Length,
-                pathOnlyUsableModels = pathOnlyRows.Length - pathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
+                sourceIndexedPathEvidence = sourceIndexedWithoutComponentRows.Length,
+                pathOnlyUsableModels = purePathOnlyRows.Length - purePathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
                 purePathOnlyUsableModels = purePathOnlyRows.Length - purePathOnlyRows.Count(x => BuildTaskQualityIssueReasons(x).Length > 0),
                 withAnimationCandidates = animatedRows.Length,
                 okValidation = taskRows.Count(x => string.Equals(x.ValidationStatus, "ok", StringComparison.OrdinalIgnoreCase)),
@@ -4580,8 +4581,8 @@ internal static class UELibraryPostProcessor
             },
             relationNeedsReview = new
             {
-                pathOnlyWithoutComponentReferences = pathOnlyRows.Length,
-                sourceIndexedWithoutComponentReferences = sourceIndexedWithoutComponentRows.Length,
+                pathOnlyWithoutSourceIndexObject = purePathOnlyRows.Length,
+                sourceIndexedPathEvidence = sourceIndexedWithoutComponentRows.Length,
                 purePathOnlyWithoutSourceIndexObject = purePathOnlyRows.Length,
             },
             bySourceType = taskRows
@@ -4659,7 +4660,7 @@ internal static class UELibraryPostProcessor
         var json = JObject.FromObject(new
         {
             generatedAt = DateTime.UtcNow.ToString("O"),
-            rule = "任务/道具质量报告只基于 UE 通用路径语义、组件引用、模型验证、材质和动画候选事实；pathOnly 表示可浏览但暂未解析到 UE 组件显式引用，不代表模型不可用。",
+            rule = "任务/道具质量报告只基于 UE 通用路径语义、组件引用、源索引对象、模型验证、材质和动画候选事实；sourceIndexedPathEvidence 表示源索引确认了资产对象，只是暂未解析到 UE 组件显式引用，不代表模型不可用。",
             totals = new
             {
                 taskOrPropModels = rows.Length,
@@ -4671,7 +4672,8 @@ internal static class UELibraryPostProcessor
                 withComponentReferences = rows.Count(x => x.ComponentReferenceCount > 0),
                 withSourceIndexObjects = rows.Count(x => x.SourceIndexObjectCount > 0),
                 sourceIndexedWithoutComponentReferences = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0),
-                pathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0),
+                sourceIndexedPathEvidence = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0),
+                pathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount == 0),
                 purePathOnlyRelation = rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount == 0),
                 withAnimationCandidates = rows.Count(x => x.AnimationCandidateCount > 0),
                 validationWarnings = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase)),
@@ -4693,6 +4695,7 @@ internal static class UELibraryPostProcessor
                     relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y.row).Length > 0),
                     withComponentReferences = x.Count(y => y.row.ComponentReferenceCount > 0),
                     withSourceIndexObjects = x.Count(y => y.row.SourceIndexObjectCount > 0),
+                    sourceIndexedPathEvidence = x.Count(y => y.row.ComponentReferenceCount == 0 && y.row.SourceIndexObjectCount > 0),
                     purePathOnlyRelation = x.Count(y => y.row.ComponentReferenceCount == 0 && y.row.SourceIndexObjectCount == 0),
                     withAnimationCandidates = x.Count(y => y.row.AnimationCandidateCount > 0),
                 })
@@ -4710,6 +4713,7 @@ internal static class UELibraryPostProcessor
                     relationNeedsReview = x.Count(y => BuildTaskRelationReviewReasons(y).Length > 0),
                     withComponentReferences = x.Count(y => y.ComponentReferenceCount > 0),
                     withSourceIndexObjects = x.Count(y => y.SourceIndexObjectCount > 0),
+                    sourceIndexedPathEvidence = x.Count(y => y.ComponentReferenceCount == 0 && y.SourceIndexObjectCount > 0),
                     purePathOnlyRelation = x.Count(y => y.ComponentReferenceCount == 0 && y.SourceIndexObjectCount == 0),
                     withAnimationCandidates = x.Count(y => y.AnimationCandidateCount > 0),
                 })
@@ -4744,12 +4748,8 @@ internal static class UELibraryPostProcessor
     private static string[] BuildTaskRelationReviewReasons(ModelCoverageRow row)
     {
         var reasons = new List<string>();
-        if (row.ComponentReferenceCount == 0)
-        {
-            reasons.Add(row.SourceIndexObjectCount > 0
-                ? "sourceIndexedButNoComponentReference"
-                : "pathOnlyRelation");
-        }
+        if (row.ComponentReferenceCount == 0 && row.SourceIndexObjectCount == 0)
+            reasons.Add("pathOnlyRelation");
         return reasons.ToArray();
     }
 
@@ -4806,7 +4806,7 @@ internal static class UELibraryPostProcessor
         {
             "# UE 任务/道具模型质量报告",
             "",
-            "本报告用于快速确认任务模型、交互道具和 Prop 是否已经作为可浏览素材进入库。`需要复查` 只统计模型质量问题；`关系待补` 表示模型来自任务/道具路径或 Prop 分类，但当前没有解析到 UE 组件显式引用。",
+            "本报告用于快速确认任务模型、交互道具和 Prop 是否已经作为可浏览素材进入库。`需要复查` 只统计模型质量问题；`关系待补` 只表示既没有 UE 组件显式引用、也没有源索引对象确认的纯路径命中。",
             "",
             $"总数: {rows.Length}",
             $"可直接使用: {readyRows.Length}",
@@ -4837,9 +4837,9 @@ internal static class UELibraryPostProcessor
             lines.Add($"- {group.Key}: {group.Count()}");
 
         lines.Add("");
-        lines.Add("## 关系待补");
+        lines.Add("## 关系证据");
         lines.Add("");
-        lines.Add($"- sourceIndexedButNoComponentReference: {relationReviewRows.Count(x => x.SourceIndexObjectCount > 0)}");
+        lines.Add($"- sourceIndexedPathEvidence: {rows.Count(x => x.ComponentReferenceCount == 0 && x.SourceIndexObjectCount > 0)}");
         lines.Add($"- pathOnlyRelation: {relationReviewRows.Count(x => x.SourceIndexObjectCount == 0)}");
 
         lines.Add("");
