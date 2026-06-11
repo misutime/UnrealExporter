@@ -40,6 +40,8 @@ internal static class UEAnimationPreviewBuilder
 
             var matchedTracks = 0;
             var writtenChannels = 0;
+            var retargetedTranslationTracks = 0;
+            var skippedStaticTranslationTracks = 0;
             var missingBones = new List<string>();
             foreach (var track in animation.Tracks)
             {
@@ -52,11 +54,17 @@ internal static class UEAnimationPreviewBuilder
                 matchedTracks++;
                 if (track.Positions.Count > 0)
                 {
-                    gltfAnimation.CreateTranslationChannel(
-                        node,
-                        BuildKeyMap(track.Positions, animation.FramesPerSecond, x => SwapYZ(x) * 0.01f),
-                        linear: true);
-                    writtenChannels++;
+                    var translation = BuildTranslationKeyMap(track, node, animation.FramesPerSecond);
+                    if (translation.Keys.Count > 0)
+                    {
+                        gltfAnimation.CreateTranslationChannel(node, translation.Keys, linear: true);
+                        writtenChannels++;
+                    }
+
+                    if (translation.Retargeted)
+                        retargetedTranslationTracks++;
+                    if (translation.SkippedStatic)
+                        skippedStaticTranslationTracks++;
                 }
 
                 if (track.Rotations.Count > 0)
@@ -79,8 +87,9 @@ internal static class UEAnimationPreviewBuilder
             }
 
             model.SaveGLB(outputPath, new WriteSettings());
+            var heavyTranslationRetarget = matchedTracks > 0 && retargetedTranslationTracks > matchedTracks * 0.5f;
             var status = matchedTracks > 0 && writtenChannels > 0 && File.Exists(outputPath)
-                ? missingBones.Count == 0 ? "ok" : "warning"
+                ? missingBones.Count == 0 && !heavyTranslationRetarget ? "ok" : "warning"
                 : "error";
             WriteReport(reportPath, new
             {
@@ -99,11 +108,14 @@ internal static class UEAnimationPreviewBuilder
                 matchedTracks,
                 missingTrackCount = missingBones.Count,
                 writtenChannels,
+                retargetedTranslationTracks,
+                skippedStaticTranslationTracks,
+                heavyTranslationRetarget,
                 missingBones = missingBones.Take(64).ToArray(),
             });
 
             Console.WriteLine($"=> {outputPath}");
-            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}");
+            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}");
             return status == "error" ? 2 : 0;
         }
         catch (Exception ex)
@@ -128,6 +140,41 @@ internal static class UEAnimationPreviewBuilder
     private static Quaternion SwapYZ(Quaternion value)
         => Quaternion.Normalize(new Quaternion(value.X, value.Z, value.Y, value.W));
 
+    private static TranslationKeyMap BuildTranslationKeyMap(UEAnimTrack track, Node node, float framesPerSecond)
+    {
+        var directKeys = BuildKeyMap(track.Positions, framesPerSecond, x => SwapYZ(x) * 0.01f);
+        if (directKeys.Count == 0)
+            return new TranslationKeyMap(directKeys, Retargeted: false, SkippedStatic: false);
+
+        var first = directKeys
+            .OrderBy(x => x.Key)
+            .First()
+            .Value;
+        var rest = node.LocalTransform.Translation;
+        if (IsTranslationCompatibleWithRest(first, rest))
+            return new TranslationKeyMap(directKeys, Retargeted: false, SkippedStatic: false);
+
+        if (directKeys.Count == 1)
+            return new TranslationKeyMap([], Retargeted: true, SkippedStatic: true);
+
+        // UE 同 Skeleton 可以被不同体型复用。动画 position 第一帧常带源体型骨长，
+        // 直接写入 glTF 会覆盖目标模型 rest pose，导致骨骼散开。
+        // 这里保留动作位移变化量，但用目标模型自己的 rest translation 作为基准。
+        var retargetedKeys = directKeys.ToDictionary(
+            x => x.Key,
+            x => rest + (x.Value - first));
+        return new TranslationKeyMap(retargetedKeys, Retargeted: true, SkippedStatic: false);
+    }
+
+    private static bool IsTranslationCompatibleWithRest(Vector3 first, Vector3 rest)
+    {
+        var distance = Vector3.Distance(first, rest);
+        var restLength = rest.Length();
+        var firstLength = first.Length();
+        var lengthBase = MathF.Max(MathF.Max(restLength, firstLength), 0.01f);
+        return distance <= MathF.Max(0.05f, lengthBase * 0.35f);
+    }
+
     private static Dictionary<float, TOut> BuildKeyMap<TIn, TOut>(
         IEnumerable<UEAnimKey<TIn>> keys,
         float framesPerSecond,
@@ -150,3 +197,8 @@ internal static class UEAnimationPreviewBuilder
     }
 
 }
+
+internal readonly record struct TranslationKeyMap(
+    Dictionary<float, Vector3> Keys,
+    bool Retargeted,
+    bool SkippedStatic);

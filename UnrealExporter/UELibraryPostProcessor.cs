@@ -4009,7 +4009,7 @@ internal static class UELibraryPostProcessor
                 {
                     animationsByOutput.TryGetValue(NormalizeCatalogOutput(validation.AnimationOutput), out var animation);
                     var exportStatus = (string?)animation?["status"];
-                    var isUsableCandidate = IsUsableAnimationCandidate(exportStatus, validation.Status);
+                    var isUsableCandidate = IsUsableAnimationCandidate(exportStatus, validation.Status, validation.CandidateReason);
                     return new
                     {
                         name = animation?["name"] ?? validation.AnimationName,
@@ -4046,7 +4046,7 @@ internal static class UELibraryPostProcessor
                     ? "ExplicitComponent"
                     : relationAnimations.Any(x => string.Equals(x.relationSource, "uniqueSkeleton", StringComparison.OrdinalIgnoreCase))
                         ? "UniqueSkeleton"
-                        : "SharedSkeletonCompatible";
+                        : "RelatedButNotUsable";
 
             relations.Add(JObject.FromObject(new
             {
@@ -4065,7 +4065,7 @@ internal static class UELibraryPostProcessor
         var summary = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "默认输出显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 可复用动画；不按目录名、角色名或文件名前缀硬猜。",
+            ["rule"] = "默认可用动画只来自显式组件关系和唯一 Skeleton 关系；共享 Skeleton 仅作为诊断/人工预览候选，不按目录名、角色名或文件名前缀硬猜。",
             ["totals"] = JObject.FromObject(new
             {
                 models = models.Length,
@@ -4082,10 +4082,13 @@ internal static class UELibraryPostProcessor
         return summary;
     }
 
-    private static bool IsUsableAnimationCandidate(string? exportStatus, string validationStatus)
+    private static bool IsUsableAnimationCandidate(string? exportStatus, string validationStatus, string? candidateReason)
     {
         if (!string.IsNullOrWhiteSpace(exportStatus) &&
             !string.Equals(exportStatus, "ok", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (string.Equals(candidateReason, "sharedSkeleton", StringComparison.OrdinalIgnoreCase))
             return false;
 
         return !string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase);
@@ -4099,7 +4102,8 @@ internal static class UELibraryPostProcessor
 
         return IsUsableAnimationCandidate(
             (string?)animation["status"],
-            (string?)animation["validationStatus"] ?? "");
+            (string?)animation["validationStatus"] ?? "",
+            (string?)animation["relationSource"]);
     }
 
     private static int CountReferencedAnimations(JArray? segments)
