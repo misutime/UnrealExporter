@@ -3105,7 +3105,8 @@ internal static class UELibraryPostProcessor
         var normalized = boneName.Replace("_", "", StringComparison.Ordinal)
             .Replace("-", "", StringComparison.Ordinal)
             .Replace(" ", "", StringComparison.Ordinal);
-        return normalized.Contains("hair", StringComparison.OrdinalIgnoreCase)
+        return normalized.EndsWith("nub", StringComparison.OrdinalIgnoreCase)
+               || normalized.Contains("hair", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("cloth", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("cape", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("skirt", StringComparison.OrdinalIgnoreCase)
