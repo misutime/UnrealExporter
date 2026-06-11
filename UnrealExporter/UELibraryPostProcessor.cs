@@ -3384,11 +3384,14 @@ internal static class UELibraryPostProcessor
         {
             if (trackCoverage >= 0.9
                 || (matchedTrackBones > 0 && missingTrackBones.Length <= 2)
-                || (trackCoverage >= 0.8 && IsOnlyAuxiliaryMissingTrackBones(missingTrackBones)))
+                || (trackCoverage >= 0.8 && IsOnlyAuxiliaryMissingTrackBones(missingTrackBones))
+                || (trackCoverage >= 0.85 && IsOnlyFaceExpressionMissingTrackBones(missingTrackBones)))
             {
                 status = "warning";
                 validationCategory = "partialTrackCoverage";
-                reason = "动画主体骨骼覆盖较高，但部分辅助骨骼 track 缺失，需要预览复核。";
+                reason = trackCoverage >= 0.85 && IsOnlyFaceExpressionMissingTrackBones(missingTrackBones)
+                    ? "动画主体骨骼覆盖较高，但部分脸部/表情骨骼 track 缺失；可做身体动作预览，表情需要复核。"
+                    : "动画主体骨骼覆盖较高，但部分辅助骨骼 track 缺失，需要预览复核。";
             }
             else
             {
@@ -3506,11 +3509,45 @@ internal static class UELibraryPostProcessor
         return missingTrackBones.All(IsAuxiliaryAnimationBoneName);
     }
 
+    private static bool IsOnlyFaceExpressionMissingTrackBones(string[] missingTrackBones)
+    {
+        if (missingTrackBones.Length == 0)
+            return false;
+
+        var hasSpecificFaceBone = false;
+        foreach (var boneName in missingTrackBones)
+        {
+            var normalized = NormalizeBoneNameForSemanticCheck(boneName);
+            var isSpecificFaceBone =
+                normalized.Contains("lip", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("brow", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("lid", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("eye", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("jaw", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("mouth", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("teeth", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("face", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("cheek", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("nose", StringComparison.OrdinalIgnoreCase);
+            if (isSpecificFaceBone)
+            {
+                hasSpecificFaceBone = true;
+                continue;
+            }
+
+            // head 只有和明确脸部/表情骨骼一起缺失时，才视为表情预览不完整，而不是整体骨架不匹配。
+            if (normalized.Contains("head", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            return false;
+        }
+
+        return hasSpecificFaceBone;
+    }
+
     private static bool IsAuxiliaryAnimationBoneName(string boneName)
     {
-        var normalized = boneName.Replace("_", "", StringComparison.Ordinal)
-            .Replace("-", "", StringComparison.Ordinal)
-            .Replace(" ", "", StringComparison.Ordinal);
+        var normalized = NormalizeBoneNameForSemanticCheck(boneName);
         return normalized.EndsWith("nub", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("hair", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("cloth", StringComparison.OrdinalIgnoreCase)
@@ -3532,6 +3569,12 @@ internal static class UELibraryPostProcessor
                || normalized.Contains("pendant", StringComparison.OrdinalIgnoreCase)
                || normalized.Contains("piaodai", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static string NormalizeBoneNameForSemanticCheck(string boneName)
+        => (boneName ?? "")
+            .Replace("_", "", StringComparison.Ordinal)
+            .Replace("-", "", StringComparison.Ordinal)
+            .Replace(" ", "", StringComparison.Ordinal);
 
     private static bool IsContainerAnimation(JObject animation)
         => animation["segments"] is JArray segments && segments.Count > 0
