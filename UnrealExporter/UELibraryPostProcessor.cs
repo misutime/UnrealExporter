@@ -2357,8 +2357,9 @@ internal static class UELibraryPostProcessor
         var result = new List<AnimationValidationEntry>();
         var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
         var animationTrackCache = new Dictionary<string, SourceAnimationTrack[]>(StringComparer.OrdinalIgnoreCase);
+        var skeletonLookupCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
         foreach (var candidate in candidates)
-            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache));
+            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache, skeletonLookupCache));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
@@ -2513,7 +2514,8 @@ internal static class UELibraryPostProcessor
         SourceIndexSnapshot sourceIndex,
         string candidateReason = "",
         Dictionary<string, ModelBoneLookup>? modelBoneCache = null,
-        Dictionary<string, SourceAnimationTrack[]>? animationTrackCache = null)
+        Dictionary<string, SourceAnimationTrack[]>? animationTrackCache = null,
+        Dictionary<string, ModelBoneLookup>? skeletonLookupCache = null)
     {
         var skeletonPath = (string?)model["skeletonPath"];
         var modelKey = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
@@ -2535,7 +2537,7 @@ internal static class UELibraryPostProcessor
         var namedTrackCount = animationTracks.Count(x => !string.IsNullOrWhiteSpace(x.BoneName));
         var matchedTrackBones = Math.Max(0, namedTrackCount - missingTrackBones.Length);
         var trackCoverage = namedTrackCount == 0 ? 0 : Math.Round((double)matchedTrackBones / namedTrackCount, 4);
-        var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex);
+        var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex, skeletonPath, skeletonLookupCache);
         var isContainerAnimation = IsContainerAnimation(animation);
         var referencedAnimations = BuildReferencedAnimationPaths(animation);
         var exportedReferencedAnimations = FindExportedReferencedAnimations(referencedAnimations, allAnimations);
@@ -2672,6 +2674,31 @@ internal static class UELibraryPostProcessor
         }
 
         return tracks;
+    }
+
+    private static ModelBoneLookup GetOrBuildSkeletonLookup(
+        SourceIndexSnapshot sourceIndex,
+        string skeletonPath,
+        Dictionary<string, ModelBoneLookup>? cache)
+    {
+        if (cache == null)
+            return BuildSkeletonLookup(sourceIndex, skeletonPath);
+
+        if (!cache.TryGetValue(skeletonPath, out var lookup))
+        {
+            lookup = BuildSkeletonLookup(sourceIndex, skeletonPath);
+            cache[skeletonPath] = lookup;
+        }
+
+        return lookup;
+    }
+
+    private static ModelBoneLookup BuildSkeletonLookup(SourceIndexSnapshot sourceIndex, string skeletonPath)
+    {
+        if (!sourceIndex.BonesBySkeleton.TryGetValue(skeletonPath, out var skeletonBones))
+            return new ModelBoneLookup([]);
+
+        return new ModelBoneLookup(PickSingleBoneOwner(skeletonBones, "Skeleton") ?? PickSingleBoneOwner(skeletonBones, null) ?? []);
     }
 
     private static bool IsOnlyAuxiliaryMissingTrackBones(string[] missingTrackBones)
@@ -2822,16 +2849,23 @@ internal static class UELibraryPostProcessor
     private static string[] CompareHierarchy(
         ModelBoneLookup modelBones,
         SourceAnimationTrack[] animationTracks,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        string? skeletonPath,
+        Dictionary<string, ModelBoneLookup>? skeletonLookupCache)
     {
         if (modelBones.Bones.Length == 0 || animationTracks.Length == 0)
             return [];
 
-        var skeletonPath = animationTracks.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.SkeletonPath))?.SkeletonPath;
-        if (string.IsNullOrWhiteSpace(skeletonPath) || !sourceIndex.BonesBySkeleton.TryGetValue(skeletonPath, out var skeletonBones))
+        skeletonPath = !string.IsNullOrWhiteSpace(skeletonPath)
+            ? skeletonPath
+            : animationTracks.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.SkeletonPath))?.SkeletonPath;
+        if (string.IsNullOrWhiteSpace(skeletonPath))
             return [];
 
-        var skeletonLookup = new ModelBoneLookup(PickSingleBoneOwner(skeletonBones, "Skeleton") ?? PickSingleBoneOwner(skeletonBones, null) ?? []);
+        var skeletonLookup = GetOrBuildSkeletonLookup(sourceIndex, skeletonPath, skeletonLookupCache);
+        if (skeletonLookup.Bones.Length == 0)
+            return [];
+
         var mismatches = new List<string>();
         foreach (var track in animationTracks)
         {
