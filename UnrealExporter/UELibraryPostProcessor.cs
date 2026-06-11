@@ -1037,6 +1037,7 @@ internal static class UELibraryPostProcessor
             snapshot.SegmentsByAnimation = LoadSegmentsByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
             snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
+            snapshot.UnsupportedAnimationObjectPaths = LoadUnsupportedAnimationObjectPaths(connection);
             snapshot.PackageObjectMapCount = CountTableRows(connection, "package_object_maps");
             snapshot.PackageObjectMaps = [];
         }
@@ -1262,6 +1263,43 @@ internal static class UELibraryPostProcessor
         }
 
         return result.ToArray();
+    }
+
+    private static HashSet<string> LoadUnsupportedAnimationObjectPaths(SqliteConnection connection)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!TableExists(connection, "source_objects"))
+            return result;
+
+        var hasObjectType = TableColumnExists(connection, "source_objects", "object_type");
+        var hasExportType = TableColumnExists(connection, "source_objects", "export_type");
+        if (!hasObjectType && !hasExportType)
+            return result;
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT object_path, object_type, export_type, name
+            FROM source_objects
+            WHERE object_path IS NOT NULL
+              AND (
+                    object_type LIKE '%BlendSpace%' OR export_type LIKE '%BlendSpace%'
+                 OR object_type LIKE '%AimOffset%' OR export_type LIKE '%AimOffset%'
+                 OR object_type LIKE '%AnimBlueprint%' OR export_type LIKE '%AnimBlueprint%'
+              );
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var objectPath = GetString(reader, 0);
+            if (string.IsNullOrWhiteSpace(objectPath))
+                continue;
+
+            var typeText = $"{GetString(reader, 1)} {GetString(reader, 2)} {GetString(reader, 3)} {objectPath}";
+            if (IsUnsupportedAnimationTypeText(typeText))
+                result.Add(objectPath);
+        }
+
+        return result;
     }
 
     private static SourcePackageObjectMap[] LoadSourcePackageObjectMaps(SqliteConnection connection)
@@ -1751,7 +1789,7 @@ internal static class UELibraryPostProcessor
         foreach (var relation in sourceIndex.ComponentAssetRelations)
         {
             var matched = FindExportedAssetForTarget(relation, assetLookup);
-            var matchStatus = BuildComponentRelationMatchStatus(relation, matched, assetLookup, packageObjectsByPath);
+            var matchStatus = BuildComponentRelationMatchStatus(relation, matched, assetLookup, packageObjectsByPath, sourceIndex);
             var matchReason = BuildComponentRelationMatchReason(relation, matched, matchStatus);
             result.Add(new ComponentAssetRelationLink
             {
@@ -1839,7 +1877,8 @@ internal static class UELibraryPostProcessor
         SourceComponentAssetRelation relation,
         JObject? matched,
         ExportedAssetLookup assetLookup,
-        Dictionary<string, SourcePackageObjectMap> packageObjectsByPath)
+        Dictionary<string, SourcePackageObjectMap> packageObjectsByPath,
+        SourceIndexSnapshot sourceIndex)
     {
         if (matched != null)
             return "matched";
@@ -1855,7 +1894,8 @@ internal static class UELibraryPostProcessor
         if (IsClassReferenceRelation(relation.RelationType))
             return "classReference";
 
-        if (IsUnsupportedAnimationAsset(relation, packageObjectsByPath))
+        if (IsUnsupportedAnimationAsset(relation, sourceIndex) ||
+            IsUnsupportedAnimationAsset(relation, packageObjectsByPath))
             return "unsupportedAnimationAsset";
 
         return "missingExportedAsset";
@@ -1906,12 +1946,31 @@ internal static class UELibraryPostProcessor
             string.IsNullOrWhiteSpace(relation.TargetPath))
             return false;
 
+        if (packageObjectsByPath.Count == 0)
+            return false;
+
         packageObjectsByPath.TryGetValue(relation.TargetPath, out var target);
         var typeText = $"{target?.ClassName} {target?.ClassPath} {target?.ObjectName} {relation.TargetName} {relation.TargetPath}";
-        return typeText.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase)
-               || typeText.Contains("AimOffset", StringComparison.OrdinalIgnoreCase)
-               || typeText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase);
+        return IsUnsupportedAnimationTypeText(typeText);
     }
+
+    private static bool IsUnsupportedAnimationAsset(SourceComponentAssetRelation relation, SourceIndexSnapshot sourceIndex)
+    {
+        if (!relation.RelationType.Equals("Animation", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(relation.TargetPath))
+            return false;
+
+        if (sourceIndex.UnsupportedAnimationObjectPaths.Contains(relation.TargetPath))
+            return true;
+
+        var typeText = $"{relation.TargetName} {relation.TargetPath}";
+        return IsUnsupportedAnimationTypeText(typeText);
+    }
+
+    private static bool IsUnsupportedAnimationTypeText(string typeText)
+        => typeText.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase)
+           || typeText.Contains("AimOffset", StringComparison.OrdinalIgnoreCase)
+           || typeText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase);
 
     private static JObject? FindExportedAssetForTarget(
         SourceComponentAssetRelation relation,
@@ -6518,6 +6577,7 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceAnimationSegment[]> SegmentsByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
+        public HashSet<string> UnsupportedAnimationObjectPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
         public int PackageObjectMapCount { get; set; }
     }
