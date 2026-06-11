@@ -3015,8 +3015,9 @@ internal static class UELibraryPostProcessor
         var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
         var animationTrackCache = new Dictionary<string, SourceAnimationTrack[]>(StringComparer.OrdinalIgnoreCase);
         var skeletonLookupCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
+        var exportedAnimationLookup = BuildExportedAnimationReferenceLookup(allAnimations);
         foreach (var candidate in candidates)
-            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, allAnimations, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache, skeletonLookupCache));
+            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, exportedAnimationLookup, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache, skeletonLookupCache));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
@@ -3306,7 +3307,7 @@ internal static class UELibraryPostProcessor
         string root,
         JObject model,
         JObject animation,
-        JObject[] allAnimations,
+        HashSet<string> exportedAnimationLookup,
         SourceIndexSnapshot sourceIndex,
         string candidateReason = "",
         Dictionary<string, ModelBoneLookup>? modelBoneCache = null,
@@ -3336,7 +3337,7 @@ internal static class UELibraryPostProcessor
         var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex, skeletonPath, skeletonLookupCache);
         var isContainerAnimation = IsContainerAnimation(animation);
         var referencedAnimations = BuildReferencedAnimationPaths(animation);
-        var exportedReferencedAnimations = FindExportedReferencedAnimations(referencedAnimations, allAnimations);
+        var exportedReferencedAnimations = FindExportedReferencedAnimations(referencedAnimations, exportedAnimationLookup);
         var missingReferencedAnimations = referencedAnimations
             .Where(x => !exportedReferencedAnimations.Contains(x, StringComparer.OrdinalIgnoreCase))
             .ToArray();
@@ -3591,7 +3592,39 @@ internal static class UELibraryPostProcessor
             .ToArray();
     }
 
-    private static string[] FindExportedReferencedAnimations(string[] referencedAnimations, JObject[] allAnimations)
+    private static HashSet<string> BuildExportedAnimationReferenceLookup(JObject[] allAnimations)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var animation in allAnimations)
+        {
+            AddAnimationReferenceKeys(result, (string?)animation["objectPath"]);
+            AddAnimationReferenceKeys(result, (string?)animation["source"]);
+            AddAnimationReferenceKeys(result, (string?)animation["output"]);
+        }
+
+        return result;
+    }
+
+    private static void AddAnimationReferenceKeys(HashSet<string> result, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return;
+
+        var normalized = value.Replace('\\', '/');
+        result.Add(normalized);
+        result.Add(NormalizePackageObjectPath(normalized));
+
+        var extension = Path.GetExtension(normalized);
+        if (!string.IsNullOrWhiteSpace(extension))
+            normalized = normalized[..^extension.Length];
+
+        result.Add(normalized);
+        var contentIndex = normalized.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+        if (contentIndex >= 0)
+            result.Add(normalized[(contentIndex + 1)..]);
+    }
+
+    private static string[] FindExportedReferencedAnimations(string[] referencedAnimations, HashSet<string> exportedAnimationLookup)
     {
         if (referencedAnimations.Length == 0)
             return [];
@@ -3599,15 +3632,29 @@ internal static class UELibraryPostProcessor
         var result = new List<string>();
         foreach (var referenced in referencedAnimations)
         {
-            var matched = allAnimations.Any(animation =>
-                string.Equals((string?)animation["objectPath"], referenced, StringComparison.OrdinalIgnoreCase) ||
-                AnimationSourceMatchesReference((string?)animation["source"], referenced) ||
-                AnimationSourceMatchesReference((string?)animation["output"], referenced));
-            if (matched)
+            if (IsReferencedAnimationExported(referenced, exportedAnimationLookup))
                 result.Add(referenced);
         }
 
         return result.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static bool IsReferencedAnimationExported(string referencedObjectPath, HashSet<string> exportedAnimationLookup)
+    {
+        if (exportedAnimationLookup.Contains(referencedObjectPath))
+            return true;
+
+        var normalized = NormalizePackageObjectPath(referencedObjectPath);
+        if (exportedAnimationLookup.Contains(normalized))
+            return true;
+
+        var packageSuffix = BuildPackageSuffix(referencedObjectPath);
+        if (string.IsNullOrWhiteSpace(packageSuffix))
+            return false;
+
+        var suffix = packageSuffix.TrimStart('/');
+        return exportedAnimationLookup.Contains(packageSuffix)
+               || exportedAnimationLookup.Contains(suffix);
     }
 
     private static bool AnimationSourceMatchesReference(string? sourceOrOutput, string referencedObjectPath)
@@ -3736,7 +3783,54 @@ internal static class UELibraryPostProcessor
         if (!string.IsNullOrWhiteSpace(objectPath) && sourceIndex.TracksByAnimation.TryGetValue(objectPath, out var byObjectPath))
             return byObjectPath;
 
+        var segmentTracks = FindContainerSegmentTracks(animation, sourceIndex);
+        if (segmentTracks.Length > 0)
+            return segmentTracks;
+
         return ReadExportedUEAnimTracks(root, animation);
+    }
+
+    private static SourceAnimationTrack[] FindContainerSegmentTracks(JObject animation, SourceIndexSnapshot sourceIndex)
+    {
+        var objectPath = (string?)animation["objectPath"];
+        if (string.IsNullOrWhiteSpace(objectPath))
+            return [];
+
+        if (!sourceIndex.SegmentsByAnimation.TryGetValue(NormalizePackageObjectPath(objectPath), out var segments) || segments.Length == 0)
+            return [];
+
+        var result = new List<SourceAnimationTrack>();
+        foreach (var segment in segments.OrderBy(x => x.SegmentIndex))
+        {
+            if (string.IsNullOrWhiteSpace(segment.ReferencedAnimationPath))
+                continue;
+
+            if (!sourceIndex.TracksByAnimation.TryGetValue(segment.ReferencedAnimationPath, out var tracks) || tracks.Length == 0)
+                continue;
+
+            // Montage/Composite 是容器资产，真正能证明骨骼覆盖的是它引用的子动画 track。
+            // 导出的容器 .ueanim 可能包含 ref pose 或合并轨道，不能优先拿来判定模型缺骨骼。
+            foreach (var track in tracks)
+            {
+                result.Add(new SourceAnimationTrack
+                {
+                    SourcePath = track.SourcePath,
+                    AnimationObjectPath = objectPath,
+                    SkeletonPath = track.SkeletonPath ?? segment.SkeletonPath,
+                    TrackIndex = result.Count,
+                    BoneIndex = track.BoneIndex,
+                    BoneName = track.BoneName,
+                    FromExportedUEAnim = false,
+                });
+            }
+        }
+
+        return result
+            .Where(x => !string.IsNullOrWhiteSpace(x.BoneName))
+            .GroupBy(x => x.BoneName!, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.First())
+            .OrderBy(x => x.TrackIndex)
+            .ToArray();
     }
 
     private static SourceAnimationTrack[] ReadExportedUEAnimTracks(string root, JObject animation)
