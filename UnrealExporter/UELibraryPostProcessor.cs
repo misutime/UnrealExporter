@@ -3674,17 +3674,35 @@ internal static class UELibraryPostProcessor
     private static Dictionary<string, int> BuildSourceIndexObjectCounts(JObject[] modelRows, SourceIndexSnapshot sourceIndex)
     {
         var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        if (!sourceIndex.Available || sourceIndex.PackageObjectMaps.Length == 0)
+        if (!sourceIndex.Available)
             return result;
 
-        var byObjectPath = sourceIndex.PackageObjectMaps
-            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
-            .GroupBy(x => NormalizePackageObjectPath(x.ObjectPath!), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
-        var bySourcePath = sourceIndex.PackageObjectMaps
-            .Where(x => !string.IsNullOrWhiteSpace(x.SourcePath))
-            .GroupBy(x => NormalizeCatalogOutput(x.SourcePath), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+        var sourcePaths = modelRows
+            .Select(x => NormalizeCatalogOutput((string?)x["source"]))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var objectPaths = modelRows
+            .Select(x => NormalizeOptionalPackageObjectPath((string?)x["objectPath"]))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var bySourcePath = QuerySourceObjectCounts(sourceIndex.Path, "source_path", sourcePaths, NormalizeCatalogOutput);
+        var byObjectPath = QuerySourceObjectCounts(sourceIndex.Path, "object_path", objectPaths, NormalizeOptionalPackageObjectPath);
+
+        // 兼容极旧的源索引：没有 source_objects 时才退回 package_object_maps。
+        if (bySourcePath.Count == 0 && byObjectPath.Count == 0 && sourceIndex.PackageObjectMaps.Length > 0)
+        {
+            byObjectPath = sourceIndex.PackageObjectMaps
+                .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+                .GroupBy(x => NormalizePackageObjectPath(x.ObjectPath!), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+            bySourcePath = sourceIndex.PackageObjectMaps
+                .Where(x => !string.IsNullOrWhiteSpace(x.SourcePath))
+                .GroupBy(x => NormalizeCatalogOutput(x.SourcePath), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+        }
 
         foreach (var model in modelRows)
         {
@@ -3709,6 +3727,62 @@ internal static class UELibraryPostProcessor
 
             if (count > 0)
                 result[output] = count;
+        }
+
+        return result;
+    }
+
+    private static string NormalizeOptionalPackageObjectPath(string? objectPath)
+        => string.IsNullOrWhiteSpace(objectPath) ? "" : NormalizePackageObjectPath(objectPath);
+
+    private static Dictionary<string, int> QuerySourceObjectCounts(
+        string dbPath,
+        string columnName,
+        string[] values,
+        Func<string?, string> normalize)
+    {
+        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(dbPath) || values.Length == 0 || !File.Exists(dbPath))
+            return result;
+
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            if (!TableExists(connection, "source_objects") || !TableColumnExists(connection, "source_objects", columnName))
+                return result;
+
+            foreach (var batch in values.Chunk(480))
+            {
+                using var command = connection.CreateCommand();
+                var parameterNames = new List<string>();
+                for (var i = 0; i < batch.Length; i++)
+                {
+                    var name = $"$p{i}";
+                    parameterNames.Add(name);
+                    command.Parameters.AddWithValue(name, batch[i]);
+                }
+
+                command.CommandText = $"""
+                    SELECT {columnName}, COUNT(*)
+                    FROM source_objects
+                    WHERE {columnName} IN ({string.Join(", ", parameterNames)})
+                    GROUP BY {columnName};
+                    """;
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var key = normalize(GetString(reader, 0));
+                    if (string.IsNullOrWhiteSpace(key))
+                        continue;
+
+                    result[key] = reader.GetInt32(1);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARN: source object count query failed ({columnName}): {ex.Message}");
         }
 
         return result;
