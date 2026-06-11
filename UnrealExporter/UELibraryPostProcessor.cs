@@ -45,13 +45,22 @@ internal static class UELibraryPostProcessor
 
         RunStage("验证模型并写模型说明", () =>
         {
+            var materialIndexSignature = BuildMaterialIndexSignature(root, materialIndex.Values);
+            var cacheHits = 0;
+            var cacheMisses = 0;
             foreach (var glbPath in modelFiles)
             {
-                var report = InspectModel(root, glbPath, materialIndex);
+                var report = InspectModel(root, glbPath, materialIndex, materialIndexSignature, out var fromCache);
+                if (fromCache)
+                    cacheHits++;
+                else
+                    cacheMisses++;
                 reports.Add(report);
                 catalogRows.Add(BuildModelCatalogRow(report));
                 WriteAssetReadme(root, report);
             }
+
+            Console.WriteLine($"UE model validation cache: hits={cacheHits}, misses={cacheMisses}");
         });
 
         foreach (var material in materialIndex.Values.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
@@ -349,7 +358,8 @@ internal static class UELibraryPostProcessor
         if (relative.StartsWith(".as_browser_cache/", StringComparison.OrdinalIgnoreCase)
             || relative.StartsWith(".animestudio_browser/", StringComparison.OrdinalIgnoreCase)
             || relative.StartsWith("Textures/_Shared/", StringComparison.OrdinalIgnoreCase)
-            || relative.StartsWith("Textures/.Shared/", StringComparison.OrdinalIgnoreCase))
+            || relative.StartsWith("Textures/.Shared/", StringComparison.OrdinalIgnoreCase)
+            || relative.EndsWith(".ue_model_validation_cache.json", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -399,8 +409,17 @@ internal static class UELibraryPostProcessor
     private static ModelValidationEntry InspectModel(
         string root,
         string glbPath,
-        Dictionary<string, MaterialInfo> materialIndex)
+        Dictionary<string, MaterialInfo> materialIndex,
+        string materialIndexSignature,
+        out bool fromCache)
     {
+        if (TryLoadModelValidationCache(root, glbPath, materialIndexSignature, out var cached))
+        {
+            fromCache = true;
+            return cached;
+        }
+
+        fromCache = false;
         var notes = new List<string>();
         JObject gltf;
         byte[] binData;
@@ -410,7 +429,7 @@ internal static class UELibraryPostProcessor
         }
         catch (Exception ex)
         {
-            return new ModelValidationEntry
+            var errorReport = new ModelValidationEntry
             {
                 Status = "error",
                 Path = glbPath,
@@ -418,6 +437,8 @@ internal static class UELibraryPostProcessor
                 Name = Path.GetFileNameWithoutExtension(glbPath),
                 Notes = [$"glTF parse failed: {ex.Message}"],
             };
+            WriteModelValidationCache(root, glbPath, materialIndexSignature, errorReport);
+            return errorReport;
         }
 
         var nodes = ArrayOf(gltf, "nodes");
@@ -460,7 +481,7 @@ internal static class UELibraryPostProcessor
         if (bbox == null)
             notes.Add("POSITION accessor bounds were not available.");
 
-        return new ModelValidationEntry
+        var report = new ModelValidationEntry
         {
             Status = notes.Count == 0 ? "ok" : "warning",
             Path = glbPath,
@@ -483,7 +504,147 @@ internal static class UELibraryPostProcessor
             BBox = bbox,
             Notes = notes.ToArray(),
         };
+        WriteModelValidationCache(root, glbPath, materialIndexSignature, report);
+        return report;
     }
+
+    private static string BuildMaterialIndexSignature(string root, IEnumerable<MaterialInfo> materials)
+    {
+        var parts = materials
+            .OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .Select(x =>
+            {
+                var info = new FileInfo(x.Path);
+                return $"{x.RelativePath}|{info.Length}|{info.LastWriteTimeUtc.Ticks}";
+            });
+        return ComputeHash(string.Join('\n', parts));
+    }
+
+    private static bool TryLoadModelValidationCache(
+        string root,
+        string glbPath,
+        string materialIndexSignature,
+        out ModelValidationEntry report)
+    {
+        report = null!;
+        var path = BuildModelValidationCachePath(glbPath);
+        if (!File.Exists(path))
+            return false;
+
+        try
+        {
+            var modelInfo = new FileInfo(glbPath);
+            var json = JObject.Parse(File.ReadAllText(path));
+            if ((int?)json["cacheVersion"] != 1 ||
+                !string.Equals((string?)json["materialIndexSignature"], materialIndexSignature, StringComparison.Ordinal) ||
+                (long?)json["modelSizeBytes"] != modelInfo.Length ||
+                (long?)json["modelLastWriteUtcTicks"] != modelInfo.LastWriteTimeUtc.Ticks)
+            {
+                return false;
+            }
+
+            var data = json["report"] as JObject;
+            if (data == null)
+                return false;
+
+            report = ReadModelValidationCacheReport(root, glbPath, data);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void WriteModelValidationCache(
+        string root,
+        string glbPath,
+        string materialIndexSignature,
+        ModelValidationEntry report)
+    {
+        try
+        {
+            var modelInfo = new FileInfo(glbPath);
+            var json = new JObject
+            {
+                ["cacheVersion"] = 1,
+                ["modelSizeBytes"] = modelInfo.Length,
+                ["modelLastWriteUtcTicks"] = modelInfo.LastWriteTimeUtc.Ticks,
+                ["materialIndexSignature"] = materialIndexSignature,
+                ["report"] = BuildModelValidationCacheReport(report),
+            };
+            File.WriteAllText(BuildModelValidationCachePath(glbPath), json.ToString(Formatting.None), Encoding.UTF8);
+        }
+        catch
+        {
+            // 缓存只用于加速，写失败不能影响素材库后处理。
+        }
+    }
+
+    private static string BuildModelValidationCachePath(string glbPath)
+        => glbPath + ".ue_model_validation_cache.json";
+
+    private static JObject BuildModelValidationCacheReport(ModelValidationEntry report)
+    {
+        return JObject.FromObject(new
+        {
+            report.Status,
+            report.RelativePath,
+            report.Name,
+            report.ResourceKind,
+            report.NodeCount,
+            report.MeshCount,
+            report.SkinCount,
+            report.MaterialCount,
+            report.ImageCount,
+            report.EmbeddedImageCount,
+            report.AnimationCount,
+            report.BoneCount,
+            report.BoneNames,
+            report.SkeletonHash,
+            report.MaterialNames,
+            report.MatchedMaterialSidecars,
+            report.MissingMaterialSidecars,
+            report.ExternalMaterialNames,
+            report.ExternalMaterialTextureCount,
+            report.BBox,
+            report.Notes,
+        });
+    }
+
+    private static ModelValidationEntry ReadModelValidationCacheReport(string root, string glbPath, JObject data)
+    {
+        return new ModelValidationEntry
+        {
+            Status = (string?)data["Status"] ?? (string?)data["status"] ?? "unknown",
+            Path = glbPath,
+            RelativePath = (string?)data["RelativePath"] ?? MakeRelative(root, glbPath),
+            Name = (string?)data["Name"] ?? Path.GetFileNameWithoutExtension(glbPath),
+            ResourceKind = (string?)data["ResourceKind"] ?? "Unknown",
+            NodeCount = (int?)data["NodeCount"] ?? 0,
+            MeshCount = (int?)data["MeshCount"] ?? 0,
+            SkinCount = (int?)data["SkinCount"] ?? 0,
+            MaterialCount = (int?)data["MaterialCount"] ?? 0,
+            ImageCount = (int?)data["ImageCount"] ?? 0,
+            EmbeddedImageCount = (int?)data["EmbeddedImageCount"] ?? 0,
+            AnimationCount = (int?)data["AnimationCount"] ?? 0,
+            BoneCount = (int?)data["BoneCount"] ?? 0,
+            BoneNames = ReadStringArray(data, "BoneNames"),
+            SkeletonHash = (string?)data["SkeletonHash"],
+            MaterialNames = ReadStringArray(data, "MaterialNames"),
+            MatchedMaterialSidecars = ReadStringArray(data, "MatchedMaterialSidecars"),
+            MissingMaterialSidecars = ReadStringArray(data, "MissingMaterialSidecars"),
+            ExternalMaterialNames = ReadStringArray(data, "ExternalMaterialNames"),
+            ExternalMaterialTextureCount = (int?)data["ExternalMaterialTextureCount"] ?? 0,
+            BBox = data["BBox"]?.DeepClone(),
+            Notes = ReadStringArray(data, "Notes"),
+        };
+    }
+
+    private static string[] ReadStringArray(JObject data, string propertyName)
+        => data[propertyName] is JArray array
+            ? array.Select(x => (string?)x).Where(x => !string.IsNullOrWhiteSpace(x)).Cast<string>().ToArray()
+            : [];
 
     private static (JObject Gltf, byte[] BinData) ReadGlb(string path)
     {
