@@ -19,6 +19,7 @@ using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.IO.Objects;
 using CUE4Parse.UE4.Objects.Engine;
+using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.UObject;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
@@ -884,6 +885,9 @@ internal static class UESourceIndexBuilder
 
         if (obj is UAnimComposite composite)
             InsertCompositeSegments(connection, transaction, file.Path, composite, skeletonPath);
+
+        if (obj is UBlendSpaceBase blendSpace)
+            InsertBlendSpaceSamples(connection, transaction, file.Path, blendSpace, skeletonPath);
 
         if (sequenceBase != null)
             InsertAnimationNotifies(connection, transaction, file.Path, sequenceBase);
@@ -1800,6 +1804,64 @@ internal static class UESourceIndexBuilder
                 composite.AnimationTrack.AnimSegments[segmentIndex],
                 "CompositeTrack");
         }
+    }
+
+    private static void InsertBlendSpaceSamples(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UBlendSpaceBase blendSpace,
+        string? skeletonPath)
+    {
+        for (var sampleIndex = 0; sampleIndex < blendSpace.SampleData.Length; sampleIndex++)
+            InsertBlendSpaceSample(connection, transaction, sourcePath, blendSpace.GetPathName(), skeletonPath, sampleIndex, blendSpace.SampleData[sampleIndex]);
+    }
+
+    private static void InsertBlendSpaceSample(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string animationObjectPath,
+        string? skeletonPath,
+        int sampleIndex,
+        FBlendSample sample)
+    {
+        var referencedAnimationPath = GetPackageIndexPath(sample.Animation);
+        var referencedAnimation = sample.Animation?.Load<UAnimSequenceBase>();
+        if (!string.IsNullOrWhiteSpace(referencedAnimationPath))
+            InsertRelation(connection, transaction, sourcePath, animationObjectPath, "AnimationSegment", referencedAnimationPath, referencedAnimation?.Name);
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO animation_segments (
+                source_path, animation_object_path, skeleton_path, segment_index, slot_name,
+                referenced_animation_path, referenced_animation_name,
+                start_pos, anim_start_time, anim_end_time, play_rate, looping_count, length,
+                relation_source
+            )
+            VALUES (
+                $sourcePath, $animationObjectPath, $skeletonPath, $segmentIndex, $slotName,
+                $referencedAnimationPath, $referencedAnimationName,
+                $startPos, $animStartTime, $animEndTime, $playRate, $loopingCount, $length,
+                $relationSource
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$animationObjectPath", animationObjectPath);
+        Add(command, "$skeletonPath", skeletonPath);
+        Add(command, "$segmentIndex", sampleIndex);
+        Add(command, "$slotName", null);
+        Add(command, "$referencedAnimationPath", referencedAnimationPath);
+        Add(command, "$referencedAnimationName", referencedAnimation?.Name);
+        Add(command, "$startPos", 0);
+        Add(command, "$animStartTime", 0);
+        Add(command, "$animEndTime", referencedAnimation?.SequenceLength);
+        Add(command, "$playRate", sample.RateScale);
+        Add(command, "$loopingCount", 1);
+        Add(command, "$length", referencedAnimation?.SequenceLength);
+        Add(command, "$relationSource", "BlendSpaceSample");
+        command.ExecuteNonQuery();
     }
 
     private static void InsertAnimationSegment(

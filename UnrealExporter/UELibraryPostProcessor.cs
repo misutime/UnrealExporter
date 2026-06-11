@@ -845,6 +845,7 @@ internal static class UELibraryPostProcessor
                 .GroupBy(x => x.SkeletonPath!, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
             snapshot.TracksByAnimation = LoadTracksByAnimation(connection);
+            snapshot.SegmentsByAnimation = LoadSegmentsByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
             snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
             snapshot.PackageObjectMaps = LoadSourcePackageObjectMaps(connection);
@@ -926,6 +927,56 @@ internal static class UELibraryPostProcessor
                 TrackIndex = reader.GetInt32(3),
                 BoneIndex = reader.GetInt32(4),
                 BoneName = GetString(reader, 5),
+            });
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, SourceAnimationSegment[]> LoadSegmentsByAnimation(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "animation_segments"))
+            return new Dictionary<string, SourceAnimationSegment[]>(StringComparer.OrdinalIgnoreCase);
+
+        var result = new Dictionary<string, List<SourceAnimationSegment>>(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, animation_object_path, skeleton_path, segment_index, slot_name,
+                   referenced_animation_path, referenced_animation_name,
+                   start_pos, anim_start_time, anim_end_time, play_rate, looping_count, length, relation_source
+            FROM animation_segments
+            ORDER BY animation_object_path, segment_index;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var animationObjectPath = GetString(reader, 1);
+            if (string.IsNullOrWhiteSpace(animationObjectPath))
+                continue;
+
+            var normalizedPath = NormalizePackageObjectPath(animationObjectPath);
+            if (!result.TryGetValue(normalizedPath, out var segments))
+            {
+                segments = [];
+                result[normalizedPath] = segments;
+            }
+
+            segments.Add(new SourceAnimationSegment
+            {
+                SourcePath = GetString(reader, 0),
+                AnimationObjectPath = animationObjectPath,
+                SkeletonPath = GetString(reader, 2),
+                SegmentIndex = reader.GetInt32(3),
+                SlotName = GetString(reader, 4),
+                ReferencedAnimationPath = GetString(reader, 5),
+                ReferencedAnimationName = GetString(reader, 6),
+                StartPos = GetNullableDouble(reader, 7),
+                AnimStartTime = GetNullableDouble(reader, 8),
+                AnimEndTime = GetNullableDouble(reader, 9),
+                PlayRate = GetNullableDouble(reader, 10),
+                LoopingCount = reader.IsDBNull(11) ? null : reader.GetInt32(11),
+                Length = GetNullableDouble(reader, 12),
+                RelationSource = GetString(reader, 13) ?? "",
             });
         }
 
@@ -2352,7 +2403,7 @@ internal static class UELibraryPostProcessor
             .Where(x => IsExportedAnimationFileAvailable(root, x))
             .ToArray();
         var allAnimations = animations;
-        var candidates = BuildModelAnimationCandidates(models, animations, componentAssetRelations);
+        var candidates = BuildModelAnimationCandidates(models, animations, sourceIndex, componentAssetRelations);
 
         var result = new List<AnimationValidationEntry>();
         var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
@@ -2370,10 +2421,13 @@ internal static class UELibraryPostProcessor
     private static ModelAnimationCandidate[] BuildModelAnimationCandidates(
         JObject[] models,
         JObject[] animations,
+        SourceIndexSnapshot sourceIndex,
         ComponentAssetRelationLink[] componentAssetRelations)
     {
         var modelsByOutput = BuildUniqueAssetOutputLookup(models);
         var animationsByOutput = BuildUniqueAssetOutputLookup(animations);
+        var animationsByObjectPath = BuildUniqueAnimationObjectPathLookup(animations);
+        var animationsByOwner = BuildAnimationsByOwner(componentAssetRelations, sourceIndex, animationsByOutput, animationsByObjectPath);
         var result = new Dictionary<string, ModelAnimationCandidate>(StringComparer.OrdinalIgnoreCase);
 
         // 同一个 UE owner 同时显式引用模型和动画时，才作为默认推荐候选。
@@ -2393,10 +2447,31 @@ internal static class UELibraryPostProcessor
                 .Where(x => !string.IsNullOrWhiteSpace(x) && animationsByOutput.ContainsKey(x))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            var animationContainerLinks = group
+                .Where(x => IsAnimationRelation(x.RelationType) && x.MatchStatus == "unsupportedAnimationAsset")
+                .Where(x => !string.IsNullOrWhiteSpace(x.TargetPath))
+                .ToArray();
 
             foreach (var modelOutput in modelLinks)
+            {
             foreach (var animationOutput in animationLinks)
                 AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animationsByOutput[animationOutput], "componentOwner");
+
+                // BlendSpace / AimOffset / Montage 这类 UE 动画容器本身不直接导出为 ueanim。
+                // 如果源索引能解析出它显式引用的 AnimSequence，就把可播放序列挂到同组件模型上。
+                foreach (var containerLink in animationContainerLinks)
+                foreach (var animation in FindAnimationsFromContainerSegments(containerLink.TargetPath, sourceIndex, animationsByObjectPath))
+                    AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animation, "componentOwnerBlendSpaceSample");
+
+                foreach (var animClassOwner in FindAnimationClassOwners(group))
+                {
+                    if (!animationsByOwner.TryGetValue(animClassOwner, out var classAnimations))
+                        continue;
+
+                    foreach (var animation in classAnimations)
+                        AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animation, "componentAnimClass");
+                }
+            }
         }
 
         var modelsBySkeleton = models
@@ -2442,6 +2517,121 @@ internal static class UELibraryPostProcessor
             .GroupBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
             .Where(x => x.Count() == 1)
             .ToDictionary(x => x.Key, x => x.First().Asset, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, JObject> BuildUniqueAnimationObjectPathLookup(JObject[] animations)
+    {
+        return animations
+            .Select(x => new { ObjectPath = NormalizeAnimationObjectPath((string?)x["objectPath"] ?? (string?)x["source"]), Animation = x })
+            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+            .GroupBy(x => x.ObjectPath, StringComparer.OrdinalIgnoreCase)
+            .Where(x => x.Count() == 1)
+            .ToDictionary(x => x.Key, x => x.First().Animation, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, JObject[]> BuildAnimationsByOwner(
+        ComponentAssetRelationLink[] componentAssetRelations,
+        SourceIndexSnapshot sourceIndex,
+        Dictionary<string, JObject> animationsByOutput,
+        Dictionary<string, JObject> animationsByObjectPath)
+    {
+        var result = new Dictionary<string, List<JObject>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in componentAssetRelations
+                     .Where(x => !string.IsNullOrWhiteSpace(x.OwnerObjectPath))
+                     .GroupBy(x => x.OwnerObjectPath!, StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var link in group.Where(x => IsAnimationRelation(x.RelationType)))
+            {
+                foreach (var animation in ResolveRelationAnimations(link, sourceIndex, animationsByOutput, animationsByObjectPath))
+                {
+                    if (!result.TryGetValue(group.Key, out var list))
+                    {
+                        list = [];
+                        result[group.Key] = list;
+                    }
+
+                    if (!list.Any(x => string.Equals((string?)x["output"], (string?)animation["output"], StringComparison.OrdinalIgnoreCase)))
+                        list.Add(animation);
+                }
+            }
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static JObject[] ResolveRelationAnimations(
+        ComponentAssetRelationLink link,
+        SourceIndexSnapshot sourceIndex,
+        Dictionary<string, JObject> animationsByOutput,
+        Dictionary<string, JObject> animationsByObjectPath)
+    {
+        if (string.Equals(link.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase))
+        {
+            var output = NormalizeCatalogOutput(link.TargetAssetOutput);
+            return !string.IsNullOrWhiteSpace(output) && animationsByOutput.TryGetValue(output, out var animation)
+                ? [animation]
+                : [];
+        }
+
+        return string.Equals(link.MatchStatus, "unsupportedAnimationAsset", StringComparison.OrdinalIgnoreCase)
+            ? FindAnimationsFromContainerSegments(link.TargetPath, sourceIndex, animationsByObjectPath)
+            : [];
+    }
+
+    private static JObject[] FindAnimationsFromContainerSegments(
+        string? containerPath,
+        SourceIndexSnapshot sourceIndex,
+        Dictionary<string, JObject> animationsByObjectPath)
+    {
+        if (string.IsNullOrWhiteSpace(containerPath) || sourceIndex.SegmentsByAnimation.Count == 0)
+            return [];
+
+        var containerObjectPath = NormalizeAnimationObjectPath(containerPath);
+        if (!sourceIndex.SegmentsByAnimation.TryGetValue(containerObjectPath, out var segments))
+            return [];
+
+        return segments
+            .Select(x => NormalizeAnimationObjectPath(x.ReferencedAnimationPath))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(x => animationsByObjectPath.TryGetValue(x, out var animation) ? animation : null)
+            .Where(x => x != null)
+            .Cast<JObject>()
+            .ToArray();
+    }
+
+    private static string NormalizeAnimationObjectPath(string? objectPath)
+        => string.IsNullOrWhiteSpace(objectPath) ? "" : NormalizePackageObjectPath(objectPath);
+
+    private static string[] FindAnimationClassOwners(IEnumerable<ComponentAssetRelationLink> ownerLinks)
+    {
+        return ownerLinks
+            .Where(x => IsAnimationClassRelation(x.RelationType))
+            .Select(x => NormalizeBlueprintGeneratedClassOwnerPath(x.TargetPath))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool IsAnimationClassRelation(string relationType)
+        => relationType.Equals("AnimClass", StringComparison.OrdinalIgnoreCase)
+           || relationType.Equals("AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeBlueprintGeneratedClassOwnerPath(string? targetPath)
+    {
+        if (string.IsNullOrWhiteSpace(targetPath))
+            return "";
+
+        var path = targetPath.Replace('\\', '/').Trim();
+        var dot = path.LastIndexOf('.');
+        if (dot <= 0 || dot == path.Length - 1)
+            return path;
+
+        var package = path[..dot];
+        var className = path[(dot + 1)..];
+        return className.EndsWith("_C", StringComparison.OrdinalIgnoreCase)
+            ? $"{package}.Default__{className}"
+            : path;
     }
 
     private static JObject[] PickSharedSkeletonAnimations(JObject model, JObject[] skeletonAnimations)
@@ -5514,6 +5704,7 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceBone[]> BonesByOwner { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SourceBone[]> BonesBySkeleton { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SourceAnimationTrack[]> TracksByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, SourceAnimationSegment[]> SegmentsByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
         public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
@@ -5539,6 +5730,24 @@ internal static class UELibraryPostProcessor
         public int BoneIndex { get; set; }
         public string? BoneName { get; set; }
         public bool FromExportedUEAnim { get; set; }
+    }
+
+    private sealed class SourceAnimationSegment
+    {
+        public string? SourcePath { get; set; }
+        public string AnimationObjectPath { get; set; } = string.Empty;
+        public string? SkeletonPath { get; set; }
+        public int SegmentIndex { get; set; }
+        public string? SlotName { get; set; }
+        public string? ReferencedAnimationPath { get; set; }
+        public string? ReferencedAnimationName { get; set; }
+        public double? StartPos { get; set; }
+        public double? AnimStartTime { get; set; }
+        public double? AnimEndTime { get; set; }
+        public double? PlayRate { get; set; }
+        public int? LoopingCount { get; set; }
+        public double? Length { get; set; }
+        public string RelationSource { get; set; } = string.Empty;
     }
 
     private sealed class SourceMaterialTextureSlot
