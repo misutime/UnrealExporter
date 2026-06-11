@@ -42,6 +42,7 @@ internal static class UEAnimationPreviewBuilder
             var writtenChannels = 0;
             var retargetedTranslationTracks = 0;
             var skippedStaticTranslationTracks = 0;
+            var retargetedRotationTracks = 0;
             var missingBones = new List<string>();
             foreach (var track in animation.Tracks)
             {
@@ -69,11 +70,14 @@ internal static class UEAnimationPreviewBuilder
 
                 if (track.Rotations.Count > 0)
                 {
+                    var rotation = BuildRotationKeyMap(track, node, animation.FramesPerSecond);
                     gltfAnimation.CreateRotationChannel(
                         node,
-                        BuildKeyMap(track.Rotations, animation.FramesPerSecond, SwapYZ),
+                        rotation.Keys,
                         linear: true);
                     writtenChannels++;
+                    if (rotation.Retargeted)
+                        retargetedRotationTracks++;
                 }
 
                 if (track.Scales.Count > 0)
@@ -110,12 +114,13 @@ internal static class UEAnimationPreviewBuilder
                 writtenChannels,
                 retargetedTranslationTracks,
                 skippedStaticTranslationTracks,
+                retargetedRotationTracks,
                 heavyTranslationRetarget,
                 missingBones = missingBones.Take(64).ToArray(),
             });
 
             Console.WriteLine($"=> {outputPath}");
-            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}");
+            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, retargetedRotations={retargetedRotationTracks}");
             return status == "error" ? 2 : 0;
         }
         catch (Exception ex)
@@ -175,6 +180,36 @@ internal static class UEAnimationPreviewBuilder
         return distance <= MathF.Max(0.05f, lengthBase * 0.35f);
     }
 
+    private static RotationKeyMap BuildRotationKeyMap(UEAnimTrack track, Node node, float framesPerSecond)
+    {
+        var directKeys = BuildKeyMap(track.Rotations, framesPerSecond, SwapYZ);
+        if (directKeys.Count == 0)
+            return new RotationKeyMap(directKeys, Retargeted: false);
+
+        var first = directKeys
+            .OrderBy(x => x.Key)
+            .First()
+            .Value;
+        var rest = Quaternion.Normalize(node.LocalTransform.Rotation);
+        if (IsRotationCompatibleWithRest(first, rest))
+            return new RotationKeyMap(directKeys, Retargeted: false);
+
+        // 和 translation 一样，UE 动画 rotation 可能来自另一个源参考姿态。
+        // 这里把第一帧对齐到目标模型 rest pose，再保留后续相对旋转变化。
+        var offset = Quaternion.Normalize(rest * Quaternion.Inverse(first));
+        var retargetedKeys = directKeys.ToDictionary(
+            x => x.Key,
+            x => Quaternion.Normalize(offset * x.Value));
+        return new RotationKeyMap(retargetedKeys, Retargeted: true);
+    }
+
+    private static bool IsRotationCompatibleWithRest(Quaternion first, Quaternion rest)
+    {
+        var dot = MathF.Abs(Quaternion.Dot(Quaternion.Normalize(first), Quaternion.Normalize(rest)));
+        var angle = 2f * MathF.Acos(MathF.Min(1f, dot));
+        return angle <= 10f * MathF.PI / 180f;
+    }
+
     private static Dictionary<float, TOut> BuildKeyMap<TIn, TOut>(
         IEnumerable<UEAnimKey<TIn>> keys,
         float framesPerSecond,
@@ -202,3 +237,7 @@ internal readonly record struct TranslationKeyMap(
     Dictionary<float, Vector3> Keys,
     bool Retargeted,
     bool SkippedStatic);
+
+internal readonly record struct RotationKeyMap(
+    Dictionary<float, Quaternion> Keys,
+    bool Retargeted);
