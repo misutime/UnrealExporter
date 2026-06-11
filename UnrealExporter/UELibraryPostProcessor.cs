@@ -4397,6 +4397,15 @@ internal static class UELibraryPostProcessor
         var usableRelationAnimations = relationAnimations
             .Where(IsUsableRelationAnimation)
             .ToArray();
+        var animationValidationErrors = animationValidation.Validations
+            .Where(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var actionableAnimationValidationErrors = animationValidation.Validations
+            .Where(IsActionableAnimationValidationError)
+            .ToArray();
+        var fallbackDiagnosticAnimationValidationErrors = animationValidation.Validations
+            .Where(IsFallbackDiagnosticAnimationValidationError)
+            .ToArray();
         var modelRefs = componentAssetRelations.Where(x => IsModelRelation(x.RelationType)).ToArray();
         var animationRefs = componentAssetRelations.Where(x => IsAnimationRelation(x.RelationType)).ToArray();
         var materialRefs = componentAssetRelations.Where(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -4472,7 +4481,9 @@ internal static class UELibraryPostProcessor
                 validationPairs = animationValidation.Validations.Length,
                 ok = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
                 warning = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase)),
-                error = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase)),
+                error = animationValidationErrors.Length,
+                actionableError = actionableAnimationValidationErrors.Length,
+                fallbackDiagnosticError = fallbackDiagnosticAnimationValidationErrors.Length,
                 containerAnimations = animationValidation.Validations.Count(x => x.IsContainerAnimation),
                 byCategory = animationValidation.Validations
                     .GroupBy(x => x.ValidationCategory, StringComparer.OrdinalIgnoreCase)
@@ -4498,7 +4509,8 @@ internal static class UELibraryPostProcessor
             notes = new[]
             {
                 "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
-                "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但路径语义明确时保留为可浏览素材并标记为关系待补。",
+                "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但源索引确认到对象时记录为 sourceIndexedPathEvidence。",
+                "动画 actionableError 来自显式/唯一骨架等默认关系链路；fallbackDiagnosticError 来自 sharedSkeleton 兜底诊断，保留用于排查但不进入默认可用动画。",
                 "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
             },
         });
@@ -5992,6 +6004,8 @@ internal static class UELibraryPostProcessor
         var modelWarnings = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
         var modelErrors = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
         var validationErrors = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
+        var actionableValidationErrors = animationValidation.Validations.Count(IsActionableAnimationValidationError);
+        var fallbackDiagnosticValidationErrors = animationValidation.Validations.Count(IsFallbackDiagnosticAnimationValidationError);
         var validationWarnings = animationValidation.Validations.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
         var exportedAnimations = animations.Count(x => IsExportedAnimationFileAvailable(root, x));
         var metadataAnimations = animations.Count(x => string.Equals((string?)x["status"], "metadata", StringComparison.OrdinalIgnoreCase));
@@ -6002,7 +6016,7 @@ internal static class UELibraryPostProcessor
 
         var healthStatus =
             modelErrors > 0 ? "error" :
-            modelWarnings > 0 || missingComponentRefs > 0 || actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 || linkErrors > 0 || validationErrors > 0 || validationWarnings > 0 ? "warning" :
+            modelWarnings > 0 || missingComponentRefs > 0 || actionableMissingMaterialSlots > 0 || unresolvedMaterialSlots > 0 || linkErrors > 0 || actionableValidationErrors > 0 || validationWarnings > 0 ? "warning" :
             "ok";
 
         var issues = new JArray();
@@ -6034,12 +6048,19 @@ internal static class UELibraryPostProcessor
                 ["area"] = "animations",
                 ["message"] = $"有 {failedAnimations} 个动画没有成功导出为 .ueanim，已从默认模型动画候选中排除。",
             });
-        if (validationErrors > 0 || validationWarnings > 0)
+        if (actionableValidationErrors > 0 || validationWarnings > 0)
             issues.Add(new JObject
             {
                 ["level"] = "warning",
                 ["area"] = "animations",
-                ["message"] = $"动画骨架验证存在 error={validationErrors}, warning={validationWarnings}；error 候选不会进入默认可用动画列表。",
+                ["message"] = $"动画骨架验证存在 actionableError={actionableValidationErrors}, warning={validationWarnings}；actionable error 候选不会进入默认可用动画列表。",
+            });
+        if (fallbackDiagnosticValidationErrors > 0)
+            issues.Add(new JObject
+            {
+                ["level"] = "info",
+                ["area"] = "animations",
+                ["message"] = $"另有 {fallbackDiagnosticValidationErrors} 个 sharedSkeleton 兜底诊断候选缺少部分 track 骨骼，已保留在明细中但不会作为默认可用动画。",
             });
         if (linkErrors > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "textures", ["message"] = $"有 {linkErrors} 个共享贴图硬链接创建失败。" });
@@ -6147,6 +6168,8 @@ internal static class UELibraryPostProcessor
                 validationOk = animationValidation.Validations.Count(x => string.Equals(x.Status, "ok", StringComparison.OrdinalIgnoreCase)),
                 validationWarning = validationWarnings,
                 validationError = validationErrors,
+                actionableValidationError = actionableValidationErrors,
+                fallbackDiagnosticValidationError = fallbackDiagnosticValidationErrors,
                 containerAnimations = animationValidation.Validations.Count(x => x.IsContainerAnimation),
                 validationCategories = animationValidation.Validations
                     .GroupBy(x => x.ValidationCategory, StringComparer.OrdinalIgnoreCase)
@@ -6186,6 +6209,14 @@ internal static class UELibraryPostProcessor
             })
             .ToArray<object>();
     }
+
+    private static bool IsActionableAnimationValidationError(AnimationValidationEntry validation)
+        => string.Equals(validation.Status, "error", StringComparison.OrdinalIgnoreCase)
+           && !IsFallbackDiagnosticAnimationValidationError(validation);
+
+    private static bool IsFallbackDiagnosticAnimationValidationError(AnimationValidationEntry validation)
+        => string.Equals(validation.Status, "error", StringComparison.OrdinalIgnoreCase)
+           && string.Equals(validation.CandidateReason, "sharedSkeleton", StringComparison.OrdinalIgnoreCase);
 
     private static void WriteLibraryReadme(
         string root,
