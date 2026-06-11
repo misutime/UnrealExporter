@@ -834,6 +834,7 @@ internal static class UELibraryPostProcessor
             meshCount = report.MeshCount,
             materialCount = report.MaterialCount,
             textureCount = report.ImageCount,
+            embeddedImageCount = report.EmbeddedImageCount,
             boneCount = report.BoneCount,
             skinCount = report.SkinCount,
             animationCount = report.AnimationCount,
@@ -3550,6 +3551,7 @@ internal static class UELibraryPostProcessor
                     bones = x.BoneCount,
                     materials = x.MaterialCount,
                     images = x.ImageCount,
+                    embeddedImages = x.EmbeddedImageCount,
                     animations = x.AnimationCount,
                 },
                 materialNames = x.MaterialNames,
@@ -5548,6 +5550,8 @@ internal static class UELibraryPostProcessor
         var metadataAnimations = animations.Count(x => string.Equals((string?)x["status"], "metadata", StringComparison.OrdinalIgnoreCase));
         var failedAnimations = animations.Count(x => string.Equals((string?)x["status"], "error", StringComparison.OrdinalIgnoreCase));
         var linkErrors = textureLinks.Count(x => !string.IsNullOrWhiteSpace(x.LinkError));
+        var embeddedGltfImageCount = reports.Sum(x => x.EmbeddedImageCount);
+        var modelsWithEmbeddedGltfImages = reports.Count(x => x.EmbeddedImageCount > 0);
 
         var healthStatus =
             modelErrors > 0 ? "error" :
@@ -5592,6 +5596,13 @@ internal static class UELibraryPostProcessor
             });
         if (linkErrors > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "textures", ["message"] = $"有 {linkErrors} 个共享贴图硬链接创建失败。" });
+        if (embeddedGltfImageCount > 0)
+            issues.Add(new JObject
+            {
+                ["level"] = "info",
+                ["area"] = "textures",
+                ["message"] = $"有 {modelsWithEmbeddedGltfImages} 个 GLB 仍包含内嵌图片，共 {embeddedGltfImageCount} 张；独立贴图已进入 Textures/_Shared，后续可继续做 GLB 贴图外置化以减少模型文件体积。",
+            });
 
         var health = new JObject
         {
@@ -5623,6 +5634,8 @@ internal static class UELibraryPostProcessor
                 unique = textureLinks.Select(x => x.Hash).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
                 hardLinked = textureLinks.Count(x => x.HardLinked),
                 linkErrors,
+                embeddedGltfImages = embeddedGltfImageCount,
+                modelsWithEmbeddedGltfImages,
                 sharedGltfLinks = sharedGltfTextureLinks.Length,
                 sharedGltfLinked = sharedGltfTextureLinks.Count(x => string.Equals(x.Status, "linked", StringComparison.OrdinalIgnoreCase)),
             }),
