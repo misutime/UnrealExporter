@@ -77,8 +77,8 @@ internal static class UELibraryPostProcessor
         var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
         var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex));
         RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
+        var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots));
         mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList()));
-        var sharedGltfTextureLinks = RunStage("改写文本glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots));
         var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex));
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
@@ -672,6 +672,31 @@ internal static class UELibraryPostProcessor
         var binData = reader.ReadBytes(binLength);
         return (gltf, binData);
     }
+
+    private static void WriteGlb(string path, JObject gltf, byte[] binData)
+    {
+        var jsonData = Encoding.UTF8.GetBytes(gltf.ToString(Formatting.None));
+        Array.Resize(ref jsonData, Align4(jsonData.Length));
+        for (var i = jsonData.Length - 1; i >= 0 && jsonData[i] == 0; i--)
+            jsonData[i] = 0x20;
+
+        Array.Resize(ref binData, Align4(binData.Length));
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream);
+        writer.Write(Encoding.ASCII.GetBytes("glTF"));
+        writer.Write(2);
+        writer.Write(12 + 8 + jsonData.Length + 8 + binData.Length);
+        writer.Write(jsonData.Length);
+        writer.Write(Encoding.ASCII.GetBytes("JSON"));
+        writer.Write(jsonData);
+        writer.Write(binData.Length);
+        writer.Write(Encoding.ASCII.GetBytes("BIN\0"));
+        writer.Write(binData);
+        File.WriteAllBytes(path, stream.ToArray());
+    }
+
+    private static int Align4(int value)
+        => (value + 3) & ~3;
 
     private static (JObject Gltf, byte[] BinData) ReadGltfModel(string path)
     {
@@ -2156,12 +2181,20 @@ internal static class UELibraryPostProcessor
            || status.Equals("skeletonCoveredByModels", StringComparison.OrdinalIgnoreCase)
            || status.Equals("unsupportedAnimationAsset", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsSharedGltfTextureLinkedStatus(string status)
+        => status.Equals("linked", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("rewritten", StringComparison.OrdinalIgnoreCase)
+           || status.Equals("externalized", StringComparison.OrdinalIgnoreCase);
+
     private static SharedGltfTextureLink[] RewriteGltfSharedTextureUris(
         string root,
         List<ModelValidationEntry> reports,
         MaterialTextureSlotLink[] materialTextureSlots)
     {
         var rows = new List<SharedGltfTextureLink>();
+        foreach (var report in reports.Where(x => x.RelativePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
+            TryExternalizeGlbEmbeddedImages(root, report, rows);
+
         var matchedSlots = materialTextureSlots
             .Where(x => x.MatchStatus == "matched" && !string.IsNullOrWhiteSpace(x.SharedTexture))
             .GroupBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
@@ -2226,6 +2259,318 @@ internal static class UELibraryPostProcessor
             writer.WriteLine(JsonConvert.SerializeObject(row));
 
         return rows.ToArray();
+    }
+
+    private static void TryExternalizeGlbEmbeddedImages(string root, ModelValidationEntry report, List<SharedGltfTextureLink> rows)
+    {
+        var glbPath = Path.Combine(root, report.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(glbPath))
+            return;
+
+        try
+        {
+            var (gltf, binData) = ReadGlb(glbPath);
+            var images = ArrayOf(gltf, "images");
+            var bufferViews = ArrayOf(gltf, "bufferViews");
+            if (images.Length == 0 || bufferViews.Length == 0 || binData.Length == 0)
+            {
+                RecordExistingSharedGlbImageUris(root, glbPath, report, images, rows);
+                return;
+            }
+
+            RecordExistingSharedGlbImageUris(root, glbPath, report, images, rows);
+
+            var removableBufferViews = FindImageOnlyBufferViews(gltf, images, bufferViews);
+            var changed = false;
+            for (var imageIndex = 0; imageIndex < images.Length; imageIndex++)
+            {
+                var image = images[imageIndex];
+                var bufferViewIndex = (int?)image["bufferView"];
+                if (bufferViewIndex == null)
+                    continue;
+
+                if (!removableBufferViews.Contains(bufferViewIndex.Value))
+                {
+                    rows.Add(new SharedGltfTextureLink
+                    {
+                        Model = report.RelativePath,
+                        ImageIndex = imageIndex,
+                        RemovedBufferView = false,
+                        Status = "skipped",
+                        Reason = "image.bufferView 可能被几何或其它数据引用，跳过外置以保护模型结构。",
+                    });
+                    continue;
+                }
+
+                if (!TryReadBufferViewBytes(bufferViews[bufferViewIndex.Value], binData, out var imageBytes))
+                {
+                    rows.Add(new SharedGltfTextureLink
+                    {
+                        Model = report.RelativePath,
+                        ImageIndex = imageIndex,
+                        RemovedBufferView = false,
+                        Status = "error",
+                        Reason = "image.bufferView 超出 GLB binary chunk 范围。",
+                    });
+                    continue;
+                }
+
+                var extension = GuessImageExtension((string?)image["mimeType"], imageBytes);
+                if (extension == null)
+                {
+                    rows.Add(new SharedGltfTextureLink
+                    {
+                        Model = report.RelativePath,
+                        ImageIndex = imageIndex,
+                        RemovedBufferView = false,
+                        Status = "skipped",
+                        Reason = "暂不支持的内嵌图片格式。",
+                    });
+                    continue;
+                }
+
+                var hash = HashBytes(imageBytes);
+                var sharedPath = BuildSharedTexturePath(root, hash, extension);
+                Directory.CreateDirectory(Path.GetDirectoryName(sharedPath)!);
+                if (!File.Exists(sharedPath))
+                    File.WriteAllBytes(sharedPath, imageBytes);
+
+                var uri = MakeRelative(Path.GetDirectoryName(glbPath)!, sharedPath);
+                image["uri"] = uri;
+                image.Remove("bufferView");
+                image.Remove("mimeType");
+                changed = true;
+                rows.Add(new SharedGltfTextureLink
+                {
+                    Model = report.RelativePath,
+                    ImageIndex = imageIndex,
+                    SharedTexture = MakeRelative(root, sharedPath),
+                    Sha256 = hash,
+                    Uri = uri,
+                    RemovedBufferView = true,
+                    Status = "externalized",
+                    Reason = "从 GLB binary chunk 提取内嵌图片，写入 Textures/_Shared，并改写 image URI。",
+                });
+            }
+
+            if (!changed)
+                return;
+
+            var newBin = RebuildGlbBinaryWithoutBufferViews(gltf, bufferViews, binData, removableBufferViews);
+            WriteGlb(glbPath, gltf, newBin);
+            report.EmbeddedImageCount = ArrayOf(gltf, "images").Count(x => x["bufferView"] != null);
+            report.ImageCount = ArrayOf(gltf, "images").Length;
+            TryDeleteModelValidationCache(glbPath);
+        }
+        catch (Exception ex)
+        {
+            rows.Add(new SharedGltfTextureLink
+            {
+                Model = report.RelativePath,
+                Status = "error",
+                Reason = $"GLB 贴图外置失败: {ex.Message}",
+            });
+        }
+    }
+
+    private static void RecordExistingSharedGlbImageUris(
+        string root,
+        string glbPath,
+        ModelValidationEntry report,
+        JObject[] images,
+        List<SharedGltfTextureLink> rows)
+    {
+        for (var imageIndex = 0; imageIndex < images.Length; imageIndex++)
+        {
+            var image = images[imageIndex];
+            if (image["bufferView"] != null)
+                continue;
+
+            var uri = (string?)image["uri"];
+            if (string.IsNullOrWhiteSpace(uri))
+                continue;
+
+            var imagePath = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(glbPath)!, Uri.UnescapeDataString(uri)));
+            var sharedRoot = Path.GetFullPath(Path.Combine(root, "Textures", "_Shared"));
+            if (!imagePath.StartsWith(sharedRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(imagePath))
+                continue;
+
+            var sharedRelative = MakeRelative(root, imagePath);
+            rows.Add(new SharedGltfTextureLink
+            {
+                Model = report.RelativePath,
+                ImageIndex = imageIndex,
+                SharedTexture = sharedRelative,
+                Sha256 = TryReadHashFromSharedTexturePath(imagePath),
+                Uri = uri,
+                RemovedBufferView = true,
+                Status = "externalized",
+                Reason = "GLB image URI 已指向 Textures/_Shared，本次重建共享贴图链接记录。",
+            });
+        }
+    }
+
+    private static string? TryReadHashFromSharedTexturePath(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        return name.Length == 64 && name.All(Uri.IsHexDigit) ? name.ToLowerInvariant() : null;
+    }
+
+    private static HashSet<int> FindImageOnlyBufferViews(JObject gltf, JObject[] images, JObject[] bufferViews)
+    {
+        var imageBufferViews = images
+            .Select(x => (int?)x["bufferView"])
+            .Where(x => x is >= 0)
+            .Select(x => x!.Value)
+            .Where(x => x < bufferViews.Length && ((int?)bufferViews[x]["buffer"] ?? 0) == 0)
+            .ToHashSet();
+        if (imageBufferViews.Count == 0)
+            return [];
+
+        var protectedBufferViews = new HashSet<int>();
+        CollectProtectedBufferViewReferences(gltf, protectedBufferViews);
+        imageBufferViews.ExceptWith(protectedBufferViews);
+        return imageBufferViews;
+    }
+
+    private static void CollectProtectedBufferViewReferences(JToken token, HashSet<int> result)
+    {
+        if (token is JObject obj)
+        {
+            if (obj["bufferView"] is JValue value && value.Type == JTokenType.Integer)
+            {
+                if (!IsGltfImageObject(obj))
+                    result.Add(value.Value<int>());
+            }
+
+            foreach (var child in obj.Properties().Select(x => x.Value))
+                CollectProtectedBufferViewReferences(child, result);
+        }
+        else if (token is JArray array)
+        {
+            foreach (var child in array)
+                CollectProtectedBufferViewReferences(child, result);
+        }
+    }
+
+    private static bool IsGltfImageObject(JObject obj)
+        => obj.Parent is JArray array
+           && array.Parent is JProperty property
+           && property.Name.Equals("images", StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryReadBufferViewBytes(JObject bufferView, byte[] binData, out byte[] bytes)
+    {
+        bytes = [];
+        var offset = (int?)bufferView["byteOffset"] ?? 0;
+        var length = (int?)bufferView["byteLength"] ?? 0;
+        if (offset < 0 || length <= 0 || offset + length > binData.Length)
+            return false;
+
+        bytes = new byte[length];
+        Buffer.BlockCopy(binData, offset, bytes, 0, length);
+        return true;
+    }
+
+    private static byte[] RebuildGlbBinaryWithoutBufferViews(
+        JObject gltf,
+        JObject[] oldBufferViews,
+        byte[] oldBinData,
+        HashSet<int> removedBufferViews)
+    {
+        var bufferViewMap = new Dictionary<int, int>();
+        var newBufferViews = new JArray();
+        using var stream = new MemoryStream(oldBinData.Length);
+
+        for (var oldIndex = 0; oldIndex < oldBufferViews.Length; oldIndex++)
+        {
+            if (removedBufferViews.Contains(oldIndex))
+                continue;
+
+            if (!TryReadBufferViewBytes(oldBufferViews[oldIndex], oldBinData, out var bytes))
+                throw new InvalidDataException($"bufferView[{oldIndex}] 超出 GLB binary chunk 范围。");
+
+            PadStream4(stream);
+            var clone = (JObject)oldBufferViews[oldIndex].DeepClone();
+            clone["byteOffset"] = (int)stream.Position;
+            clone["byteLength"] = bytes.Length;
+            bufferViewMap[oldIndex] = newBufferViews.Count;
+            newBufferViews.Add(clone);
+            stream.Write(bytes, 0, bytes.Length);
+        }
+
+        gltf["bufferViews"] = newBufferViews;
+        RemapBufferViewReferences(gltf, bufferViewMap, removedBufferViews);
+        if (gltf["buffers"] is JArray buffers && buffers.First is JObject buffer)
+            buffer["byteLength"] = (int)stream.Length;
+
+        return stream.ToArray();
+    }
+
+    private static void RemapBufferViewReferences(JToken token, Dictionary<int, int> map, HashSet<int> removed)
+    {
+        if (token is JObject obj)
+        {
+            if (obj["bufferView"] is JValue value && value.Type == JTokenType.Integer)
+            {
+                var oldIndex = value.Value<int>();
+                if (map.TryGetValue(oldIndex, out var newIndex))
+                    obj["bufferView"] = newIndex;
+                else if (removed.Contains(oldIndex))
+                    obj.Remove("bufferView");
+            }
+
+            foreach (var child in obj.Properties().Select(x => x.Value).ToArray())
+                RemapBufferViewReferences(child, map, removed);
+        }
+        else if (token is JArray array)
+        {
+            foreach (var child in array.ToArray())
+                RemapBufferViewReferences(child, map, removed);
+        }
+    }
+
+    private static void PadStream4(Stream stream)
+    {
+        while ((stream.Position & 3) != 0)
+            stream.WriteByte(0);
+    }
+
+    private static string? GuessImageExtension(string? mimeType, byte[] bytes)
+    {
+        if (mimeType?.Equals("image/png", StringComparison.OrdinalIgnoreCase) == true || IsPng(bytes))
+            return ".png";
+        if (mimeType?.Equals("image/jpeg", StringComparison.OrdinalIgnoreCase) == true || IsJpeg(bytes))
+            return ".jpg";
+        if (mimeType?.Equals("image/webp", StringComparison.OrdinalIgnoreCase) == true || IsWebp(bytes))
+            return ".webp";
+        return null;
+    }
+
+    private static bool IsPng(byte[] bytes)
+        => bytes.Length >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47;
+
+    private static bool IsJpeg(byte[] bytes)
+        => bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF;
+
+    private static bool IsWebp(byte[] bytes)
+        => bytes.Length >= 12 && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46
+           && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50;
+
+    private static string BuildSharedTexturePath(string root, string hash, string extension)
+        => Path.Combine(root, "Textures", "_Shared", hash[..2], $"{hash}{extension.ToLowerInvariant()}");
+
+    private static void TryDeleteModelValidationCache(string glbPath)
+    {
+        try
+        {
+            var cachePath = BuildModelValidationCachePath(glbPath);
+            if (File.Exists(cachePath))
+                File.Delete(cachePath);
+        }
+        catch
+        {
+            // 缓存删不掉只会影响下一次扫描速度，不影响当前报告。
+        }
     }
 
     private static bool TryRewriteMaterialTexture(
@@ -5637,7 +5982,7 @@ internal static class UELibraryPostProcessor
                 embeddedGltfImages = embeddedGltfImageCount,
                 modelsWithEmbeddedGltfImages,
                 sharedGltfLinks = sharedGltfTextureLinks.Length,
-                sharedGltfLinked = sharedGltfTextureLinks.Count(x => string.Equals(x.Status, "linked", StringComparison.OrdinalIgnoreCase)),
+                sharedGltfLinked = sharedGltfTextureLinks.Count(x => IsSharedGltfTextureLinkedStatus(x.Status)),
             }),
             ["materials"] = JObject.FromObject(new
             {
@@ -6091,6 +6436,12 @@ internal static class UELibraryPostProcessor
         using var sha = SHA256.Create();
         using var stream = File.OpenRead(path);
         return Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
+    }
+
+    private static string HashBytes(byte[] bytes)
+    {
+        using var sha = SHA256.Create();
+        return Convert.ToHexString(sha.ComputeHash(bytes)).ToLowerInvariant();
     }
 
     private static string ComputeHash(string text)
