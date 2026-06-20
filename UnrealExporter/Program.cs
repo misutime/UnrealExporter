@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Reflection;
@@ -111,8 +111,8 @@ public class UnrealExporter
                 Console.WriteLine($"AES key: {config.Aes}");
                 Console.WriteLine($"Log outputs: {config.LogOutputs}");
                 Console.WriteLine($"Keep directory structure: {config.KeepDirectoryStructure}");
-                Console.WriteLine($"SQLite-only library index: {config.SqliteOnlyIndex || !config.WriteCompatibilityJson}");
-                Console.WriteLine($"Compatibility JSON/JSONL outputs: {ShouldWriteCompatibilityJson(config)}");
+                Console.WriteLine("SQLite-first library index: True");
+                Console.WriteLine($"Debug JSON/JSONL outputs: {ShouldWriteDebugJson(config)}");
                 Console.WriteLine($"Create new checkpoint: {config.CreateNewCheckpoint}");
 
                 // Load CUE4Parse and export files
@@ -157,17 +157,15 @@ public class UnrealExporter
         if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             Console.WriteLine("ERROR: --postprocess-library requires an exported library root path.");
-            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures] [--compat-json]");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures] [--debug-json]");
             return true;
         }
 
         // 后处理只读取已导出的 GLB/JSON/PNG，不需要重新挂载 pak。
         var root = args[1];
         var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
-        var writeCompatibilityJson = args.Any(x =>
-            x.Equals("--compat-json", StringComparison.OrdinalIgnoreCase) ||
-            x.Equals("--write-compat-json", StringComparison.OrdinalIgnoreCase));
-        UELibraryPostProcessor.Run(root, dedupeTextures, writeCompatibilityJson);
+        var writeDebugJson = args.Any(x => x.Equals("--debug-json", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.Run(root, dedupeTextures, writeDebugJson);
         return true;
     }
 
@@ -185,14 +183,12 @@ public class UnrealExporter
         if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             Console.WriteLine("ERROR: --materialize-animation-metadata requires an exported library root path.");
-            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --materialize-animation-metadata <outputDir> [--compat-json]");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --materialize-animation-metadata <outputDir> [--debug-json]");
             return true;
         }
 
-        var writeCompatibilityJson = args.Any(x =>
-            x.Equals("--compat-json", StringComparison.OrdinalIgnoreCase) ||
-            x.Equals("--write-compat-json", StringComparison.OrdinalIgnoreCase));
-        UELibraryPostProcessor.MaterializeAnimationMetadataSidecars(args[1], writeCompatibilityJson);
+        var writeDebugJson = args.Any(x => x.Equals("--debug-json", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.MaterializeAnimationMetadataSidecars(args[1], writeDebugJson);
         return true;
     }
 
@@ -885,7 +881,7 @@ public class UnrealExporter
         using var exportResumeStore = resumeExports ? ExportResumeStore.Open(config) : null;
         if (resumeExports)
             Console.WriteLine($"Export resume: loaded {exportResumeStore!.Count} completed job(s).");
-        PrepareCompatibilityJsonOutputs(config);
+        PrepareDefaultIndexOutputs(config);
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
@@ -1236,7 +1232,7 @@ public class UnrealExporter
                                             {
                                                 const string error = "missingNativeFeature: ACL. CUE4Parse-Natives 没有编入 ACL，无法解压 ACL 压缩动画。请补齐 CUE4Parse-Natives/ACL/external/acl 后重建。";
                                                 Console.WriteLine($"WARN: Skipped animation {file.Value.Path} ({error})");
-                                                if (ShouldWriteCompatibilityJson(config))
+                                                if (ShouldWriteDebugJson(config))
                                                 {
                                                     var diagnosticPath = objectOutputPath + "." + outputType + ".missing-acl.json";
                                                     WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
@@ -1282,7 +1278,7 @@ public class UnrealExporter
                                                 var error = label ?? "exporter returned false";
                                                 if (TryPrepareAnimationMetadataOutput(config, file.Value.Path, animationAsset, objectOutputPath + "." + outputType, "metadata", error, out var metadataOutput, out var metadataFormat))
                                                 {
-                                                    if (ShouldWriteCompatibilityJson(config))
+                                                    if (ShouldWriteDebugJson(config))
                                                         AppendExportManifest(config, file.Value.Path, obj, metadataOutput, "AnimationMetadata");
                                                     AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataOutput, metadataFormat, "metadata", error));
                                                     AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataOutput, "metadata", error);
@@ -1300,7 +1296,7 @@ public class UnrealExporter
                                                 );
                                                 if (TryPrepareAnimationMetadataOutput(config, file.Value.Path, animationAsset, objectOutputPath + "." + outputType, "metadata", ex.Message, out var metadataOutput, out var metadataFormat))
                                                 {
-                                                    if (ShouldWriteCompatibilityJson(config))
+                                                    if (ShouldWriteDebugJson(config))
                                                         AppendExportManifest(config, file.Value.Path, obj, metadataOutput, "AnimationMetadata");
                                                     AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataOutput, metadataFormat, "metadata", ex.Message));
                                                     AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataOutput, "metadata", ex.Message);
@@ -1478,14 +1474,13 @@ public class UnrealExporter
         );
         if (config.GenerateLibraryIndexes)
         {
-            var writeCompatibilityJson = config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
-            UELibraryPostProcessor.Run(config.OutputDir, config.UseSharedTextures, writeCompatibilityJson);
+            UELibraryPostProcessor.Run(config.OutputDir, config.UseSharedTextures, ShouldWriteDebugJson(config));
         }
         else if (config.UseSharedTextures)
         {
             UELibraryPostProcessor.DeduplicateTextureFiles(
                 Path.GetFullPath(config.OutputDir),
-                ShouldWriteCompatibilityJson(config));
+                ShouldWriteDebugJson(config));
         }
         Console.WriteLine();
     }
@@ -1936,7 +1931,7 @@ public class UnrealExporter
     private static void AppendAutoReferencedExportDiagnostic(ConfigObj config, object diagnostic)
     {
         WriteExportEventSqlite(config, "auto_referenced_exports", JObject.FromObject(diagnostic));
-        if (!ShouldWriteCompatibilityJson(config))
+        if (!ShouldWriteDebugJson(config))
             return;
 
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
@@ -1966,7 +1961,7 @@ public class UnrealExporter
         {
             ClearExportEventSqliteRows(config, "auto_referenced_exports");
             var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
-            if (!ShouldWriteCompatibilityJson(config))
+            if (!ShouldWriteDebugJson(config))
             {
                 DeleteIfExists(path);
                 return new AutoReferencedDiagnosticSink(config, null);
@@ -2281,12 +2276,12 @@ public class UnrealExporter
     private static bool ShouldResumeExports(ConfigObj config)
         => config.ResumeExports != false;
 
-    private static bool ShouldWriteCompatibilityJson(ConfigObj config)
-        => config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
+    private static bool ShouldWriteDebugJson(ConfigObj config)
+        => config.WriteDebugJson;
 
-    private static void PrepareCompatibilityJsonOutputs(ConfigObj config)
+    private static void PrepareDefaultIndexOutputs(ConfigObj config)
     {
-        if (ShouldWriteCompatibilityJson(config))
+        if (ShouldWriteDebugJson(config))
             return;
 
         var outputDir = Path.GetFullPath(config.OutputDir);
@@ -2336,7 +2331,7 @@ public class UnrealExporter
             output = Path.GetFullPath(outputPath),
         };
         WriteExportEventSqlite(config, "export_manifest", JObject.FromObject(entry));
-        if (!ShouldWriteCompatibilityJson(config))
+        if (!ShouldWriteDebugJson(config))
             return;
 
         var manifestPath = Path.Combine(Path.GetFullPath(config.OutputDir), "export_manifest.jsonl");
@@ -2350,7 +2345,7 @@ public class UnrealExporter
     private static void AppendAssetCatalog(ConfigObj config, object entry)
     {
         WriteExportEventSqlite(config, "asset_catalog", JObject.FromObject(entry));
-        if (!ShouldWriteCompatibilityJson(config))
+        if (!ShouldWriteDebugJson(config))
             return;
 
         var catalogPath = Path.Combine(Path.GetFullPath(config.OutputDir), "asset_catalog.jsonl");
@@ -3199,7 +3194,7 @@ public class UnrealExporter
         };
 
         WriteExportEventSqlite(config, "animation_bindings", JObject.FromObject(entry));
-        if (!ShouldWriteCompatibilityJson(config))
+        if (!ShouldWriteDebugJson(config))
             return;
 
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "animation_bindings.jsonl");
@@ -3371,7 +3366,7 @@ public class UnrealExporter
         if (!HasUsefulAnimationMetadata(asset))
             return false;
 
-        if (!ShouldWriteCompatibilityJson(config))
+        if (!ShouldWriteDebugJson(config))
             return true;
 
         var outputPath = attemptedOutputPath + ".metadata.json";
@@ -4205,8 +4200,7 @@ public class ConfigObj
     public string? UseCheckpointFile { get; set; }
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
-    public bool SqliteOnlyIndex { get; set; } = true;
-    public bool WriteCompatibilityJson { get; set; }
+    public bool WriteDebugJson { get; set; }
     public bool GenerateSourceIndex { get; set; }
     public bool? AutoExportReferencedAssets { get; set; }
     public bool? AutoExportCompatibleAnimations { get; set; }

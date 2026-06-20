@@ -18,7 +18,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 2. 贴图与材质
    - PNG/HDR sidecar 继续导出，但要统一进入 `Textures/_Shared`，原目录使用硬链接减少重复。
-   - `library_index.db.texture_links` 必须记录原贴图、共享贴图、sha256、大小和硬链接状态；`asset_catalog.jsonl` 仅作为兼容视图，Texture 行以 `export_events.db.asset_catalog` / `library_index.db.assets` 为准。
+   - `library_index.db.texture_links` 必须记录原贴图、共享贴图、sha256、大小和硬链接状态；`asset_catalog.jsonl` 仅作为人工排查视图，Texture 行以 `export_events.db.asset_catalog` / `library_index.db.assets` 为准。
    - `material_texture_slots.jsonl` 和 `library_index.db.material_texture_slots` 必须记录材质 slot、UE 贴图对象、导出贴图、共享贴图、sha256 和匹配状态。
    - 材质 JSON 必须保留 UE 材质参数、贴图槽、颜色、scalar、switch、blend mode 和 shading model。
    - 已支持 `:gltf` 输出文本 glTF + `.bin`，并在材质槽和共享贴图明确匹配时改写 glTF image URI；GLB 继续作为独立预览格式。
@@ -31,7 +31,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 4. 动画
    - 支持 `ueanim` 与 `psa` 输出类型，目标对象包括 `UAnimSequence`、`UAnimMontage`、`UAnimComposite`。
-   - 导出时必须写 `export_events.db.animation_bindings`，记录动画源路径、对象路径、Skeleton、SkeletonGuid、时长、帧数、track 数、track 对应骨骼索引、压缩类型和导出状态；`animation_bindings.jsonl` 仅作为兼容视图。
+   - 导出时必须写 `export_events.db.animation_bindings`，记录动画源路径、对象路径、Skeleton、SkeletonGuid、时长、帧数、track 数、track 对应骨骼索引、压缩类型和导出状态；`animation_bindings.jsonl` 仅作为人工排查视图。
    - ACL 压缩动画需要 native ACL 支持；如果 DLL 缺少 `nAllocate/nReadACLData`，必须明确标记 blocked，不能吞异常或伪装成功。
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
 
@@ -46,18 +46,18 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 6. 索引与报告
    - `library_index.db` 是已导出素材库的 SQLite 优先查询入口，浏览器、筛选器和验收脚本默认应读 SQLite；JSON/JSONL 只在明确需要人工 diff/调试视图时生成。
-   - 默认 `sqliteOnlyIndex=true` / `writeCompatibilityJson=false`：导出事件优先写入 `export_events.db`，源包对象映射和源索引 resume/fingerprint 状态保留在 `ue_source_index.db`，材质 sidecar 摘要、贴图去重关系和摘要、材质贴图槽、glTF 共享贴图改写关系、组件关系、组件聚合、模型验证缓存、模型覆盖、任务模型质量、模型验证、骨架分组、动画验证、模型动画关系、健康报告和验收报告优先写入 `library_work.db` / `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`ue_source_index.metadata.json`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`model_validation.json`、`skeletons.json`、`animation_validation.json`、`animation_validation.jsonl`、`model_animations.json`、`library_health.json`、`library_acceptance.json`、失败动画 `.ueanim.metadata.json` 侧车默认不生成；旧版 `.ue_model_validation_cache.json` 只作为一次性缓存迁移读取，命中后会迁移到 `library_work.db.model_validation_cache`。
+   - SQLite-first 是默认且不可关闭的机器索引路径，`writeDebugJson=false`：导出事件优先写入 `export_events.db`，源包对象映射和源索引 resume/fingerprint 状态保留在 `ue_source_index.db`，材质 sidecar 摘要、贴图去重关系和摘要、材质贴图槽、glTF 共享贴图改写关系、组件关系、组件聚合、模型验证缓存、模型覆盖、任务模型质量、模型验证、骨架分组、动画验证、模型动画关系、健康报告和验收报告优先写入 `library_work.db` / `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`ue_source_index.metadata.json`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`model_validation.json`、`skeletons.json`、`animation_validation.json`、`animation_validation.jsonl`、`model_animations.json`、`library_health.json`、`library_acceptance.json`、失败动画 `.ueanim.metadata.json` 侧车默认不生成；旧版 `.ue_model_validation_cache.json` 只作为一次性缓存迁移读取，命中后会迁移到 `library_work.db.model_validation_cache`。
    - 即使 `generateLibraryIndexes=false` 只运行共享贴图去重，SQLite-first 默认也必须生效：贴图链接和去重摘要写入 `library_work.db`，不额外生成 `texture_links.jsonl` / `texture_dedupe_summary.json`。
    - 大型 UE5 全量导出应配置 `maxHeavyExportDegreeOfParallelism` 和 `memorySoftLimitGb`。`maxDegreeOfParallelism` 控制整体扫描并发，`maxHeavyExportDegreeOfParallelism` 只限制 `uasset` / `umap` 包加载、贴图解码、模型/动画导出这类重活的同时数量；`memorySoftLimitGb` 按进程 Private Bytes 做软水位，超过后会暂停新重活、触发 GC，等内存回落后继续。它们只影响调度和稳定性，不改变 Mesh、贴图、材质、骨骼、动画导出内容。
    - `sourceIndexCommitInterval` 控制源索引事务提交批次。全量 NTE/Batman 这类 20 万级包索引建议保持在 100 左右，降低 SQLite WAL、事务和 CUE4Parse 临时对象叠加造成的峰值；需要极限吞吐时可以调大，但内存峰值也会更难控。
    - `createNewCheckpoint` 默认写 `checkpoints/*.checkpoint.db`，用 `checkpoint_files(path, size)` 替代旧版 `.ckpt` JSON 字典；`useCheckpointFile: "latest"` 读取最新同名 SQLite checkpoint。
    - `resumeExports` 的运行状态写入 `export_resume_state.db.export_jobs` 和 `export_resume_state.db.export_job_outputs`；输出文件列表按行保存，不再用 `outputs_json` 数组。
-   - `library_index.db.assets` 是素材库资产查询总入口；`asset_catalog.jsonl` 仅作为兼容视图，导出主链路数据优先来自 `export_events.db.asset_catalog`，后处理再同步到 `library_index.db.assets`。
+   - `library_index.db.assets` 是素材库资产查询总入口；`asset_catalog.jsonl` 仅作为人工排查视图，导出主链路数据优先来自 `export_events.db.asset_catalog`，后处理再同步到 `library_index.db.assets`。
    - 浏览器模型列表只读 `library_index.db.assets` 显式列和 `model_validation` / `model_coverage` 等验证表，不再用 `json_extract(assets.raw_json, ...)` 兜底。
    - `library_index.db` 必须包含 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports、package_object_maps 等常用查询表；贴图去重摘要写入 `library_reports` 的 `texture_dedupe` 记录。
-   - `export_events.db.export_manifest` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`；`export_manifest.jsonl` 仅作为兼容视图。
-   - `export_events.db.animation_bindings` 记录动画发现、导出状态、Skeleton、track/segment/section 和压缩信息，并同步到 `library_index.db.animation_bindings`；`animation_bindings.jsonl` 仅作为兼容视图。
-   - `export_events.db.auto_referenced_exports` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因，并同步到 `library_index.db.auto_referenced_exports`；`auto_referenced_exports.jsonl` 仅作为兼容视图。
+   - `export_events.db.export_manifest` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`；`export_manifest.jsonl` 仅作为人工排查视图。
+   - `export_events.db.animation_bindings` 记录动画发现、导出状态、Skeleton、track/segment/section 和压缩信息，并同步到 `library_index.db.animation_bindings`；`animation_bindings.jsonl` 仅作为人工排查视图。
+   - `export_events.db.auto_referenced_exports` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因，并同步到 `library_index.db.auto_referenced_exports`；`auto_referenced_exports.jsonl` 仅作为人工排查视图。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox，并结合材质 sidecar 与 `material_texture_slots` 判断外部材质贴图关系，避免把未内嵌贴图但关系完整的模型误报为异常。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_index_metadata、source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
    - `library_index.db` 面向已导出素材库，记录 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports 和 package_object_maps。常用筛选字段必须显式列化，完整机器细节应优先拆成子表；`raw_json` 只作为尚未迁移字段的临时过渡或人工调试信息。
@@ -84,7 +84,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `package_object_maps`，在源索引阶段记录 UE 包 ImportMap/ExportMap，并同步生成素材库侧 `package_object_maps.jsonl` 和 `library_index.db.package_object_maps`，用于分析包级依赖、导出对象、class/outer/super/template 关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
-- `model_animations.json` 仅作为显式兼容/调试视图；`library_index.db.relation_animations` 保留动画 segment/section 计数，完整 segment/section 明细写入 `relation_animation_segments` 和 `relation_animation_sections`，用于区分直接可采样 AnimSequence 与 Montage/Composite 容器动画。
+- `model_animations.json` 仅作为显式调试/人工视图；`library_index.db.relation_animations` 保留动画 segment/section 计数，完整 segment/section 明细写入 `relation_animation_segments` 和 `relation_animation_sections`，用于区分直接可采样 AnimSequence 与 Montage/Composite 容器动画。
 - 下一步继续扩展 ExternalActor 描述数据和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路

@@ -17,7 +17,7 @@ internal static class UELibraryPostProcessor
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 
-    public static void Run(string libraryRoot, bool dedupeTextures, bool writeCompatibilityJson = false)
+    public static void Run(string libraryRoot, bool dedupeTextures, bool writeDebugJson = false)
     {
         if (string.IsNullOrWhiteSpace(libraryRoot))
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
@@ -27,7 +27,7 @@ internal static class UELibraryPostProcessor
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
         Console.WriteLine($"UE Library postprocess root: {root}");
-        Console.WriteLine($"Compatibility JSON/JSONL outputs: {(writeCompatibilityJson ? "enabled" : "disabled")}");
+        Console.WriteLine($"Debug JSON/JSONL outputs: {(writeDebugJson ? "enabled" : "disabled")}");
         var modelFiles = new[] { "*.glb", "*.gltf" }
             .SelectMany(pattern => Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
             .Where(x => !IsIgnoredLibraryPath(root, x))
@@ -66,7 +66,7 @@ internal static class UELibraryPostProcessor
         var textureLinks = dedupeTextures
             ? RunStage("共享贴图去重/硬链接", () =>
             {
-                var result = DeduplicateTextureFilesCore(root, writeCompatibilityJson);
+                var result = DeduplicateTextureFilesCore(root, writeDebugJson);
                 textureDedupeSummary = result.Summary;
                 return result.Links;
             })
@@ -78,32 +78,32 @@ internal static class UELibraryPostProcessor
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
-        var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows, writeCompatibilityJson));
+        var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows, writeDebugJson));
         var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
-        var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex, writeCompatibilityJson));
+        var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex, writeDebugJson));
         RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
-        var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots, writeCompatibilityJson));
+        var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots, writeDebugJson));
         mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(
             root,
             mergedCatalogRows.Concat(reports.Select(BuildModelCatalogRow)).ToList(),
-            writeCompatibilityJson));
-        var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
-        var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex, writeCompatibilityJson));
-        var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations, writeCompatibilityJson));
-        var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeCompatibilityJson));
-        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex, writeCompatibilityJson));
-        RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage, writeCompatibilityJson));
-        RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeCompatibilityJson));
-        var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
-        var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
-        var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
+            writeDebugJson));
+        var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeDebugJson));
+        var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex, writeDebugJson));
+        var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations, writeDebugJson));
+        var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeDebugJson));
+        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex, writeDebugJson));
+        RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage, writeDebugJson));
+        RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeDebugJson));
+        var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeDebugJson));
+        var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeDebugJson));
+        var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeDebugJson));
         RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, materialIndex.Values, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance, textureDedupeSummary));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
     }
 
-    public static void MaterializeAnimationMetadataSidecars(string libraryRoot, bool writeCompatibilityJson = false)
+    public static void MaterializeAnimationMetadataSidecars(string libraryRoot, bool writeDebugJson = false)
     {
         if (string.IsNullOrWhiteSpace(libraryRoot))
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
@@ -112,14 +112,14 @@ internal static class UELibraryPostProcessor
         if (!Directory.Exists(root))
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
-        var catalogSummary = MaterializeAnimationMetadataRows(root, "asset_catalog", Path.Combine(root, "asset_catalog.jsonl"), true, writeCompatibilityJson);
-        var bindingSummary = MaterializeAnimationMetadataRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl"), false, writeCompatibilityJson);
+        var catalogSummary = MaterializeAnimationMetadataRows(root, "asset_catalog", Path.Combine(root, "asset_catalog.jsonl"), true, writeDebugJson);
+        var bindingSummary = MaterializeAnimationMetadataRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl"), false, writeDebugJson);
         Console.WriteLine(JsonConvert.SerializeObject(new
         {
             root,
             assetCatalog = catalogSummary,
             animationBindings = bindingSummary,
-            note = writeCompatibilityJson
+            note = writeDebugJson
                 ? "已把失败但含曲线、通知或容器片段的 UE 动画写成 .metadata.json 调试侧车，并同步 SQLite；它们仍不会进入默认可播放动画候选。"
                 : "已把失败但含曲线、通知或容器片段的 UE 动画标记为 SQLite metadata 行；默认不写 .metadata.json 侧车，它们仍不会进入默认可播放动画候选。"
         }, Formatting.Indented));
@@ -130,11 +130,11 @@ internal static class UELibraryPostProcessor
         string tableName,
         string legacyJsonLinesPath,
         bool updateCatalogRow,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
-        var sqlite = MaterializeAnimationMetadataSqlite(root, tableName, updateCatalogRow, writeCompatibilityJson);
+        var sqlite = MaterializeAnimationMetadataSqlite(root, tableName, updateCatalogRow, writeDebugJson);
         AnimationMetadataMaterializeSummary? legacy = null;
-        if (writeCompatibilityJson && File.Exists(legacyJsonLinesPath))
+        if (writeDebugJson && File.Exists(legacyJsonLinesPath))
             legacy = MaterializeAnimationMetadataJsonLines(root, legacyJsonLinesPath, updateCatalogRow);
 
         if (sqlite != null || legacy != null)
@@ -160,7 +160,7 @@ internal static class UELibraryPostProcessor
         string root,
         string tableName,
         bool updateCatalogRow,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var dbPath = Path.Combine(root, "export_events.db");
         if (!File.Exists(dbPath))
@@ -208,7 +208,7 @@ internal static class UELibraryPostProcessor
                     continue;
 
                 string? metadataPath = null;
-                if (writeCompatibilityJson)
+                if (writeDebugJson)
                 {
                     metadataPath = BuildAnimationMetadataPath(root, row);
                     if (string.IsNullOrWhiteSpace(metadataPath))
@@ -497,7 +497,7 @@ internal static class UELibraryPostProcessor
 
         var root = Path.GetFullPath(libraryRoot);
         var rows = LoadModelCoverageRowsForTaskQuality(root);
-        WriteTaskModelQualityReport(root, rows, writeCompatibilityJson: false);
+        WriteTaskModelQualityReport(root, rows, writeDebugJson: false);
         Console.WriteLine($"UE task model quality report refreshed: {root}");
     }
 
@@ -1442,11 +1442,11 @@ internal static class UELibraryPostProcessor
         });
     }
 
-    private static List<JObject> WriteAssetCatalog(string root, List<JObject> rows, bool writeCompatibilityJson)
+    private static List<JObject> WriteAssetCatalog(string root, List<JObject> rows, bool writeDebugJson)
     {
         var path = Path.Combine(root, "asset_catalog.jsonl");
         var mergedRows = MergeExistingCatalogRows(root, path, rows);
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
         {
             DeleteIfExists(path);
             return mergedRows;
@@ -2078,22 +2078,22 @@ internal static class UELibraryPostProcessor
         Dictionary<string, MaterialInfo> materialIndex,
         List<TextureLinkInfo> textureLinks,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var links = BuildMaterialTextureSlotLinks(materialIndex, textureLinks, sourceIndex);
         var path = Path.Combine(root, "material_texture_slots.jsonl");
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
             DeleteIfExists(path);
 
-        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "material_texture_slots");
+        using var workConnection = writeDebugJson ? null : OpenLibraryWorkDb(root, "material_texture_slots");
         using var workTransaction = workConnection?.BeginTransaction();
-        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
+        using (var writer = writeDebugJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
             foreach (var link in links.OrderBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
                          .ThenBy(x => x.SlotName, StringComparer.OrdinalIgnoreCase)
                          .ThenBy(x => x.TextureObjectPath, StringComparer.OrdinalIgnoreCase))
             {
-                if (writeCompatibilityJson)
+                if (writeDebugJson)
                 {
                     writer!.WriteLine(JsonConvert.SerializeObject(new
                     {
@@ -2397,14 +2397,14 @@ internal static class UELibraryPostProcessor
         string root,
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var totalRelations = sourceIndex.ComponentAssetRelationCount > 0
             ? sourceIndex.ComponentAssetRelationCount
             : sourceIndex.ComponentAssetRelations.Length;
         if (!sourceIndex.Available || totalRelations == 0)
         {
-            WriteEmptyComponentRelations(root, writeCompatibilityJson);
+            WriteEmptyComponentRelations(root, writeDebugJson);
             return [];
         }
 
@@ -2419,17 +2419,17 @@ internal static class UELibraryPostProcessor
             .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
         var retainedLinks = new List<ComponentAssetRelationLink>();
         var path = Path.Combine(root, "component_asset_relations.jsonl");
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
             DeleteIfExists(path);
 
-        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "component_asset_relations");
+        using var workConnection = writeDebugJson ? null : OpenLibraryWorkDb(root, "component_asset_relations");
         using var workTransaction = workConnection?.BeginTransaction();
-        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
+        using (var writer = writeDebugJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
             foreach (var relation in EnumerateSourceComponentAssetRelations(sourceIndex))
             {
                 var link = BuildComponentAssetRelationLink(relation, assetLookup, packageObjectsByPath, sourceIndex);
-                if (writeCompatibilityJson)
+                if (writeDebugJson)
                     writer!.WriteLine(SerializeComponentAssetRelationLink(link));
                 else
                     InsertComponentAssetRelation(workConnection!, workTransaction!, link);
@@ -2443,13 +2443,13 @@ internal static class UELibraryPostProcessor
         FinalizeWorkDb(workConnection);
         var links = retainedLinks.ToArray();
         Console.WriteLine($"Component relations streamed: total={totalRelations}, retainedInMemory={links.Length}.");
-        WriteComponentGroups(root, links, writeCompatibilityJson);
+        WriteComponentGroups(root, links, writeDebugJson);
         return links;
     }
 
-    private static void WriteEmptyComponentRelations(string root, bool writeCompatibilityJson)
+    private static void WriteEmptyComponentRelations(string root, bool writeDebugJson)
     {
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(Path.Combine(root, "component_asset_relations.jsonl"), "", Encoding.UTF8);
         else
         {
@@ -2458,7 +2458,7 @@ internal static class UELibraryPostProcessor
             FinalizeWorkDb(workConnection);
         }
 
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
         {
             File.WriteAllText(
                 Path.Combine(root, "component_groups.json"),
@@ -2653,11 +2653,11 @@ internal static class UELibraryPostProcessor
             File.Delete(path);
     }
 
-    private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex, bool writeCompatibilityJson)
+    private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex, bool writeDebugJson)
     {
         var rows = sourceIndex.Available ? sourceIndex.PackageObjectMaps : [];
         var path = Path.Combine(root, "package_object_maps.jsonl");
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
         {
             DeleteIfExists(path);
             return rows;
@@ -3055,9 +3055,9 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static void WriteComponentGroups(string root, ComponentAssetRelationLink[] links, bool writeCompatibilityJson)
+    private static void WriteComponentGroups(string root, ComponentAssetRelationLink[] links, bool writeDebugJson)
     {
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
         {
             DeleteIfExists(Path.Combine(root, "component_groups.json"));
             return;
@@ -3325,7 +3325,7 @@ internal static class UELibraryPostProcessor
         string root,
         List<ModelValidationEntry> reports,
         MaterialTextureSlotLink[] materialTextureSlots,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var rows = new List<SharedGltfTextureLink>();
         foreach (var report in reports.Where(x => x.RelativePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
@@ -3388,18 +3388,18 @@ internal static class UELibraryPostProcessor
         }
 
         var path = Path.Combine(root, "shared_texture_gltf_links.jsonl");
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
             DeleteIfExists(path);
 
-        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "shared_gltf_texture_links");
+        using var workConnection = writeDebugJson ? null : OpenLibraryWorkDb(root, "shared_gltf_texture_links");
         using var workTransaction = workConnection?.BeginTransaction();
-        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
+        using (var writer = writeDebugJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
             foreach (var row in rows.OrderBy(x => x.Model, StringComparer.OrdinalIgnoreCase)
                          .ThenBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
                          .ThenBy(x => x.Semantic, StringComparer.OrdinalIgnoreCase))
             {
-                if (writeCompatibilityJson)
+                if (writeDebugJson)
                     writer!.WriteLine(JsonConvert.SerializeObject(row));
                 else
                     InsertSharedGltfTextureLink(workConnection!, workTransaction!, row);
@@ -4023,7 +4023,7 @@ internal static class UELibraryPostProcessor
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex,
         ComponentAssetRelationLink[] componentAssetRelations,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var validations = BuildAnimationValidations(root, catalogRows, sourceIndex, componentAssetRelations);
         var summary = new AnimationValidationSummary
@@ -4057,7 +4057,7 @@ internal static class UELibraryPostProcessor
 
         var summaryPath = Path.Combine(root, "animation_validation.json");
         var detailPath = Path.Combine(root, "animation_validation.jsonl");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
         {
             File.WriteAllText(summaryPath, json.ToString(Formatting.Indented), Encoding.UTF8);
             WriteAnimationValidationJsonLines(detailPath, validations);
@@ -5286,7 +5286,7 @@ internal static class UELibraryPostProcessor
         string root,
         List<JObject> catalogRows,
         AnimationValidationSummary animationValidation,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var models = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -5417,7 +5417,7 @@ internal static class UELibraryPostProcessor
         };
 
         var path = Path.Combine(root, "model_animations.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(path, summary.ToString(Formatting.Indented));
         else
             DeleteIfExists(path);
@@ -5541,7 +5541,7 @@ internal static class UELibraryPostProcessor
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Count();
 
-    private static void WriteModelValidation(string root, List<ModelValidationEntry> reports, bool writeCompatibilityJson)
+    private static void WriteModelValidation(string root, List<ModelValidationEntry> reports, bool writeDebugJson)
     {
         var summary = new
         {
@@ -5585,7 +5585,7 @@ internal static class UELibraryPostProcessor
             }),
         };
         var path = Path.Combine(root, "model_validation.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
         {
             File.WriteAllText(
                 path,
@@ -5605,7 +5605,7 @@ internal static class UELibraryPostProcessor
         ComponentAssetRelationLink[] componentAssetRelations,
         JObject modelAnimationRelations,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var modelRows = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -5730,7 +5730,7 @@ internal static class UELibraryPostProcessor
         });
 
         var path = Path.Combine(root, "model_coverage.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(path, json.ToString(Formatting.Indented), Encoding.UTF8);
         else
             DeleteIfExists(path);
@@ -5956,7 +5956,7 @@ internal static class UELibraryPostProcessor
         JObject modelCoverage,
         AnimationValidationSummary animationValidation,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var assets = catalogRows.ToArray();
         var models = assets.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -6104,7 +6104,7 @@ internal static class UELibraryPostProcessor
         });
 
         var path = Path.Combine(root, "library_acceptance.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(path, acceptance.ToString(Formatting.Indented), Encoding.UTF8);
         else
             DeleteIfExists(path);
@@ -6235,16 +6235,16 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static void WriteTaskModelQualityReport(string root, JObject modelCoverage, bool writeCompatibilityJson)
+    private static void WriteTaskModelQualityReport(string root, JObject modelCoverage, bool writeDebugJson)
     {
         var rows = ((JArray?)modelCoverage["models"] ?? [])
             .OfType<JObject>()
             .Select(ReadModelCoverageRow)
             .ToArray();
-        WriteTaskModelQualityReport(root, rows, writeCompatibilityJson);
+        WriteTaskModelQualityReport(root, rows, writeDebugJson);
     }
 
-    private static void WriteTaskModelQualityReport(string root, IEnumerable<ModelCoverageRow> modelCoverageRows, bool writeCompatibilityJson)
+    private static void WriteTaskModelQualityReport(string root, IEnumerable<ModelCoverageRow> modelCoverageRows, bool writeDebugJson)
     {
         var rows = modelCoverageRows
             .Where(IsTaskOrPropCoverageRow)
@@ -6345,12 +6345,12 @@ internal static class UELibraryPostProcessor
         });
 
         var jsonPath = Path.Combine(root, "task_model_quality.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(jsonPath, json.ToString(Formatting.Indented), Encoding.UTF8);
         else
             DeleteIfExists(jsonPath);
 
-        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows, relationReviewRows, writeCompatibilityJson);
+        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows, relationReviewRows, writeDebugJson);
     }
 
     private static bool IsTaskOrPropCoverageRow(ModelCoverageRow row)
@@ -6416,7 +6416,7 @@ internal static class UELibraryPostProcessor
         ModelCoverageRow[] readyRows,
         ModelCoverageRow[] reviewRows,
         ModelCoverageRow[] relationReviewRows,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var warningCount = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase));
         var errorCount = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase));
@@ -6440,7 +6440,7 @@ internal static class UELibraryPostProcessor
             $"模型验证 warning/error: {warningCount}/{errorCount}",
             $"缺材质/无外部贴图槽: {rows.Count(x => x.MaterialCount == 0)}/{rows.Count(x => x.TextureCount == 0)}",
             "",
-            writeCompatibilityJson
+            writeDebugJson
                 ? "详细机器报告: `task_model_quality.json`"
                 : "详细机器索引: `library_index.db.model_coverage`（筛选 `is_task_or_prop`、`needs_review`、`relation_needs_review`），复查原因见 `model_coverage_review_reasons`。",
             "",
@@ -8916,7 +8916,7 @@ internal static class UELibraryPostProcessor
         List<ModelValidationEntry> reports,
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var modelsByOutput = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -9012,7 +9012,7 @@ internal static class UELibraryPostProcessor
         var skeletonArray = JArray.FromObject(skeletons);
 
         var path = Path.Combine(root, "skeletons.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
         {
             File.WriteAllText(
                 path,
@@ -9053,7 +9053,7 @@ internal static class UELibraryPostProcessor
         JObject modelCoverage,
         AnimationValidationSummary animationValidation,
         SourceIndexSnapshot sourceIndex,
-        bool writeCompatibilityJson)
+        bool writeDebugJson)
     {
         var models = catalogRows.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
         var materials = catalogRows.Where(x => string.Equals((string?)x["kind"], "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -9270,7 +9270,7 @@ internal static class UELibraryPostProcessor
         };
 
         var path = Path.Combine(root, "library_health.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
             File.WriteAllText(path, health.ToString(Formatting.Indented), Encoding.UTF8);
         else
             DeleteIfExists(path);
@@ -9335,32 +9335,32 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
         sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如材质 sidecar 摘要、贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录源索引 resume/fingerprint 状态、完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
-        sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
-        sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
-        sb.AppendLine("| `library_acceptance.json` | 验收摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
-        sb.AppendLine("| `texture_dedupe_summary.json` | 贴图去重摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports` 的 `texture_dedupe` 记录。 |");
-        sb.AppendLine("| `export_manifest.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
-        sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
-        sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
-        sb.AppendLine("| `model_coverage.json` | 模型覆盖兼容/人工排查视图；主数据在 `library_index.db.model_coverage`。 |");
-        sb.AppendLine("| `model_animations.json` | 模型动画关系兼容/人工排查视图；主数据在 `library_index.db.model_animation_relations` 和 `library_index.db.relation_animations`。 |");
-        sb.AppendLine("| `animation_validation.json` | 动画兼容验证兼容/人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
-        sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证兼容/人工排查视图；主数据在 `library_index.db.model_validation`。 |");
-        sb.AppendLine("| `skeletons.json` | 骨架分组兼容/人工排查视图；主数据在 `library_index.db.skeleton_groups`。 |");
+        sb.AppendLine("| `asset_catalog.jsonl` | 人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
+        sb.AppendLine("| `library_health.json` | 健康摘要人工排查视图；主数据在 `library_index.db.library_reports`。 |");
+        sb.AppendLine("| `library_acceptance.json` | 验收摘要人工排查视图；主数据在 `library_index.db.library_reports`。 |");
+        sb.AppendLine("| `texture_dedupe_summary.json` | 贴图去重摘要人工排查视图；主数据在 `library_index.db.library_reports` 的 `texture_dedupe` 记录。 |");
+        sb.AppendLine("| `export_manifest.jsonl` | 人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
+        sb.AppendLine("| `auto_referenced_exports.jsonl` | 人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
+        sb.AppendLine("| `animation_bindings.jsonl` | 人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
+        sb.AppendLine("| `model_coverage.json` | 模型覆盖人工排查视图；主数据在 `library_index.db.model_coverage`。 |");
+        sb.AppendLine("| `model_animations.json` | 模型动画关系人工排查视图；主数据在 `library_index.db.model_animation_relations` 和 `library_index.db.relation_animations`。 |");
+        sb.AppendLine("| `animation_validation.json` | 动画兼容验证人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
+        sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证人工排查视图；主数据在 `library_index.db.model_validation`。 |");
+        sb.AppendLine("| `skeletons.json` | 骨架分组人工排查视图；主数据在 `library_index.db.skeleton_groups`。 |");
         sb.AppendLine("| `library_index.db.material_sidecars` | 材质 sidecar 摘要和原始参数缓存；新后处理优先通过 `export_events.db.asset_catalog` 定位材质 JSON，再缓存到 SQLite，避免全盘递归扫描 JSON。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `component_asset_relations.jsonl` | 蓝图、组件、默认对象到模型/材质/动画/Skeleton 的显式 UE 关系。 |");
-        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系兼容/人工排查视图；主数据在 `library_index.db.component_groups`，完整逐行关系在 `library_index.db.component_asset_relations`。 |");
+        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系人工排查视图；主数据在 `library_index.db.component_groups`，完整逐行关系在 `library_index.db.component_asset_relations`。 |");
         sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 摘要；完整原始依赖和导出对象记录保留在 `ue_source_index.db`。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
         sb.AppendLine("## 模型动画关系字段");
         sb.AppendLine();
-        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是显式请求兼容/调试 JSON 时才生成的人读视图，默认可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
+        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是显式请求调试 JSON 时才生成的人读视图，默认可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("默认导出和后处理采用 SQLite-first：大型机器索引进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`，贴图去重摘要会进入 `library_index.db.library_reports`。只有显式请求兼容/调试 JSON 时才写这些人读视图，完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("默认导出和后处理采用 SQLite-first：大型机器索引进入 SQLite，不再生成对应 JSON/JSONL 人工排查视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`，贴图去重摘要会进入 `library_index.db.library_reports`。只有显式请求调试 JSON 时才写这些人读视图，完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -9411,9 +9411,9 @@ internal static class UELibraryPostProcessor
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }
 
-    public static void DeduplicateTextureFiles(string root, bool writeCompatibilityJson = false)
+    public static void DeduplicateTextureFiles(string root, bool writeDebugJson = false)
     {
-        DeduplicateTextureFilesCore(root, writeCompatibilityJson);
+        DeduplicateTextureFilesCore(root, writeDebugJson);
     }
 
     private static List<TextureLinkInfo> LoadExistingTextureLinks(string root)
@@ -9497,7 +9497,7 @@ internal static class UELibraryPostProcessor
         return result;
     }
 
-    private static TextureDedupeResult DeduplicateTextureFilesCore(string root, bool writeCompatibilityJson)
+    private static TextureDedupeResult DeduplicateTextureFilesCore(string root, bool writeDebugJson)
     {
         var textureFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
             .Where(x => TextureExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
@@ -9548,7 +9548,7 @@ internal static class UELibraryPostProcessor
             });
         }
 
-        WriteTextureLinks(root, links, writeCompatibilityJson);
+        WriteTextureLinks(root, links, writeDebugJson);
         var removedStaleSharedFiles = RemoveUnreferencedSharedTextures(root, sharedRoot, links);
         var summary = JObject.FromObject(new
         {
@@ -9565,7 +9565,7 @@ internal static class UELibraryPostProcessor
         });
         WriteLibraryWorkReport(root, "texture_dedupe", summary);
         var summaryPath = Path.Combine(root, "texture_dedupe_summary.json");
-        if (writeCompatibilityJson)
+        if (writeDebugJson)
         {
             File.WriteAllText(summaryPath, summary.ToString(Formatting.Indented), Encoding.UTF8);
         }
@@ -9630,19 +9630,19 @@ internal static class UELibraryPostProcessor
         return removed;
     }
 
-    private static void WriteTextureLinks(string root, List<TextureLinkInfo> links, bool writeCompatibilityJson)
+    private static void WriteTextureLinks(string root, List<TextureLinkInfo> links, bool writeDebugJson)
     {
         var path = Path.Combine(root, "texture_links.jsonl");
-        if (!writeCompatibilityJson)
+        if (!writeDebugJson)
             DeleteIfExists(path);
 
-        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "texture_links");
+        using var workConnection = writeDebugJson ? null : OpenLibraryWorkDb(root, "texture_links");
         using var workTransaction = workConnection?.BeginTransaction();
-        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
+        using (var writer = writeDebugJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
             foreach (var link in links.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             {
-                if (writeCompatibilityJson)
+                if (writeDebugJson)
                 {
                     writer!.WriteLine(JsonConvert.SerializeObject(new
                     {

@@ -329,7 +329,7 @@ internal static class UESourceIndexBuilder
             ["completedPackageCount"] = completedPackageCount,
         };
         UpsertSourceIndexMetadata(connection, metadata);
-        if (ShouldWriteCompatibilityJson(config))
+        if (ShouldWriteDebugJson(config))
             File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
         else
             DeleteIfExists(metadataPath);
@@ -381,8 +381,8 @@ internal static class UESourceIndexBuilder
         command.ExecuteNonQuery();
     }
 
-    private static bool ShouldWriteCompatibilityJson(ConfigObj config)
-        => config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
+    private static bool ShouldWriteDebugJson(ConfigObj config)
+        => config.WriteDebugJson;
 
     private static HashSet<string> LoadCompletedSourceIndexPackages(SqliteConnection connection)
     {
