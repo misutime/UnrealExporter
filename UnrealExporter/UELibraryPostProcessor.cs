@@ -6627,8 +6627,7 @@ internal static class UELibraryPostProcessor
                 target_path TEXT,
                 source TEXT,
                 output_type TEXT,
-                reason TEXT,
-                raw_json TEXT NOT NULL
+                reason TEXT
             );
             """);
         Execute(connection, transaction, """
@@ -7474,10 +7473,10 @@ internal static class UELibraryPostProcessor
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO auto_referenced_exports (
-                    stage, status, relation_type, target_path, source, output_type, reason, raw_json
+                    stage, status, relation_type, target_path, source, output_type, reason
                 )
                 VALUES (
-                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason, $rawJson
+                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason
                 );
                 """;
             Add(command, "$stage", (string?)row["stage"]);
@@ -7487,7 +7486,6 @@ internal static class UELibraryPostProcessor
             Add(command, "$source", (string?)row["source"]);
             Add(command, "$outputType", (string?)row["outputType"]);
             Add(command, "$reason", (string?)row["reason"]);
-            Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
         }
     }
@@ -7535,6 +7533,13 @@ internal static class UELibraryPostProcessor
                     if (string.Equals(tableName, "export_manifest", StringComparison.OrdinalIgnoreCase))
                     {
                         foreach (var row in ReadExportManifestEventRows(connection))
+                            yield return row;
+                        yield break;
+                    }
+
+                    if (string.Equals(tableName, "auto_referenced_exports", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var row in ReadAutoReferencedExportEventRows(connection))
                             yield return row;
                         yield break;
                     }
@@ -7588,6 +7593,30 @@ internal static class UELibraryPostProcessor
                 ["name"] = GetString(reader, 5),
                 ["objectPath"] = GetString(reader, 6),
                 ["output"] = GetString(reader, 7),
+            };
+        }
+    }
+
+    private static IEnumerable<JObject> ReadAutoReferencedExportEventRows(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT stage, status, relation_type, target_path, source, output_type, reason
+            FROM auto_referenced_exports
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            yield return new JObject
+            {
+                ["stage"] = GetString(reader, 0),
+                ["status"] = GetString(reader, 1),
+                ["relationType"] = GetString(reader, 2),
+                ["targetPath"] = GetString(reader, 3),
+                ["source"] = GetString(reader, 4),
+                ["outputType"] = GetString(reader, 5),
+                ["reason"] = GetString(reader, 6),
             };
         }
     }

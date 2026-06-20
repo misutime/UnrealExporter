@@ -19,7 +19,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Export resume state | `export_resume_state.db.export_jobs` and `export_resume_state.db.export_job_outputs` | older `outputs_json` rows are discarded when the resume DB is opened |
 | Asset catalog | `export_events.db.asset_catalog`, then `library_index.db.assets` | `asset_catalog.jsonl` is a debug/human view |
 | Animation bindings | `export_events.db.animation_bindings`, then `library_index.db.animation_bindings` | `animation_bindings.jsonl` is a debug/human view |
-| Auto referenced export diagnostics | `export_events.db.auto_referenced_exports`, then `library_index.db.auto_referenced_exports` | `auto_referenced_exports.jsonl` is a debug/human view |
+| Auto referenced export diagnostics | `export_events.db.auto_referenced_exports`, then `library_index.db.auto_referenced_exports` | `auto_referenced_exports.jsonl` is a debug/human view; diagnostic facts are explicit columns without `raw_json` |
 | Export update checkpoints | `checkpoints/*.checkpoint.db.checkpoint_files` | legacy `.ckpt` JSON files are not written by new exports |
 | Texture dedupe links | `library_work.db.texture_links`, then `library_index.db.texture_links` | `texture_links.jsonl` is a debug/human view |
 | Texture dedupe summary | `library_work.db.library_reports(name='texture_dedupe')`, then `library_index.db.library_reports` | `texture_dedupe_summary.json` is a debug/human view |
@@ -84,6 +84,7 @@ SQLite-first indexing is the normal and non-configurable machine path. `writeDeb
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes debug JSONL when explicitly requested.
 - `export_manifest` rows in both `export_events.db` and `library_index.db` now store only explicit columns and no longer keep a duplicate `raw_json` blob.
+- `auto_referenced_exports` rows in both `export_events.db` and `library_index.db` now store only explicit columns and no longer keep a duplicate `raw_json` blob.
 - `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.
 - `export_resume_state.db` stores completed job outputs in `export_job_outputs` rows instead of an `outputs_json` blob.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.

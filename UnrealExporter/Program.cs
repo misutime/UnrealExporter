@@ -2594,10 +2594,10 @@ public class UnrealExporter
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO auto_referenced_exports (
-                    stage, status, relation_type, target_path, source, output_type, reason, raw_json
+                    stage, status, relation_type, target_path, source, output_type, reason
                 )
                 VALUES (
-                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason, $rawJson
+                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason
                 );
                 """;
             Add(command, "$stage", (string?)row["stage"]);
@@ -2607,7 +2607,6 @@ public class UnrealExporter
             Add(command, "$source", (string?)row["source"]);
             Add(command, "$outputType", (string?)row["outputType"]);
             Add(command, "$reason", (string?)row["reason"]);
-            Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
         }
 
@@ -2699,10 +2698,10 @@ public class UnrealExporter
                     target_path TEXT,
                     source TEXT,
                     output_type TEXT,
-                    reason TEXT,
-                    raw_json TEXT NOT NULL
+                    reason TEXT
                 );
                 """);
+            EnsureAutoReferencedExportsNoRawJson(connection);
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_manifest_output ON export_manifest(output, kind);");
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_asset_output ON asset_catalog(output, kind);");
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_asset_object ON asset_catalog(object_path);");
@@ -2737,6 +2736,34 @@ public class UnrealExporter
                 """);
             ExecuteExportEventSql(connection, "DROP TABLE export_manifest;");
             ExecuteExportEventSql(connection, "ALTER TABLE export_manifest_new RENAME TO export_manifest;");
+        }
+
+        private static void EnsureAutoReferencedExportsNoRawJson(SqliteConnection connection)
+        {
+            if (!ExportEventTableColumnExists(connection, "auto_referenced_exports", "raw_json"))
+                return;
+
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE auto_referenced_exports_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stage TEXT,
+                    status TEXT,
+                    relation_type TEXT,
+                    target_path TEXT,
+                    source TEXT,
+                    output_type TEXT,
+                    reason TEXT
+                );
+                """);
+            ExecuteExportEventSql(connection, """
+                INSERT INTO auto_referenced_exports_new (
+                    id, stage, status, relation_type, target_path, source, output_type, reason
+                )
+                SELECT id, stage, status, relation_type, target_path, source, output_type, reason
+                FROM auto_referenced_exports;
+                """);
+            ExecuteExportEventSql(connection, "DROP TABLE auto_referenced_exports;");
+            ExecuteExportEventSql(connection, "ALTER TABLE auto_referenced_exports_new RENAME TO auto_referenced_exports;");
         }
 
         private static bool ExportEventTableColumnExists(SqliteConnection connection, string tableName, string columnName)
