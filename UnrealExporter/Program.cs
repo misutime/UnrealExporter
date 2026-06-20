@@ -3925,80 +3925,28 @@ public class UnrealExporter
 
     public static Dictionary<string, long> LoadCheckpoint(ConfigObj config)
     {
-        if (config?.UseCheckpointFile?.Length > 0)
-        {
-            string checkpointPath = $"{RootDir}\\{config.UseCheckpointFile}";
-            if (config.UseCheckpointFile.Equals("latest"))
-            {
-                string[] allCheckpointPaths = Directory.GetFiles($"{RootDir}\\checkpoints");
-                var pathsForGameTitle = allCheckpointPaths.Where(path =>
-                    path.Contains(config.GameTitle)
-                );
-
-                if (!pathsForGameTitle.Any())
-                {
-                    Console.WriteLine(
-                        $"ERROR: could not find any checkpoints for \"{config.GameTitle}\". Ignoring..."
-                    );
-                    return [];
-                }
-
-                var sortedPaths = pathsForGameTitle.OrderBy(path =>
-                {
-                    string dateTimeFromFileName = path.Split(Path.DirectorySeparatorChar)
-                        .Last()
-                        .Split(".")
-                        .First()
-                        .SubstringAfter(config.GameTitle)[1..];
-                    string date = dateTimeFromFileName.Split(" ")[0];
-                    string time = dateTimeFromFileName.Split(" ")[1].Replace("-", ":");
-                    double unixTime = DateTime
-                        .Parse($"{date} {time}")
-                        .Subtract(new DateTime(1970, 1, 1))
-                        .TotalSeconds;
-                    return unixTime;
-                });
-
-                var latestCheckpointPath = sortedPaths.Last();
-
-                if (File.Exists(latestCheckpointPath))
-                {
-                    useCheckpoint = true;
-                    Console.WriteLine(
-                        $"Using checkpoint: latest ({latestCheckpointPath.Split(Path.DirectorySeparatorChar).Last()})"
-                    );
-                    var fromFile = File.ReadAllText(latestCheckpointPath);
-                    var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(
-                        fromFile
-                    );
-                    return loadedCheckpoint ?? [];
-                }
-
-                return [];
-            }
-            else if (File.Exists(checkpointPath))
-            {
-                useCheckpoint = true;
-                Console.WriteLine($"Using checkpoint: {config.UseCheckpointFile}");
-                var fromFile = File.ReadAllText(checkpointPath);
-                var loadedCheckpoint = JsonConvert.DeserializeObject<Dictionary<string, long>>(
-                    fromFile
-                );
-                return loadedCheckpoint ?? [];
-            }
-            else
-            {
-                Console.WriteLine(
-                    $"ERROR: checkpoint file at location \"{config.UseCheckpointFile}\" does not exist. Ignoring..."
-                );
-                return [];
-            }
-        }
-        else
+        if (string.IsNullOrWhiteSpace(config?.UseCheckpointFile))
         {
             Console.WriteLine($"No checkpoint file selected. Ignoring...");
             return [];
         }
+
+        var checkpointPath = config.UseCheckpointFile.Equals("latest", StringComparison.OrdinalIgnoreCase)
+            ? FindLatestCheckpointDb(config.GameTitle)
+            : ResolveCheckpointPath(config.UseCheckpointFile);
+        if (string.IsNullOrWhiteSpace(checkpointPath) || !File.Exists(checkpointPath))
+        {
+            Console.WriteLine(
+                $"ERROR: checkpoint file at location \"{config.UseCheckpointFile}\" does not exist. Ignoring..."
+            );
+            return [];
+        }
+
+        useCheckpoint = true;
+        Console.WriteLine(config.UseCheckpointFile.Equals("latest", StringComparison.OrdinalIgnoreCase)
+            ? $"Using checkpoint: latest ({Path.GetFileName(checkpointPath)})"
+            : $"Using checkpoint: {config.UseCheckpointFile}");
+        return LoadCheckpointDb(checkpointPath);
     }
 
     public static void CreateCheckpoint(
@@ -4007,17 +3955,145 @@ public class UnrealExporter
     )
     {
         Console.WriteLine();
-        var newCheckpointJson = JsonConvert.SerializeObject(newCheckpointDict, Formatting.Indented);
         var dateStamp = DateTime.Now.ToString("MM-dd-yyyy HH-mm");
-        string checkpointsDirPath = $"{RootDir}\\checkpoints";
+        var checkpointsDirPath = Path.Combine(RootDir, "checkpoints");
+        Directory.CreateDirectory(checkpointsDirPath);
+        var checkpointPath = Path.Combine(checkpointsDirPath, $"{config.GameTitle} {dateStamp}.checkpoint.db");
+        WriteCheckpointDb(checkpointPath, newCheckpointDict, config);
+        Console.WriteLine($"Created checkpoint SQLite DB: {MakeDisplayPath(checkpointPath)}");
+    }
+
+    private static string? FindLatestCheckpointDb(string gameTitle)
+    {
+        var checkpointsDirPath = Path.Combine(RootDir, "checkpoints");
         if (!Directory.Exists(checkpointsDirPath))
         {
-            Directory.CreateDirectory(checkpointsDirPath);
+            Console.WriteLine($"ERROR: could not find any checkpoints for \"{gameTitle}\". Ignoring...");
+            return null;
         }
-        File.WriteAllText($"./checkpoints/{config.GameTitle} {dateStamp}.ckpt", newCheckpointJson);
-        Console.WriteLine(
-            $"Created checkpoint file: ./checkpoints/{config.GameTitle} {dateStamp}.ckpt"
-        );
+
+        var latest = Directory
+            .EnumerateFiles(checkpointsDirPath, "*.checkpoint.db", SearchOption.TopDirectoryOnly)
+            .Where(path => Path.GetFileName(path).StartsWith(gameTitle + " ", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => File.GetLastWriteTimeUtc(path))
+            .LastOrDefault();
+        if (string.IsNullOrWhiteSpace(latest))
+            Console.WriteLine($"ERROR: could not find any SQLite checkpoints for \"{gameTitle}\". Ignoring...");
+
+        return latest;
+    }
+
+    private static string ResolveCheckpointPath(string checkpointFile)
+    {
+        if (Path.IsPathRooted(checkpointFile))
+            return checkpointFile;
+
+        var rootRelative = Path.Combine(RootDir, checkpointFile);
+        if (File.Exists(rootRelative))
+            return rootRelative;
+
+        return Path.Combine(RootDir, "checkpoints", checkpointFile);
+    }
+
+    private static Dictionary<string, long> LoadCheckpointDb(string checkpointPath)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        SQLitePCL.Batteries_V2.Init();
+        using var connection = new SqliteConnection($"Data Source={checkpointPath};Mode=ReadOnly");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT path, size FROM checkpoint_files;";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            result[reader.GetString(0)] = reader.GetInt64(1);
+
+        return result;
+    }
+
+    private static void WriteCheckpointDb(
+        string checkpointPath,
+        ConcurrentDictionary<string, long> checkpointFiles,
+        ConfigObj config)
+    {
+        SQLitePCL.Batteries_V2.Init();
+        using var connection = new SqliteConnection($"Data Source={checkpointPath}");
+        connection.Open();
+        ExecuteCheckpointSql(connection, "PRAGMA journal_mode = WAL;");
+        ExecuteCheckpointSql(connection, "PRAGMA synchronous = NORMAL;");
+        ExecuteCheckpointSql(connection, """
+            CREATE TABLE IF NOT EXISTS checkpoint_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """);
+        ExecuteCheckpointSql(connection, """
+            CREATE TABLE IF NOT EXISTS checkpoint_files (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL
+            );
+            """);
+        ExecuteCheckpointSql(connection, "DELETE FROM checkpoint_metadata;");
+        ExecuteCheckpointSql(connection, "DELETE FROM checkpoint_files;");
+
+        using var transaction = connection.BeginTransaction();
+        UpsertCheckpointMetadata(connection, transaction, "game_title", config.GameTitle);
+        UpsertCheckpointMetadata(connection, transaction, "created_at", DateTime.UtcNow.ToString("O"));
+        UpsertCheckpointMetadata(connection, transaction, "file_count", checkpointFiles.Count.ToString(CultureInfo.InvariantCulture));
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO checkpoint_files (path, size)
+                VALUES ($path, $size);
+                """;
+            var pathParam = command.Parameters.Add("$path", SqliteType.Text);
+            var sizeParam = command.Parameters.Add("$size", SqliteType.Integer);
+            foreach (var pair in checkpointFiles.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                pathParam.Value = pair.Key;
+                sizeParam.Value = pair.Value;
+                command.ExecuteNonQuery();
+            }
+        }
+
+        transaction.Commit();
+        ExecuteCheckpointSql(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+        ExecuteCheckpointSql(connection, "PRAGMA journal_mode = DELETE;");
+    }
+
+    private static void UpsertCheckpointMetadata(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string key,
+        string value)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO checkpoint_metadata (key, value)
+            VALUES ($key, $value)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        command.Parameters.AddWithValue("$key", key);
+        command.Parameters.AddWithValue("$value", value);
+        command.ExecuteNonQuery();
+    }
+
+    private static void ExecuteCheckpointSql(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static string MakeDisplayPath(string path)
+    {
+        var fullRoot = Path.GetFullPath(RootDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var fullPath = Path.GetFullPath(path);
+        return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase)
+            ? ".\\" + Path.GetRelativePath(RootDir, fullPath)
+            : fullPath;
     }
 
     public static double Now()

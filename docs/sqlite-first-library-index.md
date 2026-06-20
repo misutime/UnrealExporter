@@ -19,6 +19,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Asset catalog | `export_events.db.asset_catalog`, then `library_index.db.assets` | `asset_catalog.jsonl` is a compatibility view |
 | Animation bindings | `export_events.db.animation_bindings`, then `library_index.db.animation_bindings` | `animation_bindings.jsonl` is a compatibility view |
 | Auto referenced export diagnostics | `export_events.db.auto_referenced_exports`, then `library_index.db.auto_referenced_exports` | `auto_referenced_exports.jsonl` is a compatibility view |
+| Export update checkpoints | `checkpoints/*.checkpoint.db.checkpoint_files` | legacy `.ckpt` JSON files are not written by new exports |
 | Texture dedupe links | `library_work.db.texture_links`, then `library_index.db.texture_links` | `texture_links.jsonl` is a compatibility/debug view |
 | Texture dedupe summary | `library_work.db.library_reports(name='texture_dedupe')`, then `library_index.db.library_reports` | `texture_dedupe_summary.json` is a compatibility/human-inspection view |
 | Material sidecar summaries | `library_work.db.material_sidecars`, then `library_index.db.material_sidecars` | Material JSON files remain optional human/export sidecars; postprocess should prefer SQLite/cache when present |
@@ -77,6 +78,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - `UE5LibraryBrowser` already requires `library_index.db`.
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
+- `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - Auto referenced export diagnostics now stream to `export_events.db.auto_referenced_exports` in bounded batches during rule planning; `auto_referenced_exports.jsonl` is only written when compatibility JSON is explicitly enabled.
 - `--materialize-animation-metadata` updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` by default; `.ueanim.metadata.json`, `asset_catalog.jsonl` and `animation_bindings.jsonl` are only written or updated when `--compat-json` is explicitly requested.
