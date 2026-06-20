@@ -8651,9 +8651,9 @@ internal static class UELibraryPostProcessor
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }
 
-    public static void DeduplicateTextureFiles(string root)
+    public static void DeduplicateTextureFiles(string root, bool writeCompatibilityJson = true)
     {
-        DeduplicateTextureFilesCore(root, writeCompatibilityJson: true);
+        DeduplicateTextureFilesCore(root, writeCompatibilityJson);
     }
 
     private static List<TextureLinkInfo> LoadExistingTextureLinks(string root)

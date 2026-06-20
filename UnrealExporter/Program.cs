@@ -1475,7 +1475,9 @@ public class UnrealExporter
         }
         else if (config.UseSharedTextures)
         {
-            UELibraryPostProcessor.DeduplicateTextureFiles(Path.GetFullPath(config.OutputDir));
+            UELibraryPostProcessor.DeduplicateTextureFiles(
+                Path.GetFullPath(config.OutputDir),
+                ShouldWriteCompatibilityJson(config));
         }
         Console.WriteLine();
     }
