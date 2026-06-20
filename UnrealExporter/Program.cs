@@ -111,6 +111,7 @@ public class UnrealExporter
                 Console.WriteLine($"Log outputs: {config.LogOutputs}");
                 Console.WriteLine($"Keep directory structure: {config.KeepDirectoryStructure}");
                 Console.WriteLine($"SQLite-only library index: {config.SqliteOnlyIndex || !config.WriteCompatibilityJson}");
+                Console.WriteLine($"Compatibility JSON/JSONL outputs: {ShouldWriteCompatibilityJson(config)}");
                 Console.WriteLine($"Create new checkpoint: {config.CreateNewCheckpoint}");
 
                 // Load CUE4Parse and export files
@@ -871,6 +872,7 @@ public class UnrealExporter
         using var exportResumeStore = resumeExports ? ExportResumeStore.Open(config) : null;
         if (resumeExports)
             Console.WriteLine($"Export resume: loaded {exportResumeStore!.Count} completed job(s).");
+        PrepareCompatibilityJsonOutputs(config);
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
@@ -1887,6 +1889,12 @@ public class UnrealExporter
     {
         ReplaceExportEventSqliteRows(config, "auto_referenced_exports", diagnostics.Select(JObject.FromObject));
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
+        if (!ShouldWriteCompatibilityJson(config))
+        {
+            DeleteIfExists(path);
+            return;
+        }
+
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var lines = diagnostics.Select(JsonConvert.SerializeObject).ToArray();
         File.WriteAllLines(path, lines);
@@ -1895,6 +1903,9 @@ public class UnrealExporter
     private static void AppendAutoReferencedExportDiagnostic(ConfigObj config, object diagnostic)
     {
         WriteExportEventSqlite(config, "auto_referenced_exports", JObject.FromObject(diagnostic));
+        if (!ShouldWriteCompatibilityJson(config))
+            return;
+
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         lock (AutoReferencedWriteLock)
@@ -2178,6 +2189,27 @@ public class UnrealExporter
     private static bool ShouldResumeExports(ConfigObj config)
         => config.ResumeExports != false;
 
+    private static bool ShouldWriteCompatibilityJson(ConfigObj config)
+        => config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
+
+    private static void PrepareCompatibilityJsonOutputs(ConfigObj config)
+    {
+        if (ShouldWriteCompatibilityJson(config))
+            return;
+
+        var outputDir = Path.GetFullPath(config.OutputDir);
+        DeleteIfExists(Path.Combine(outputDir, "export_manifest.jsonl"));
+        DeleteIfExists(Path.Combine(outputDir, "asset_catalog.jsonl"));
+        DeleteIfExists(Path.Combine(outputDir, "animation_bindings.jsonl"));
+        DeleteIfExists(Path.Combine(outputDir, "auto_referenced_exports.jsonl"));
+    }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+
     private static string BuildExportResumeKey(
         string sourcePath,
         string outputType,
@@ -2200,8 +2232,6 @@ public class UnrealExporter
         string kind
     )
     {
-        var manifestPath = Path.Combine(Path.GetFullPath(config.OutputDir), "export_manifest.jsonl");
-        Directory.CreateDirectory(Path.GetDirectoryName(manifestPath)!);
         var entry = new
         {
             exportedAt = DateTime.UtcNow.ToString("O"),
@@ -2214,6 +2244,11 @@ public class UnrealExporter
             output = Path.GetFullPath(outputPath),
         };
         WriteExportEventSqlite(config, "export_manifest", JObject.FromObject(entry));
+        if (!ShouldWriteCompatibilityJson(config))
+            return;
+
+        var manifestPath = Path.Combine(Path.GetFullPath(config.OutputDir), "export_manifest.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(manifestPath)!);
         lock (ManifestWriteLock)
         {
             File.AppendAllText(manifestPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
@@ -2223,6 +2258,9 @@ public class UnrealExporter
     private static void AppendAssetCatalog(ConfigObj config, object entry)
     {
         WriteExportEventSqlite(config, "asset_catalog", JObject.FromObject(entry));
+        if (!ShouldWriteCompatibilityJson(config))
+            return;
+
         var catalogPath = Path.Combine(Path.GetFullPath(config.OutputDir), "asset_catalog.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(catalogPath)!);
         lock (CatalogWriteLock)
@@ -2969,6 +3007,9 @@ public class UnrealExporter
         };
 
         WriteExportEventSqlite(config, "animation_bindings", JObject.FromObject(entry));
+        if (!ShouldWriteCompatibilityJson(config))
+            return;
+
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "animation_bindings.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         lock (CatalogWriteLock)
