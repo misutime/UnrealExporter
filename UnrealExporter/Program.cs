@@ -1440,7 +1440,11 @@ public class UnrealExporter
             return new Dictionary<string, AutoReferencedExportRule[]>(StringComparer.OrdinalIgnoreCase);
         }
 
+        var autoRuleStart = Now();
+        Console.WriteLine("Building auto referenced export rules...");
         var packageFiles = BuildPackageFileLookup(provider);
+        var providerFilesByPath = BuildProviderPathLookup(provider);
+        Console.WriteLine($"Auto referenced lookup prepared: packages={packageFiles.Count}, providerPaths={providerFilesByPath.Count}, elapsed={Elapsed(autoRuleStart, Now(), 1000)}s");
         var rules = new Dictionary<string, List<AutoReferencedExportRule>>(StringComparer.OrdinalIgnoreCase);
         var diagnostics = new List<object>();
         var unresolved = 0;
@@ -1449,6 +1453,7 @@ public class UnrealExporter
         using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         connection.Open();
         using var command = connection.CreateCommand();
+        var stageStart = Now();
         command.CommandText = """
             SELECT DISTINCT relation_type, target_path
             FROM component_asset_relations
@@ -1466,7 +1471,7 @@ public class UnrealExporter
             var targetPath = reader.GetString(1);
             if (relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
             {
-                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules, diagnostics);
+                unresolved += AddSkeletonMeshExportRules(connection, providerFilesByPath, targetPath, rules, diagnostics);
                 continue;
             }
 
@@ -1499,22 +1504,39 @@ public class UnrealExporter
             var filePath = matches[0];
             AddAutoReferencedExportRule(rules, diagnostics, relationType, targetPath, filePath, outputType);
         }
+        Console.WriteLine($"Auto referenced component relations done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
 
-        var sourceRelationResult = AddSourceRelationExportRules(connection, packageFiles, provider, rules, diagnostics);
+        stageStart = Now();
+        var sourceRelationResult = AddSourceRelationExportRules(connection, packageFiles, providerFilesByPath, rules, diagnostics);
         unresolved += sourceRelationResult.Unresolved;
         ambiguous += sourceRelationResult.Ambiguous;
+        Console.WriteLine($"Auto referenced source relations done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
+
+        stageStart = Now();
         var materialTextureResult = AddMaterialTextureExportRules(connection, packageFiles, rules, diagnostics);
         unresolved += materialTextureResult.Unresolved;
         ambiguous += materialTextureResult.Ambiguous;
-        if (ShouldAutoExportCompatibleAnimations(config))
-            unresolved += AddIndexedAnimationExportRules(connection, provider, rules, diagnostics);
-        unresolved += AddAnimationSegmentExportRules(connection, provider, rules, diagnostics);
+        Console.WriteLine($"Auto referenced material textures done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
 
+        if (ShouldAutoExportCompatibleAnimations(config))
+        {
+            stageStart = Now();
+            unresolved += AddIndexedAnimationExportRules(connection, packageFiles, rules, diagnostics);
+            Console.WriteLine($"Auto referenced compatible animations done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
+        }
+
+        stageStart = Now();
+        unresolved += AddAnimationSegmentExportRules(connection, packageFiles, rules, diagnostics);
+        Console.WriteLine($"Auto referenced animation segments done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
+
+        stageStart = Now();
         WriteAutoReferencedExportDiagnostics(config, diagnostics);
+        Console.WriteLine($"Auto referenced diagnostics written: rows={diagnostics.Count}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
 
         Console.WriteLine(
             $"Auto referenced exports: {rules.Sum(x => x.Value.Count)} rule(s)" +
-            (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : ""));
+            (unresolved > 0 || ambiguous > 0 ? $" ({unresolved} unresolved, {ambiguous} ambiguous)" : "") +
+            $", elapsed={Elapsed(autoRuleStart, Now(), 1000)}s");
         return rules.ToDictionary(
             x => x.Key,
             x => x.Value.ToArray(),
@@ -1524,7 +1546,7 @@ public class UnrealExporter
     private static (int Unresolved, int Ambiguous) AddSourceRelationExportRules(
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
-        AbstractFileProvider provider,
+        Dictionary<string, string> providerFilesByPath,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
@@ -1548,7 +1570,7 @@ public class UnrealExporter
             var targetPath = reader.GetString(1);
             if (relationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase))
             {
-                unresolved += AddSkeletonMeshExportRules(connection, provider, targetPath, rules, diagnostics);
+                unresolved += AddSkeletonMeshExportRules(connection, providerFilesByPath, targetPath, rules, diagnostics);
                 continue;
             }
 
@@ -1612,7 +1634,7 @@ public class UnrealExporter
 
     private static int AddSkeletonMeshExportRules(
         SqliteConnection connection,
-        AbstractFileProvider provider,
+        Dictionary<string, string> providerFilesByPath,
         string skeletonPath,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
@@ -1635,16 +1657,14 @@ public class UnrealExporter
         {
             var sourcePath = NormalizeAssetPath(reader.GetString(0));
             var meshObjectPath = reader.GetString(1);
-            var file = provider.Files.Values.FirstOrDefault(x =>
-                NormalizeAssetPath(x.Path).Equals(sourcePath, StringComparison.OrdinalIgnoreCase));
-            if (file == null)
+            if (!providerFilesByPath.TryGetValue(sourcePath, out var filePath))
             {
                 unresolved++;
                 diagnostics.Add(BuildAutoReferencedExportDiagnostic("plan", "unresolved", "Skeleton", skeletonPath, sourcePath, "glb", "skeletonMeshSourceNotFound"));
                 continue;
             }
 
-            AddAutoReferencedExportRule(rules, diagnostics, "SkeletonMesh", meshObjectPath, file.Path, "glb");
+            AddAutoReferencedExportRule(rules, diagnostics, "SkeletonMesh", meshObjectPath, filePath, "glb");
         }
 
         return unresolved;
@@ -1703,7 +1723,7 @@ public class UnrealExporter
 
     private static int AddAnimationSegmentExportRules(
         SqliteConnection connection,
-        AbstractFileProvider provider,
+        Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
@@ -1726,7 +1746,7 @@ public class UnrealExporter
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            var filePath = FindProviderFilePathByObjectPath(provider, reader.GetString(0));
+            var filePath = FindProviderFilePathByObjectPath(packageFiles, reader.GetString(0));
             if (filePath == null)
             {
                 unresolved++;
@@ -1742,7 +1762,7 @@ public class UnrealExporter
 
     private static int AddIndexedAnimationExportRules(
         SqliteConnection connection,
-        AbstractFileProvider provider,
+        Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
         List<object> diagnostics)
     {
@@ -1776,7 +1796,7 @@ public class UnrealExporter
         while (reader.Read())
         {
             var animationPath = reader.GetString(0);
-            var filePath = FindProviderFilePathByObjectPath(provider, animationPath);
+            var filePath = FindProviderFilePathByObjectPath(packageFiles, animationPath);
             if (filePath == null)
             {
                 unresolved++;
@@ -2047,17 +2067,21 @@ public class UnrealExporter
             StringComparer.OrdinalIgnoreCase);
     }
 
-    private static string? FindProviderFilePathByObjectPath(AbstractFileProvider provider, string objectPath)
+    private static Dictionary<string, string> BuildProviderPathLookup(AbstractFileProvider provider)
+        => provider.Files.Values
+            .Where(x => x.IsUePackage)
+            .GroupBy(x => NormalizeAssetPath(x.Path), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First().Path, StringComparer.OrdinalIgnoreCase);
+
+    private static string? FindProviderFilePathByObjectPath(Dictionary<string, string[]> packageFiles, string objectPath)
     {
         var suffix = BuildPackageFileSuffix(objectPath);
         if (string.IsNullOrWhiteSpace(suffix))
             return null;
 
-        return provider.Files.Values
-            .Select(x => x.Path)
-            .FirstOrDefault(path =>
-                NormalizeAssetPath(Path.ChangeExtension(path, null))
-                    .EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        return packageFiles.TryGetValue(suffix, out var matches) && matches.Length > 0
+            ? matches[0]
+            : null;
     }
 
     private static IEnumerable<string> BuildProviderFileSuffixes(string withoutExtension)

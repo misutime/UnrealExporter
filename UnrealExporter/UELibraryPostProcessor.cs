@@ -12,6 +12,7 @@ internal static class UELibraryPostProcessor
 {
     private static readonly string[] TextureExtensions = [".png", ".hdr"];
     private const int ModelValidationCacheVersion = 2;
+    private const int MaxDetailedComponentGroupRelations = 250_000;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
@@ -1040,7 +1041,8 @@ internal static class UELibraryPostProcessor
             snapshot.TracksByAnimation = LoadTracksByAnimation(connection);
             snapshot.SegmentsByAnimation = LoadSegmentsByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
-            snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
+            snapshot.ComponentAssetRelationCount = CountTableRows(connection, "component_asset_relations");
+            snapshot.ComponentAssetRelations = [];
             snapshot.AssetRegistryDependencies = LoadAssetRegistryDependencies(connection);
             snapshot.AnimBlueprintAnimationRefs = LoadAnimBlueprintAnimationRefs(connection);
             snapshot.UnsupportedAnimationObjectPaths = LoadUnsupportedAnimationObjectPaths(connection);
@@ -1234,42 +1236,75 @@ internal static class UELibraryPostProcessor
                    location_x, location_y, location_z,
                    rotation_pitch, rotation_yaw, rotation_roll,
                    scale_x, scale_y, scale_z
-            FROM component_asset_relations
-            ORDER BY owner_object_path, component_object_path, relation_type, target_path;
+            FROM component_asset_relations;
             """;
         using var reader = command.ExecuteReader();
         var result = new List<SourceComponentAssetRelation>();
         while (reader.Read())
-        {
-            result.Add(new SourceComponentAssetRelation
-            {
-                SourcePath = GetString(reader, 0),
-                OwnerObjectPath = GetString(reader, 1),
-                OwnerType = GetString(reader, 2),
-                ComponentObjectPath = GetString(reader, 3),
-                ComponentType = GetString(reader, 4),
-                ComponentName = GetString(reader, 5),
-                ComponentVariableName = GetString(reader, 6),
-                RelationSource = GetString(reader, 7) ?? "",
-                RelationType = GetString(reader, 8) ?? "",
-                TargetPath = GetString(reader, 9),
-                TargetName = GetString(reader, 10),
-                SocketName = GetString(reader, 11),
-                ParentComponentPath = GetString(reader, 12),
-                LocationX = GetNullableDouble(reader, 13),
-                LocationY = GetNullableDouble(reader, 14),
-                LocationZ = GetNullableDouble(reader, 15),
-                RotationPitch = GetNullableDouble(reader, 16),
-                RotationYaw = GetNullableDouble(reader, 17),
-                RotationRoll = GetNullableDouble(reader, 18),
-                ScaleX = GetNullableDouble(reader, 19),
-                ScaleY = GetNullableDouble(reader, 20),
-                ScaleZ = GetNullableDouble(reader, 21),
-            });
-        }
+            result.Add(ReadSourceComponentAssetRelation(reader));
 
         return result.ToArray();
     }
+
+    private static IEnumerable<SourceComponentAssetRelation> EnumerateSourceComponentAssetRelations(SourceIndexSnapshot sourceIndex)
+    {
+        if (sourceIndex.ComponentAssetRelations.Length > 0)
+        {
+            foreach (var relation in sourceIndex.ComponentAssetRelations)
+                yield return relation;
+            yield break;
+        }
+
+        if (!sourceIndex.Available || string.IsNullOrWhiteSpace(sourceIndex.Path) || !File.Exists(sourceIndex.Path))
+            yield break;
+
+        using var connection = new SqliteConnection($"Data Source={sourceIndex.Path};Mode=ReadOnly");
+        connection.Open();
+        if (!TableExists(connection, "component_asset_relations"))
+            yield break;
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, owner_object_path, owner_type,
+                   component_object_path, component_type, component_name, component_variable_name,
+                   relation_source, relation_type, target_path, target_name,
+                   socket_name, parent_component_path,
+                   location_x, location_y, location_z,
+                   rotation_pitch, rotation_yaw, rotation_roll,
+                   scale_x, scale_y, scale_z
+            FROM component_asset_relations;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            yield return ReadSourceComponentAssetRelation(reader);
+    }
+
+    private static SourceComponentAssetRelation ReadSourceComponentAssetRelation(SqliteDataReader reader)
+        => new()
+        {
+            SourcePath = GetString(reader, 0),
+            OwnerObjectPath = GetString(reader, 1),
+            OwnerType = GetString(reader, 2),
+            ComponentObjectPath = GetString(reader, 3),
+            ComponentType = GetString(reader, 4),
+            ComponentName = GetString(reader, 5),
+            ComponentVariableName = GetString(reader, 6),
+            RelationSource = GetString(reader, 7) ?? "",
+            RelationType = GetString(reader, 8) ?? "",
+            TargetPath = GetString(reader, 9),
+            TargetName = GetString(reader, 10),
+            SocketName = GetString(reader, 11),
+            ParentComponentPath = GetString(reader, 12),
+            LocationX = GetNullableDouble(reader, 13),
+            LocationY = GetNullableDouble(reader, 14),
+            LocationZ = GetNullableDouble(reader, 15),
+            RotationPitch = GetNullableDouble(reader, 16),
+            RotationYaw = GetNullableDouble(reader, 17),
+            RotationRoll = GetNullableDouble(reader, 18),
+            ScaleX = GetNullableDouble(reader, 19),
+            ScaleY = GetNullableDouble(reader, 20),
+            ScaleZ = GetNullableDouble(reader, 21),
+        };
 
     private static SourceAssetRegistryDependency[] LoadAssetRegistryDependencies(SqliteConnection connection)
     {
@@ -1817,43 +1852,56 @@ internal static class UELibraryPostProcessor
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex)
     {
-        var links = BuildComponentAssetRelationLinks(root, catalogRows, sourceIndex);
+        var totalRelations = sourceIndex.ComponentAssetRelationCount > 0
+            ? sourceIndex.ComponentAssetRelationCount
+            : sourceIndex.ComponentAssetRelations.Length;
+        if (!sourceIndex.Available || totalRelations == 0)
+        {
+            WriteEmptyComponentRelations(root);
+            return [];
+        }
+
+        var exportedAssets = catalogRows
+            .Where(x => !string.IsNullOrWhiteSpace((string?)x["output"]) || !string.IsNullOrWhiteSpace((string?)x["source"]))
+            .ToArray();
+
+        var assetLookup = BuildExportedAssetLookup(root, exportedAssets);
+        var packageObjectsByPath = sourceIndex.PackageObjectMaps
+            .Where(x => !string.IsNullOrWhiteSpace(x.ObjectPath))
+            .GroupBy(x => x.ObjectPath!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+        var retainedLinks = new List<ComponentAssetRelationLink>();
         var path = Path.Combine(root, "component_asset_relations.jsonl");
         using (var writer = new StreamWriter(path, false, Encoding.UTF8))
         {
-            foreach (var link in links.OrderBy(x => x.OwnerObjectPath, StringComparer.OrdinalIgnoreCase)
-                         .ThenBy(x => x.ComponentObjectPath, StringComparer.OrdinalIgnoreCase)
-                         .ThenBy(x => x.RelationType, StringComparer.OrdinalIgnoreCase)
-                         .ThenBy(x => x.TargetPath, StringComparer.OrdinalIgnoreCase))
+            foreach (var relation in EnumerateSourceComponentAssetRelations(sourceIndex))
             {
-                writer.WriteLine(JsonConvert.SerializeObject(new
-                {
-                    kind = "ComponentAssetRelation",
-                    link.OwnerObjectPath,
-                    link.OwnerType,
-                    link.ComponentObjectPath,
-                    link.ComponentType,
-                    link.ComponentName,
-                    link.ComponentVariableName,
-                    link.RelationSource,
-                    link.RelationType,
-                    link.TargetPath,
-                    link.TargetName,
-                    link.TargetAssetName,
-                    link.TargetAssetKind,
-                    link.TargetAssetOutput,
-                    link.MatchStatus,
-                    link.MatchReason,
-                    link.SocketName,
-                    link.ParentComponentPath,
-                    transform = link.Transform,
-                    link.SourcePath,
-                }));
+                var link = BuildComponentAssetRelationLink(relation, assetLookup, packageObjectsByPath, sourceIndex);
+                writer.WriteLine(SerializeComponentAssetRelationLink(link));
+                if (ShouldRetainComponentAssetRelation(link))
+                    retainedLinks.Add(link);
             }
         }
 
+        var links = retainedLinks.ToArray();
+        Console.WriteLine($"Component relations streamed: total={totalRelations}, retainedInMemory={links.Length}.");
         WriteComponentGroups(root, links);
         return links;
+    }
+
+    private static void WriteEmptyComponentRelations(string root)
+    {
+        File.WriteAllText(Path.Combine(root, "component_asset_relations.jsonl"), "", Encoding.UTF8);
+        File.WriteAllText(
+            Path.Combine(root, "component_groups.json"),
+            JsonConvert.SerializeObject(new
+            {
+                generatedAt = DateTime.UtcNow.ToString("O"),
+                rule = "组合关系来自 UE 蓝图/组件/默认对象里的显式 PPtr 和组件模板，不按名称猜测绑定。",
+                groupCount = 0,
+                groups = Array.Empty<object>(),
+            }, Formatting.Indented),
+            Encoding.UTF8);
     }
 
     private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex)
@@ -1954,6 +2002,71 @@ internal static class UELibraryPostProcessor
 
         return result.ToArray();
     }
+
+    private static ComponentAssetRelationLink BuildComponentAssetRelationLink(
+        SourceComponentAssetRelation relation,
+        ExportedAssetLookup assetLookup,
+        Dictionary<string, SourcePackageObjectMap> packageObjectsByPath,
+        SourceIndexSnapshot sourceIndex)
+    {
+        var matched = FindExportedAssetForTarget(relation, assetLookup);
+        var matchStatus = BuildComponentRelationMatchStatus(relation, matched, assetLookup, packageObjectsByPath, sourceIndex);
+        var matchReason = BuildComponentRelationMatchReason(relation, matched, matchStatus);
+        return new ComponentAssetRelationLink
+        {
+            SourcePath = relation.SourcePath,
+            OwnerObjectPath = relation.OwnerObjectPath,
+            OwnerType = relation.OwnerType,
+            ComponentObjectPath = relation.ComponentObjectPath,
+            ComponentType = relation.ComponentType,
+            ComponentName = relation.ComponentName,
+            ComponentVariableName = relation.ComponentVariableName,
+            RelationSource = relation.RelationSource,
+            RelationType = relation.RelationType,
+            TargetPath = relation.TargetPath,
+            TargetName = relation.TargetName,
+            TargetAssetName = (string?)matched?["name"],
+            TargetAssetKind = (string?)matched?["kind"],
+            TargetAssetOutput = (string?)matched?["output"] ?? (string?)matched?["source"],
+            MatchStatus = matchStatus,
+            MatchReason = matchReason,
+            SocketName = relation.SocketName,
+            ParentComponentPath = relation.ParentComponentPath,
+            Transform = BuildTransformObject(relation),
+        };
+    }
+
+    private static string SerializeComponentAssetRelationLink(ComponentAssetRelationLink link)
+        => JsonConvert.SerializeObject(new
+        {
+            kind = "ComponentAssetRelation",
+            link.OwnerObjectPath,
+            link.OwnerType,
+            link.ComponentObjectPath,
+            link.ComponentType,
+            link.ComponentName,
+            link.ComponentVariableName,
+            link.RelationSource,
+            link.RelationType,
+            link.TargetPath,
+            link.TargetName,
+            link.TargetAssetName,
+            link.TargetAssetKind,
+            link.TargetAssetOutput,
+            link.MatchStatus,
+            link.MatchReason,
+            link.SocketName,
+            link.ParentComponentPath,
+            transform = link.Transform,
+            link.SourcePath,
+        });
+
+    private static bool ShouldRetainComponentAssetRelation(ComponentAssetRelationLink link)
+        => IsModelRelation(link.RelationType)
+           || IsAnimationRelation(link.RelationType)
+           || string.Equals(link.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(link.RelationType, "AnimClass", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(link.RelationType, "AnimBlueprintGeneratedClass", StringComparison.OrdinalIgnoreCase);
 
     private static ExportedAssetLookup BuildExportedAssetLookup(string root, JObject[] exportedAssets)
     {
@@ -2173,6 +2286,12 @@ internal static class UELibraryPostProcessor
 
     private static void WriteComponentGroups(string root, ComponentAssetRelationLink[] links)
     {
+        if (links.Length > MaxDetailedComponentGroupRelations)
+        {
+            WriteComponentGroupSummary(root, links);
+            return;
+        }
+
         var groups = BuildComponentGroupRows(links)
             .Select(x => JObject.Parse(x.RawJson))
             .ToArray();
@@ -2185,6 +2304,39 @@ internal static class UELibraryPostProcessor
                 rule = "组合关系来自 UE 蓝图/组件/默认对象里的显式 PPtr 和组件模板，不按名称猜测绑定。",
                 groupCount = groups.Length,
                 groups,
+            }, Formatting.Indented),
+            Encoding.UTF8);
+    }
+
+    private static void WriteComponentGroupSummary(string root, ComponentAssetRelationLink[] links)
+    {
+        File.WriteAllText(
+            Path.Combine(root, "component_groups.json"),
+            JsonConvert.SerializeObject(new
+            {
+                generatedAt = DateTime.UtcNow.ToString("O"),
+                rule = "组合关系来自 UE 蓝图/组件/默认对象里的显式 PPtr 和组件模板，不按名称猜测绑定。",
+                skippedDetailedGroups = true,
+                reason = $"保留关系数 {links.Length} 超过 {MaxDetailedComponentGroupRelations}，为避免大库后处理 OOM，仅写轻量摘要；完整逐行关系见 component_asset_relations.jsonl 和 library_index.db.component_asset_relations。",
+                retainedRelationCount = links.Length,
+                ownerCount = links
+                    .Where(x => !string.IsNullOrWhiteSpace(x.OwnerObjectPath))
+                    .Select(x => x.OwnerObjectPath)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Count(),
+                byRelationType = links
+                    .GroupBy(x => string.IsNullOrWhiteSpace(x.RelationType) ? "unknown" : x.RelationType, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new { relationType = x.Key, count = x.Count() })
+                    .ToArray(),
+                byStatus = links
+                    .GroupBy(x => string.IsNullOrWhiteSpace(x.MatchStatus) ? "unknown" : x.MatchStatus, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x.Count())
+                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(x => new { status = x.Key, count = x.Count() })
+                    .ToArray(),
+                groups = Array.Empty<object>(),
             }, Formatting.Indented),
             Encoding.UTF8);
     }
@@ -5890,8 +6042,11 @@ internal static class UELibraryPostProcessor
         foreach (var link in sharedGltfTextureLinks)
             InsertSharedGltfTextureLink(connection, transaction, link);
 
-        foreach (var link in componentAssetRelations)
-            InsertComponentAssetRelation(connection, transaction, link);
+        if (!InsertComponentAssetRelationRowsFromJsonLines(connection, transaction, root))
+        {
+            foreach (var link in componentAssetRelations)
+                InsertComponentAssetRelation(connection, transaction, link);
+        }
 
         InsertComponentGroups(connection, transaction, componentAssetRelations);
 
@@ -6363,11 +6518,61 @@ internal static class UELibraryPostProcessor
         command.ExecuteNonQuery();
     }
 
+    private static bool InsertComponentAssetRelationRowsFromJsonLines(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string root)
+    {
+        var path = Path.Combine(root, "component_asset_relations.jsonl");
+        if (!File.Exists(path))
+            return false;
+
+        var inserted = 0;
+        foreach (var row in ReadJsonLines(path))
+        {
+            InsertComponentAssetRelation(connection, transaction, ReadComponentAssetRelationLink(row));
+            inserted++;
+        }
+
+        Console.WriteLine($"SQLite component relations inserted from JSONL: {inserted}.");
+        return true;
+    }
+
+    private static ComponentAssetRelationLink ReadComponentAssetRelationLink(JObject row)
+        => new()
+        {
+            SourcePath = (string?)row["SourcePath"] ?? (string?)row["sourcePath"],
+            OwnerObjectPath = (string?)row["OwnerObjectPath"] ?? (string?)row["ownerObjectPath"],
+            OwnerType = (string?)row["OwnerType"] ?? (string?)row["ownerType"],
+            ComponentObjectPath = (string?)row["ComponentObjectPath"] ?? (string?)row["componentObjectPath"],
+            ComponentType = (string?)row["ComponentType"] ?? (string?)row["componentType"],
+            ComponentName = (string?)row["ComponentName"] ?? (string?)row["componentName"],
+            ComponentVariableName = (string?)row["ComponentVariableName"] ?? (string?)row["componentVariableName"],
+            RelationSource = (string?)row["RelationSource"] ?? (string?)row["relationSource"] ?? "",
+            RelationType = (string?)row["RelationType"] ?? (string?)row["relationType"] ?? "",
+            TargetPath = (string?)row["TargetPath"] ?? (string?)row["targetPath"],
+            TargetName = (string?)row["TargetName"] ?? (string?)row["targetName"],
+            TargetAssetName = (string?)row["TargetAssetName"] ?? (string?)row["targetAssetName"],
+            TargetAssetKind = (string?)row["TargetAssetKind"] ?? (string?)row["targetAssetKind"],
+            TargetAssetOutput = (string?)row["TargetAssetOutput"] ?? (string?)row["targetAssetOutput"],
+            MatchStatus = (string?)row["MatchStatus"] ?? (string?)row["matchStatus"] ?? "",
+            MatchReason = (string?)row["MatchReason"] ?? (string?)row["matchReason"],
+            SocketName = (string?)row["SocketName"] ?? (string?)row["socketName"],
+            ParentComponentPath = (string?)row["ParentComponentPath"] ?? (string?)row["parentComponentPath"],
+            Transform = row["transform"]?.ToObject<object>(),
+        };
+
     private static void InsertComponentGroups(
         SqliteConnection connection,
         SqliteTransaction transaction,
         ComponentAssetRelationLink[] links)
     {
+        if (links.Length > MaxDetailedComponentGroupRelations)
+        {
+            Console.WriteLine($"SQLite component_groups skipped: retained relations {links.Length} exceed {MaxDetailedComponentGroupRelations}; query component_asset_relations for full details.");
+            return;
+        }
+
         foreach (var group in BuildComponentGroupRows(links))
         {
             using var command = connection.CreateCommand();
@@ -6924,14 +7129,19 @@ internal static class UELibraryPostProcessor
         var materials = catalogRows.Where(x => string.Equals((string?)x["kind"], "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
         var textures = catalogRows.Where(x => string.Equals((string?)x["kind"], "Texture", StringComparison.OrdinalIgnoreCase)).ToArray();
         var animations = catalogRows.Where(x => string.Equals((string?)x["kind"], "Animation", StringComparison.OrdinalIgnoreCase)).ToArray();
-        var componentGroups = BuildComponentGroupRows(componentAssetRelations);
+        var componentGroups = componentAssetRelations.Length > MaxDetailedComponentGroupRelations
+            ? Array.Empty<ComponentGroupRow>()
+            : BuildComponentGroupRows(componentAssetRelations);
+        var detailedComponentGroupsSkipped = componentAssetRelations.Length > MaxDetailedComponentGroupRelations;
         var animationRelations = (JArray?)modelAnimationRelations["relations"] ?? [];
         var matchedModelAnimationRelations = animationRelations.Count(x => ((JArray?)x["animations"] ?? []).Count > 0);
         var unmatchedMaterialSlots = materialTextureSlots.Count(x => !string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase));
         var actionableMissingMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "missingExportedTexture", StringComparison.OrdinalIgnoreCase));
         var nonExportableMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "nonExportableTexture", StringComparison.OrdinalIgnoreCase));
         var unresolvedMaterialSlots = materialTextureSlots.Count(x => string.Equals(x.MatchStatus, "unresolvedTexturePackage", StringComparison.OrdinalIgnoreCase));
-        var missingComponentRefs = componentGroups.Sum(x => x.MissingReferenceCount);
+        var missingComponentRefs = detailedComponentGroupsSkipped
+            ? componentAssetRelations.Count(IsMissingAssetRelation)
+            : componentGroups.Sum(x => x.MissingReferenceCount);
         var modelWarnings = reports.Count(x => string.Equals(x.Status, "warning", StringComparison.OrdinalIgnoreCase));
         var modelErrors = reports.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
         var validationErrors = animationValidation.Validations.Count(x => string.Equals(x.Status, "error", StringComparison.OrdinalIgnoreCase));
@@ -7059,10 +7269,15 @@ internal static class UELibraryPostProcessor
             {
                 relationCount = componentAssetRelations.Length,
                 groupCount = componentGroups.Length,
+                detailedGroupsSkipped = detailedComponentGroupsSkipped,
                 groupsWithMissingReferences = componentGroups.Count(x => x.MissingReferenceCount > 0),
                 missingReferenceCount = missingComponentRefs,
-                modelReferences = componentGroups.Sum(x => x.ModelReferenceCount),
-                exportedModelReferences = componentGroups.Sum(x => x.ExportedModelReferenceCount),
+                modelReferences = detailedComponentGroupsSkipped
+                    ? componentAssetRelations.Count(x => IsModelRelation(x.RelationType))
+                    : componentGroups.Sum(x => x.ModelReferenceCount),
+                exportedModelReferences = detailedComponentGroupsSkipped
+                    ? componentAssetRelations.Count(x => IsModelRelation(x.RelationType) && string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase))
+                    : componentGroups.Sum(x => x.ExportedModelReferenceCount),
                 modelReferenceStatus = BuildComponentRelationStatusSummary(componentAssetRelations, IsModelRelation),
                 skeletonReferences = componentAssetRelations.Count(x => string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase)),
                 exportedSkeletonReferences = componentAssetRelations.Count(x =>
@@ -7072,8 +7287,12 @@ internal static class UELibraryPostProcessor
                 missingSkeletonReferences = componentAssetRelations.Count(x =>
                     string.Equals(x.RelationType, "Skeleton", StringComparison.OrdinalIgnoreCase) &&
                     IsMissingAssetRelation(x)),
-                animationReferences = componentGroups.Sum(x => x.AnimationReferenceCount),
-                exportedAnimationReferences = componentGroups.Sum(x => x.ExportedAnimationReferenceCount),
+                animationReferences = detailedComponentGroupsSkipped
+                    ? componentAssetRelations.Count(x => IsAnimationRelation(x.RelationType))
+                    : componentGroups.Sum(x => x.AnimationReferenceCount),
+                exportedAnimationReferences = detailedComponentGroupsSkipped
+                    ? componentAssetRelations.Count(x => IsAnimationRelation(x.RelationType) && string.Equals(x.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase))
+                    : componentGroups.Sum(x => x.ExportedAnimationReferenceCount),
                 animationReferenceStatus = BuildComponentRelationStatusSummary(componentAssetRelations, IsAnimationRelation),
                 materialReferences = componentGroups.Sum(x => x.MaterialReferenceCount),
                 exportedMaterialReferences = componentGroups.Sum(x => x.ExportedMaterialReferenceCount),
@@ -7113,7 +7332,9 @@ internal static class UELibraryPostProcessor
             {
                 packageObjectMaps = packageObjectMaps.Length,
                 materialTextureSlots = sourceIndex.MaterialTextureSlots.Length,
-                componentAssetRelations = sourceIndex.ComponentAssetRelations.Length,
+                componentAssetRelations = sourceIndex.ComponentAssetRelationCount > 0
+                    ? sourceIndex.ComponentAssetRelationCount
+                    : sourceIndex.ComponentAssetRelations.Length,
             }),
             ["issues"] = issues,
         };
@@ -7598,6 +7819,7 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceAnimationSegment[]> SegmentsByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
+        public int ComponentAssetRelationCount { get; set; }
         public SourceAssetRegistryDependency[] AssetRegistryDependencies { get; set; } = [];
         public SourceAnimBlueprintAnimationRef[] AnimBlueprintAnimationRefs { get; set; } = [];
         public HashSet<string> UnsupportedAnimationObjectPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
