@@ -55,11 +55,13 @@ public class UnrealExporter
     private static int totalChangedFiles = 0;
     private static int totalRegexMatches = 0;
     private static int totalExportedFiles = 0;
+    private static int totalResumedExportJobs = 0;
     private static bool useCheckpoint = false;
     private static string RootDir = AppContext.BaseDirectory;
     private static readonly object ManifestWriteLock = new();
     private static readonly object CatalogWriteLock = new();
     private static readonly object AutoReferencedWriteLock = new();
+    private static readonly object ResumeWriteLock = new();
 
     public static void Main(string[] args)
     {
@@ -92,6 +94,7 @@ public class UnrealExporter
                 totalChangedFiles = 0;
                 totalRegexMatches = 0;
                 totalExportedFiles = 0;
+                totalResumedExportJobs = 0;
 
                 EGame selectedVersion = GetGameVersion(config.Version);
                 Console.WriteLine(
@@ -851,6 +854,10 @@ public class UnrealExporter
                 : DefaultMaxDegreeOfParallelism;
         Console.WriteLine($"Max parallel exports: {maxDegreeOfParallelism}");
         var autoReferencedExportRules = BuildAutoReferencedExportRules(provider, config);
+        var resumeExports = ShouldResumeExports(config);
+        using var exportResumeStore = resumeExports ? ExportResumeStore.Open(config) : null;
+        if (resumeExports)
+            Console.WriteLine($"Export resume: loaded {exportResumeStore!.Count} completed job(s).");
 
         // Loop through all files and export the ones that match any of the config.export paths (converted to regex)
         Parallel.ForEach(
@@ -928,9 +935,19 @@ public class UnrealExporter
                     foreach (var exportJob in activeExportJobs)
                     {
                         var exportedThisJob = false;
+                        var jobOutputs = new ConcurrentBag<string>();
 
                         // "json" etc.
                         var outputType = exportJob.OutputType;
+                        var resumeKey = BuildExportResumeKey(file.Value.Path, outputType, exportJob.AutoReferencedRule);
+                        if (resumeExports && exportResumeStore!.ShouldSkip(resumeKey, file.Value.Size))
+                        {
+                            if (config.LogOutputs)
+                                Console.WriteLine($"~~ resume skip {file.Value.Path}:{outputType}");
+                            Interlocked.Increment(ref totalResumedExportJobs);
+                            Interlocked.Increment(ref totalRegexMatches);
+                            continue;
+                        }
 
                         try
                         {
@@ -995,6 +1012,7 @@ public class UnrealExporter
                                                                 );
                                                                 data.SaveTo(stream);
                                                             }
+                                                            jobOutputs.Add(pngPath);
                                                         }
                                                     }
                                                     catch (IOException ex)
@@ -1036,8 +1054,10 @@ public class UnrealExporter
                                         );
                                         if (!Directory.Exists(outputDir))
                                             Directory.CreateDirectory(outputDir);
-                                        File.WriteAllText(outputPath + ".json", json);
-                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Json");
+                                        var jsonPath = outputPath + ".json";
+                                        File.WriteAllText(jsonPath, json);
+                                        jobOutputs.Add(jsonPath);
+                                        AppendExportManifest(config, file.Value.Path, null, jsonPath, "Json");
                                         foreach (var material in allObjects.OfType<UMaterialInterface>())
                                             AppendAssetCatalog(config, BuildMaterialCatalogEntry(file.Value.Path, material, outputPath + ".json"));
                                         exportedThisJob = true;
@@ -1070,7 +1090,9 @@ public class UnrealExporter
                                                             + kvp.Key.SubstringAfterLast('.'),
                                                         kvp.Value
                                                     );
-                                                    AppendExportManifest(config, file.Value.Path, null, outputPath + "." + kvp.Key.SubstringAfterLast('.'), "RawPackage");
+                                                    var rawPath = outputPath + "." + kvp.Key.SubstringAfterLast('.');
+                                                    jobOutputs.Add(rawPath);
+                                                    AppendExportManifest(config, file.Value.Path, null, rawPath, "RawPackage");
                                                     exportedThisJob = true;
                                                     Interlocked.Increment(ref totalExportedFiles);
                                                 }
@@ -1125,6 +1147,7 @@ public class UnrealExporter
                                                     }
                                                     if (config.LogOutputs)
                                                         Console.WriteLine($"=> {savedFilePath}");
+                                                    jobOutputs.Add(savedFilePath);
                                                     AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Model");
                                                     AppendAssetCatalog(config, BuildModelCatalogEntry(file.Value.Path, obj, savedFilePath));
                                                     exportedThisJob = true;
@@ -1189,6 +1212,7 @@ public class UnrealExporter
                                                 {
                                                     if (config.LogOutputs)
                                                         Console.WriteLine($"=> {savedFilePath}");
+                                                    jobOutputs.Add(savedFilePath);
                                                     AppendExportManifest(config, file.Value.Path, obj, savedFilePath, "Animation");
                                                     AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, savedFilePath, outputType, "ok", null));
                                                     AppendAnimationBinding(config, file.Value.Path, animationAsset, savedFilePath, "ok", null);
@@ -1270,8 +1294,10 @@ public class UnrealExporter
                                         );
                                         if (!Directory.Exists(outputDir))
                                             Directory.CreateDirectory(outputDir);
-                                        File.WriteAllText(outputPath + ".json", json);
-                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".json", "Localization");
+                                        var locresJsonPath = outputPath + ".json";
+                                        File.WriteAllText(locresJsonPath, json);
+                                        jobOutputs.Add(locresJsonPath);
+                                        AppendExportManifest(config, file.Value.Path, null, locresJsonPath, "Localization");
                                         exportedThisJob = true;
                                         Interlocked.Increment(ref totalExportedFiles);
                                     }
@@ -1292,8 +1318,10 @@ public class UnrealExporter
                                         JSBeautify beautifier = new(reader.ReadToEnd(), options);
                                         if (!Directory.Exists(outputDir))
                                             Directory.CreateDirectory(outputDir);
-                                        File.WriteAllText(outputPath + ".js", beautifier.GetResult());
-                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".js", "Js");
+                                        var jsPath = outputPath + ".js";
+                                        File.WriteAllText(jsPath, beautifier.GetResult());
+                                        jobOutputs.Add(jsPath);
+                                        AppendExportManifest(config, file.Value.Path, null, jsPath, "Js");
                                         exportedThisJob = true;
                                         Interlocked.Increment(ref totalExportedFiles);
                                     }
@@ -1312,8 +1340,10 @@ public class UnrealExporter
                                         using var reader = new StreamReader(stream);
                                         if (!Directory.Exists(outputDir))
                                             Directory.CreateDirectory(outputDir);
-                                        File.WriteAllBytes(outputPath + ".db", data);
-                                        AppendExportManifest(config, file.Value.Path, null, outputPath + ".db", "Database");
+                                        var dbPath = outputPath + ".db";
+                                        File.WriteAllBytes(dbPath, data);
+                                        jobOutputs.Add(dbPath);
+                                        AppendExportManifest(config, file.Value.Path, null, dbPath, "Database");
                                         exportedThisJob = true;
                                         Interlocked.Increment(ref totalExportedFiles);
                                     }
@@ -1331,6 +1361,17 @@ public class UnrealExporter
                             Console.WriteLine(
                                 $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
                             );
+                        }
+
+                        if (resumeExports && exportedThisJob)
+                        {
+                            exportResumeStore!.MarkExported(
+                                resumeKey,
+                                file.Value.Path,
+                                file.Value.Size,
+                                outputType,
+                                exportJob.AutoReferencedRule,
+                                jobOutputs.ToArray());
                         }
 
                         if (exportJob.AutoReferencedRule != null)
@@ -1365,9 +1406,12 @@ public class UnrealExporter
         Console.WriteLine(
             $"Scanned {provider.Files.Count} files{(useCheckpoint ? $" ({totalChangedFiles} changed, {provider.Files.Count - totalChangedFiles} unchanged)" : "")}"
         );
+        var incompatibleOrNoOutputJobs = Math.Max(0, totalRegexMatches - totalExportedFiles - totalResumedExportJobs);
         Console.WriteLine(
-            $"Regex matched {totalRegexMatches} files {(totalRegexMatches > totalExportedFiles ? $"(skipped {totalRegexMatches - totalExportedFiles} incompatible file types)" : "")}"
+            $"Regex matched {totalRegexMatches} files {(incompatibleOrNoOutputJobs > 0 ? $"(skipped {incompatibleOrNoOutputJobs} incompatible/no-output job(s))" : "")}"
         );
+        if (resumeExports)
+            Console.WriteLine($"Resume skipped {totalResumedExportJobs} completed export job(s)");
         Console.WriteLine(
             $"Exported {totalExportedFiles} files in {Elapsed(start, Now(), 1000)} seconds"
         );
@@ -2088,6 +2132,23 @@ public class UnrealExporter
     private static string NormalizeAssetPath(string path)
         => path.Replace('\\', '/').Trim();
 
+    private static bool ShouldResumeExports(ConfigObj config)
+        => config.ResumeExports != false;
+
+    private static string BuildExportResumeKey(
+        string sourcePath,
+        string outputType,
+        AutoReferencedExportRule? rule)
+    {
+        var raw = string.Join(
+            "|",
+            "v1",
+            NormalizeAssetPath(sourcePath).ToLowerInvariant(),
+            outputType.ToLowerInvariant(),
+            rule == null ? "explicit" : NormalizeObjectPath(rule.TargetPath).ToLowerInvariant());
+        return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+    }
+
     private static void AppendExportManifest(
         ConfigObj config,
         string sourcePath,
@@ -2123,6 +2184,189 @@ public class UnrealExporter
         {
             File.AppendAllText(catalogPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
         }
+    }
+
+    private sealed class ExportResumeStore : IDisposable
+    {
+        private readonly SqliteConnection _connection;
+        private readonly Dictionary<string, ExportResumeEntry> _entries;
+        private readonly string _gameTitle;
+
+        private ExportResumeStore(SqliteConnection connection, Dictionary<string, ExportResumeEntry> entries, string gameTitle)
+        {
+            _connection = connection;
+            _entries = entries;
+            _gameTitle = gameTitle;
+        }
+
+        public int Count => _entries.Count;
+
+        public static ExportResumeStore Open(ConfigObj config)
+        {
+            var dbPath = Path.Combine(Path.GetFullPath(config.OutputDir), "export_resume_state.db");
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+            var connection = new SqliteConnection($"Data Source={dbPath}");
+            connection.Open();
+            ExecuteResumeSql(connection, "PRAGMA busy_timeout = 10000;");
+            ExecuteResumeSql(connection, "PRAGMA journal_mode = WAL;");
+            ExecuteResumeSql(connection, "PRAGMA synchronous = NORMAL;");
+            ExecuteResumeSql(connection, """
+                CREATE TABLE IF NOT EXISTS export_jobs (
+                    job_key TEXT PRIMARY KEY,
+                    completed_at TEXT NOT NULL,
+                    game_title TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_size INTEGER NOT NULL,
+                    output_type TEXT NOT NULL,
+                    auto_referenced_target TEXT,
+                    auto_referenced_relation_type TEXT,
+                    outputs_json TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                """);
+            ExecuteResumeSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_jobs_source ON export_jobs(source, output_type);");
+            ExecuteResumeSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_jobs_status ON export_jobs(status);");
+
+            var entries = new Dictionary<string, ExportResumeEntry>(StringComparer.OrdinalIgnoreCase);
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT job_key, source_size, outputs_json, status
+                FROM export_jobs
+                WHERE status = 'exported';
+                """;
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var jobKey = reader.GetString(0);
+                string[] outputs;
+                try
+                {
+                    outputs = JsonConvert.DeserializeObject<string[]>(reader.GetString(2)) ?? [];
+                }
+                catch
+                {
+                    outputs = [];
+                }
+
+                entries[jobKey] = new ExportResumeEntry
+                {
+                    JobKey = jobKey,
+                    SourceSize = reader.GetInt64(1),
+                    Outputs = outputs,
+                    Status = reader.GetString(3),
+                };
+            }
+
+            return new ExportResumeStore(connection, entries, config.GameTitle);
+        }
+
+        public bool ShouldSkip(string jobKey, long sourceSize)
+        {
+            lock (ResumeWriteLock)
+            {
+                if (!_entries.TryGetValue(jobKey, out var entry))
+                    return false;
+
+                if (entry.SourceSize != sourceSize || entry.Outputs.Length == 0)
+                    return false;
+
+                return entry.Outputs.All(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+            }
+        }
+
+        public void MarkExported(
+            string jobKey,
+            string sourcePath,
+            long sourceSize,
+            string outputType,
+            AutoReferencedExportRule? rule,
+            string[] outputs)
+        {
+            var existingOutputs = outputs
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(Path.GetFullPath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(File.Exists)
+                .ToArray();
+            if (existingOutputs.Length == 0)
+                return;
+
+            lock (ResumeWriteLock)
+            {
+                using var command = _connection.CreateCommand();
+                command.CommandText = """
+                    INSERT INTO export_jobs (
+                        job_key, completed_at, game_title, source, source_size, output_type,
+                        auto_referenced_target, auto_referenced_relation_type, outputs_json, status
+                    )
+                    VALUES (
+                        $jobKey, $completedAt, $gameTitle, $source, $sourceSize, $outputType,
+                        $autoReferencedTarget, $autoReferencedRelationType, $outputsJson, $status
+                    )
+                    ON CONFLICT(job_key) DO UPDATE SET
+                        completed_at = excluded.completed_at,
+                        game_title = excluded.game_title,
+                        source = excluded.source,
+                        source_size = excluded.source_size,
+                        output_type = excluded.output_type,
+                        auto_referenced_target = excluded.auto_referenced_target,
+                        auto_referenced_relation_type = excluded.auto_referenced_relation_type,
+                        outputs_json = excluded.outputs_json,
+                        status = excluded.status;
+                    """;
+                command.Parameters.AddWithValue("$jobKey", jobKey);
+                command.Parameters.AddWithValue("$completedAt", DateTime.UtcNow.ToString("O"));
+                command.Parameters.AddWithValue("$gameTitle", _gameTitle);
+                command.Parameters.AddWithValue("$source", sourcePath);
+                command.Parameters.AddWithValue("$sourceSize", sourceSize);
+                command.Parameters.AddWithValue("$outputType", outputType);
+                command.Parameters.AddWithValue("$autoReferencedTarget", (object?)rule?.TargetPath ?? DBNull.Value);
+                command.Parameters.AddWithValue("$autoReferencedRelationType", (object?)rule?.RelationType ?? DBNull.Value);
+                command.Parameters.AddWithValue("$outputsJson", JsonConvert.SerializeObject(existingOutputs));
+                command.Parameters.AddWithValue("$status", "exported");
+                command.ExecuteNonQuery();
+
+                _entries[jobKey] = new ExportResumeEntry
+                {
+                    JobKey = jobKey,
+                    SourceSize = sourceSize,
+                    Outputs = existingOutputs,
+                    Status = "exported",
+                };
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (ResumeWriteLock)
+            {
+                try
+                {
+                    ExecuteResumeSql(_connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+                {
+                    Console.WriteLine($"WARN: export resume checkpoint skipped because sqlite database is busy/locked ({ex.Message})");
+                }
+
+                _connection.Dispose();
+            }
+        }
+
+        private static void ExecuteResumeSql(SqliteConnection connection, string sql)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private sealed class ExportResumeEntry
+    {
+        public string JobKey { get; set; } = "";
+        public long SourceSize { get; set; }
+        public string[] Outputs { get; set; } = [];
+        public string Status { get; set; } = "";
     }
 
     private static object BuildModelCatalogEntry(string sourcePath, UObject obj, string outputPath)
@@ -3243,6 +3487,7 @@ public class ConfigObj
     public bool GenerateSourceIndex { get; set; }
     public bool? AutoExportReferencedAssets { get; set; }
     public bool? AutoExportCompatibleAnimations { get; set; }
+    public bool? ResumeExports { get; set; }
     public List<string>? SourceIndexRegex { get; set; }
     public int SourceIndexLimit { get; set; }
     public required List<string> Export { get; set; }

@@ -88,7 +88,7 @@ internal static class UELibraryPostProcessor
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex));
         RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
         RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
-        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation));
+        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -1041,6 +1041,8 @@ internal static class UELibraryPostProcessor
             snapshot.SegmentsByAnimation = LoadSegmentsByAnimation(connection);
             snapshot.MaterialTextureSlots = LoadSourceMaterialTextureSlots(connection);
             snapshot.ComponentAssetRelations = LoadSourceComponentAssetRelations(connection);
+            snapshot.AssetRegistryDependencies = LoadAssetRegistryDependencies(connection);
+            snapshot.AnimBlueprintAnimationRefs = LoadAnimBlueprintAnimationRefs(connection);
             snapshot.UnsupportedAnimationObjectPaths = LoadUnsupportedAnimationObjectPaths(connection);
             snapshot.PackageObjectMapCount = CountTableRows(connection, "package_object_maps");
             snapshot.PackageObjectMaps = [];
@@ -1263,6 +1265,89 @@ internal static class UELibraryPostProcessor
                 ScaleX = GetNullableDouble(reader, 19),
                 ScaleY = GetNullableDouble(reader, 20),
                 ScaleZ = GetNullableDouble(reader, 21),
+            });
+        }
+
+        return result.ToArray();
+    }
+
+    private static SourceAssetRegistryDependency[] LoadAssetRegistryDependencies(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "asset_registry_dependencies"))
+            return [];
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT registry_path, source_package, source_asset_name, source_asset_class, source_identifier,
+                   dependency_package, dependency_asset_name, dependency_asset_class, dependency_identifier,
+                   dependency_category, dependency_kind, dependency_flags, dependency_flags_text,
+                   is_hard_package, is_soft_package, is_name_dependency, is_manage_dependency,
+                   relation_source, raw_json
+            FROM asset_registry_dependencies
+            ORDER BY source_package, dependency_package, dependency_category, dependency_kind;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<SourceAssetRegistryDependency>();
+        while (reader.Read())
+        {
+            result.Add(new SourceAssetRegistryDependency
+            {
+                RegistryPath = GetString(reader, 0),
+                SourcePackage = NormalizePackageName(GetString(reader, 1)),
+                SourceAssetName = GetString(reader, 2),
+                SourceAssetClass = GetString(reader, 3),
+                SourceIdentifier = GetString(reader, 4),
+                DependencyPackage = NormalizePackageName(GetString(reader, 5)),
+                DependencyAssetName = GetString(reader, 6),
+                DependencyAssetClass = GetString(reader, 7),
+                DependencyIdentifier = GetString(reader, 8),
+                DependencyCategory = GetString(reader, 9) ?? "",
+                DependencyKind = GetString(reader, 10) ?? "",
+                DependencyFlags = reader.IsDBNull(11) ? null : reader.GetInt32(11),
+                DependencyFlagsText = GetString(reader, 12),
+                IsHardPackage = !reader.IsDBNull(13) && reader.GetInt32(13) != 0,
+                IsSoftPackage = !reader.IsDBNull(14) && reader.GetInt32(14) != 0,
+                IsNameDependency = !reader.IsDBNull(15) && reader.GetInt32(15) != 0,
+                IsManageDependency = !reader.IsDBNull(16) && reader.GetInt32(16) != 0,
+                RelationSource = GetString(reader, 17) ?? "",
+                RawJson = GetString(reader, 18) ?? "{}",
+            });
+        }
+
+        return result.ToArray();
+    }
+
+    private static SourceAnimBlueprintAnimationRef[] LoadAnimBlueprintAnimationRefs(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "anim_blueprint_animation_refs"))
+            return [];
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, anim_blueprint_object_path, generated_class_object_path,
+                   referenced_animation_path, referenced_animation_name, referenced_animation_type,
+                   property_path, node_type, skeleton_path, relation_source, confidence_hint, raw_json
+            FROM anim_blueprint_animation_refs
+            ORDER BY anim_blueprint_object_path, referenced_animation_path, property_path;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<SourceAnimBlueprintAnimationRef>();
+        while (reader.Read())
+        {
+            result.Add(new SourceAnimBlueprintAnimationRef
+            {
+                SourcePath = GetString(reader, 0),
+                AnimBlueprintObjectPath = NormalizePackageObjectPath(GetString(reader, 1)),
+                GeneratedClassObjectPath = NormalizePackageObjectPath(GetString(reader, 2)),
+                ReferencedAnimationPath = NormalizePackageObjectPath(GetString(reader, 3)),
+                ReferencedAnimationName = GetString(reader, 4),
+                ReferencedAnimationType = GetString(reader, 5),
+                PropertyPath = GetString(reader, 6),
+                NodeType = GetString(reader, 7),
+                SkeletonPath = GetString(reader, 8),
+                RelationSource = GetString(reader, 9) ?? "",
+                ConfidenceHint = GetString(reader, 10) ?? "",
+                RawJson = GetString(reader, 11) ?? "{}",
             });
         }
 
@@ -1647,8 +1732,14 @@ internal static class UELibraryPostProcessor
         return null;
     }
 
-    private static string NormalizePackageObjectPath(string objectPath)
+    private static string NormalizePackageName(string? packageName)
+        => string.IsNullOrWhiteSpace(packageName) ? "" : packageName.Replace('\\', '/').Trim();
+
+    private static string NormalizePackageObjectPath(string? objectPath)
     {
+        if (string.IsNullOrWhiteSpace(objectPath))
+            return "";
+
         var path = objectPath.Replace('\\', '/').Trim();
         var dot = path.LastIndexOf('.');
         if (dot <= 0)
@@ -3084,6 +3175,11 @@ internal static class UELibraryPostProcessor
         var animationsByOutput = BuildUniqueAssetOutputLookup(animations);
         var animationsByObjectPath = BuildUniqueAnimationObjectPathLookup(animations);
         var animationsByOwner = BuildAnimationsByOwner(componentAssetRelations, sourceIndex, animationsByOutput, animationsByObjectPath);
+        var animationsByPackage = BuildAnimationsByPackage(animations);
+        var modelsByPackage = BuildModelsByPackage(models);
+        var modelsByAnimBlueprintPackage = BuildModelsByAnimBlueprintTargetSkeleton(componentAssetRelations, modelsByOutput);
+        var animationsByAnimBlueprintPackage = BuildAnimationsByAnimBlueprintPackage(sourceIndex, animationsByObjectPath);
+        var animationsByAssetRegistrySourcePackage = BuildAnimationsByAssetRegistrySourcePackage(sourceIndex, animationsByPackage);
         var result = new Dictionary<string, ModelAnimationCandidate>(StringComparer.OrdinalIgnoreCase);
 
         // 同一个 UE owner 同时显式引用模型和动画时，才作为默认推荐候选。
@@ -3122,12 +3218,62 @@ internal static class UELibraryPostProcessor
                 foreach (var animClassOwner in FindAnimationClassOwners(group))
                 {
                     if (!animationsByOwner.TryGetValue(animClassOwner, out var classAnimations))
-                        continue;
+                        classAnimations = [];
 
                     foreach (var animation in classAnimations)
                         AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animation, "componentAnimClass");
+
+                    var animClassPackage = GetPackageNameFromObjectPath(animClassOwner);
+                    if (!string.IsNullOrWhiteSpace(animClassPackage))
+                    {
+                        if (animationsByAnimBlueprintPackage.TryGetValue(animClassPackage, out var directRefs))
+                        {
+                            foreach (var animation in directRefs)
+                                AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animation, "animBlueprintDirect");
+                        }
+
+                        if (animationsByAssetRegistrySourcePackage.TryGetValue(animClassPackage, out var dependencyRefs))
+                        {
+                            foreach (var animation in dependencyRefs)
+                                AddModelAnimationCandidate(result, modelsByOutput[modelOutput], animation, "animBlueprintDependency");
+                        }
+                    }
                 }
             }
+        }
+
+        foreach (var dependencyGroup in sourceIndex.AssetRegistryDependencies
+                     .Where(IsCharacterDataSetDependency)
+                     .GroupBy(x => x.SourcePackage, StringComparer.OrdinalIgnoreCase))
+        {
+            var dependencies = dependencyGroup.ToArray();
+            var relatedModels = dependencies
+                .SelectMany(x => modelsByPackage.TryGetValue(x.DependencyPackage, out var packageModels) ? packageModels : [])
+                .DistinctBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (relatedModels.Length == 0)
+                continue;
+
+            var relatedAnimations = dependencies
+                .SelectMany(x => animationsByPackage.TryGetValue(x.DependencyPackage, out var packageAnimations) ? packageAnimations : [])
+                .DistinctBy(x => (string?)x["output"], StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (relatedAnimations.Length == 0)
+                continue;
+
+            foreach (var model in relatedModels)
+            foreach (var animation in relatedAnimations)
+                AddModelAnimationCandidate(result, model, animation, "characterDataSet");
+        }
+
+        foreach (var (animBlueprintPackage, skeletonModels) in modelsByAnimBlueprintPackage)
+        {
+            if (!animationsByAnimBlueprintPackage.TryGetValue(animBlueprintPackage, out var directAnimations))
+                continue;
+
+            foreach (var model in skeletonModels)
+            foreach (var animation in directAnimations)
+                AddModelAnimationCandidate(result, model, animation, "animBlueprintTargetSkeleton");
         }
 
         var modelsBySkeleton = models
@@ -3183,6 +3329,188 @@ internal static class UELibraryPostProcessor
             .GroupBy(x => x.ObjectPath, StringComparer.OrdinalIgnoreCase)
             .Where(x => x.Count() == 1)
             .ToDictionary(x => x.Key, x => x.First().Animation, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, JObject[]> BuildAnimationsByPackage(JObject[] animations)
+        => animations
+            .Select(x => new { Package = GetAssetPackageName(x), Animation = x })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Package))
+            .GroupBy(x => x.Package, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Select(y => y.Animation).ToArray(), StringComparer.OrdinalIgnoreCase);
+
+    private static Dictionary<string, JObject[]> BuildModelsByPackage(JObject[] models)
+        => models
+            .Select(x => new { Package = GetAssetPackageName(x), Model = x })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Package))
+            .GroupBy(x => x.Package, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Select(y => y.Model).ToArray(), StringComparer.OrdinalIgnoreCase);
+
+    private static Dictionary<string, JObject[]> BuildModelsByAnimBlueprintTargetSkeleton(
+        ComponentAssetRelationLink[] componentAssetRelations,
+        Dictionary<string, JObject> modelsByOutput)
+    {
+        var result = new Dictionary<string, List<JObject>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var relation in componentAssetRelations)
+        {
+            if (!relation.RelationType.Equals("Skeleton", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(relation.MatchStatus, "matched", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var ownerText = $"{relation.OwnerType} {relation.OwnerObjectPath} {relation.SourcePath}";
+            if (!ownerText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var modelOutput = NormalizeCatalogOutput(relation.TargetAssetOutput);
+            if (string.IsNullOrWhiteSpace(modelOutput) || !modelsByOutput.TryGetValue(modelOutput, out var model))
+                continue;
+
+            var animBlueprintPackage = GetPackageNameFromObjectPath(relation.OwnerObjectPath);
+            if (string.IsNullOrWhiteSpace(animBlueprintPackage))
+                continue;
+
+            if (!result.TryGetValue(animBlueprintPackage, out var list))
+            {
+                list = [];
+                result[animBlueprintPackage] = list;
+            }
+
+            if (!list.Any(x => string.Equals((string?)x["output"], (string?)model["output"], StringComparison.OrdinalIgnoreCase)))
+                list.Add(model);
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, JObject[]> BuildAnimationsByAnimBlueprintPackage(
+        SourceIndexSnapshot sourceIndex,
+        Dictionary<string, JObject> animationsByObjectPath)
+    {
+        var result = new Dictionary<string, List<JObject>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in sourceIndex.AnimBlueprintAnimationRefs)
+        {
+            if (string.IsNullOrWhiteSpace(reference.ReferencedAnimationPath))
+                continue;
+
+            var normalizedAnimation = NormalizeAnimationObjectPath(reference.ReferencedAnimationPath);
+            if (!animationsByObjectPath.TryGetValue(normalizedAnimation, out var animation))
+                continue;
+
+            var ownerPackage = GetPackageNameFromObjectPath(reference.GeneratedClassObjectPath);
+            if (string.IsNullOrWhiteSpace(ownerPackage))
+                ownerPackage = GetPackageNameFromObjectPath(reference.AnimBlueprintObjectPath);
+            if (string.IsNullOrWhiteSpace(ownerPackage))
+                continue;
+
+            if (!result.TryGetValue(ownerPackage, out var list))
+            {
+                list = [];
+                result[ownerPackage] = list;
+            }
+
+            if (!list.Any(x => string.Equals((string?)x["output"], (string?)animation["output"], StringComparison.OrdinalIgnoreCase)))
+                list.Add(animation);
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, JObject[]> BuildAnimationsByAssetRegistrySourcePackage(
+        SourceIndexSnapshot sourceIndex,
+        Dictionary<string, JObject[]> animationsByPackage)
+    {
+        var result = new Dictionary<string, List<JObject>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var dependency in sourceIndex.AssetRegistryDependencies.Where(IsAnimationAssetRegistryDependency))
+        {
+            if (string.IsNullOrWhiteSpace(dependency.SourcePackage) ||
+                string.IsNullOrWhiteSpace(dependency.DependencyPackage) ||
+                !animationsByPackage.TryGetValue(dependency.DependencyPackage, out var animations))
+                continue;
+
+            if (!result.TryGetValue(dependency.SourcePackage, out var list))
+            {
+                list = [];
+                result[dependency.SourcePackage] = list;
+            }
+
+            foreach (var animation in animations)
+            {
+                if (!list.Any(x => string.Equals((string?)x["output"], (string?)animation["output"], StringComparison.OrdinalIgnoreCase)))
+                    list.Add(animation);
+            }
+        }
+
+        return result.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAnimationAssetRegistryDependency(SourceAssetRegistryDependency dependency)
+    {
+        var classText = $"{dependency.DependencyAssetClass} {dependency.DependencyAssetName} {dependency.DependencyPackage}";
+        return dependency.DependencyCategory.Equals("Package", StringComparison.OrdinalIgnoreCase) &&
+               (classText.Contains("AnimSequence", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("AnimMontage", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("AnimComposite", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("AimOffset", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("/Animation/", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("/Animations/", StringComparison.OrdinalIgnoreCase) ||
+                classText.Contains("/Anim/", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsCharacterDataSetDependency(SourceAssetRegistryDependency dependency)
+    {
+        var sourceClass = $"{dependency.SourceAssetClass} {dependency.SourceAssetName} {dependency.SourcePackage}";
+        if (!dependency.DependencyCategory.Equals("Package", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return sourceClass.Contains("DataAsset", StringComparison.OrdinalIgnoreCase) ||
+               sourceClass.Contains("DataTable", StringComparison.OrdinalIgnoreCase) ||
+               sourceClass.Contains("PrimaryAsset", StringComparison.OrdinalIgnoreCase) ||
+               sourceClass.Contains("AssetSet", StringComparison.OrdinalIgnoreCase) ||
+               sourceClass.Contains("AnimationSet", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetAssetPackageName(JObject asset)
+    {
+        foreach (var value in new[]
+                 {
+                     (string?)asset["objectPath"],
+                     (string?)asset["source"],
+                 })
+        {
+            var package = GetPackageNameFromObjectPath(value);
+            if (!string.IsNullOrWhiteSpace(package))
+                return package;
+        }
+
+        return "";
+    }
+
+    private static string GetPackageNameFromObjectPath(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        var path = value.Replace('\\', '/').Trim();
+        if (path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+        {
+            path = path[..path.LastIndexOf('.')];
+            var contentIndex = path.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+            if (contentIndex >= 0)
+                return "/Game/" + path[(contentIndex + "/Content/".Length)..].Trim('/');
+        }
+
+        if (path.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
+        {
+            var dot = path.LastIndexOf('.');
+            return dot > 0 ? path[..dot] : path;
+        }
+
+        if (path.StartsWith("Game/", StringComparison.OrdinalIgnoreCase))
+            return "/" + path;
+
+        return "";
     }
 
     private static Dictionary<string, JObject[]> BuildAnimationsByOwner(
@@ -4005,6 +4333,9 @@ internal static class UELibraryPostProcessor
                     animationsByOutput.TryGetValue(NormalizeCatalogOutput(validation.AnimationOutput), out var animation);
                     var exportStatus = (string?)animation?["status"];
                     var isUsableCandidate = IsUsableAnimationCandidate(exportStatus, validation.Status, validation.CandidateReason);
+                    var usageEvidence = ClassifyAnimationUsageEvidence(validation.CandidateReason);
+                    var confidenceTier = ClassifyAnimationConfidenceTier(validation.CandidateReason);
+                    var relationshipKind = ClassifyAnimationRelationshipKind(validation.CandidateReason);
                     return new
                     {
                         name = animation?["name"] ?? validation.AnimationName,
@@ -4023,6 +4354,15 @@ internal static class UELibraryPostProcessor
                         validationCategory = validation.ValidationCategory,
                         validationReason = validation.Reason,
                         relationSource = validation.CandidateReason,
+                        usageEvidence,
+                        confidenceTier,
+                        relationshipKind,
+                        recommendedUse = ClassifyAnimationRecommendedUse(exportStatus, validation.Status, validation.CandidateReason),
+                        evidenceChain = BuildAnimationEvidenceChain(validation.CandidateReason),
+                        isExplicitUsage = usageEvidence == "explicitUsage",
+                        isDeterministicUsage = IsDeterministicAnimationUsage(validation.CandidateReason),
+                        isSkeletonCompatible = usageEvidence == "skeletonCompatibility",
+                        isCompatibilityCandidate = usageEvidence == "skeletonCompatibility",
                         trackCoverage = validation.TrackCoverage,
                         hierarchyCompatible = validation.HierarchyCompatible,
                         isContainerAnimation = validation.IsContainerAnimation,
@@ -4039,11 +4379,22 @@ internal static class UELibraryPostProcessor
                 ? relationAnimations.Length > 0 ? "RelatedButNotUsable" : "NoMatchingAnimationExported"
                 : relationAnimations.Any(x => string.Equals(x.relationSource, "componentOwner", StringComparison.OrdinalIgnoreCase))
                     ? "ExplicitComponent"
-                    : relationAnimations.Any(x => string.Equals(x.relationSource, "uniqueSkeleton", StringComparison.OrdinalIgnoreCase))
-                        ? "UniqueSkeleton"
-                        : relationAnimations.Any(x => string.Equals(x.relationSource, "sharedSkeleton", StringComparison.OrdinalIgnoreCase))
-                            ? "SharedSkeletonCompatible"
-                            : "RelatedButNotUsable";
+                    : relationAnimations.Any(x => string.Equals(x.relationSource, "componentOwnerBlendSpaceSample", StringComparison.OrdinalIgnoreCase))
+                        ? "ExplicitComponent"
+                    : relationAnimations.Any(x =>
+                            string.Equals(x.relationSource, "animBlueprintDirect", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(x.relationSource, "animBlueprintTargetSkeleton", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(x.relationSource, "animBlueprintDependency", StringComparison.OrdinalIgnoreCase))
+                            ? "AnimBlueprintDirect"
+                            : relationAnimations.Any(x => string.Equals(x.relationSource, "characterDataSet", StringComparison.OrdinalIgnoreCase))
+                                ? "CharacterDataSet"
+                                : relationAnimations.Any(x => string.Equals(x.relationSource, "uniqueSkeleton", StringComparison.OrdinalIgnoreCase))
+                                    ? "UniqueSkeletonCompatible"
+                                    : relationAnimations.Any(x => string.Equals(x.relationSource, "sharedSkeleton", StringComparison.OrdinalIgnoreCase))
+                                        ? "SharedSkeletonCompatible"
+                                        : relationAnimations.Any(x => string.Equals(x.relationSource, "componentAnimClass", StringComparison.OrdinalIgnoreCase))
+                                            ? "AnimClassContext"
+                                            : "RelatedButNotUsable";
 
             relations.Add(JObject.FromObject(new
             {
@@ -4056,6 +4407,10 @@ internal static class UELibraryPostProcessor
                 totalAnimationCount = relationAnimations.Length,
                 usableAnimationCount,
                 animations = relationAnimations,
+                explicitUsageAnimationCount = relationAnimations.Count(x => x.isExplicitUsage),
+                deterministicUsageAnimationCount = relationAnimations.Count(x => x.isDeterministicUsage),
+                skeletonCompatibleAnimationCount = relationAnimations.Count(x => x.isSkeletonCompatible),
+                compatibilityCandidateAnimationCount = relationAnimations.Count(x => x.isCompatibilityCandidate),
             }));
         }
 
@@ -4071,6 +4426,10 @@ internal static class UELibraryPostProcessor
                 relatedModels = relations.Count(x => ((JArray)x["animations"]!).Count > 0),
                 relatedAnimations = relations.Sum(x => ((JArray)x["animations"]!).Count),
                 usableAnimations = relations.Sum(x => (int?)x["usableAnimationCount"] ?? 0),
+                explicitUsageAnimations = relations.Sum(x => (int?)x["explicitUsageAnimationCount"] ?? 0),
+                deterministicUsageAnimations = relations.Sum(x => (int?)x["deterministicUsageAnimationCount"] ?? 0),
+                skeletonCompatibleAnimations = relations.Sum(x => (int?)x["skeletonCompatibleAnimationCount"] ?? 0),
+                compatibilityCandidateAnimations = relations.Sum(x => (int?)x["compatibilityCandidateAnimationCount"] ?? 0),
             }),
             ["relations"] = relations,
         };
@@ -4086,6 +4445,91 @@ internal static class UELibraryPostProcessor
             return false;
 
         return !string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ClassifyAnimationUsageEvidence(string? candidateReason)
+    {
+        return candidateReason switch
+        {
+            "componentOwner" or "componentOwnerBlendSpaceSample" => "explicitUsage",
+            "animBlueprintDirect" or "animBlueprintTargetSkeleton" or "animBlueprintDependency" => "animBlueprintDirect",
+            "characterDataSet" => "characterDataSet",
+            "componentAnimClass" => "animClassContext",
+            "uniqueSkeleton" or "sharedSkeleton" => "skeletonCompatibility",
+            _ => "unknown",
+        };
+    }
+
+    private static string ClassifyAnimationConfidenceTier(string? candidateReason)
+    {
+        return candidateReason switch
+        {
+            "componentOwner" or "componentOwnerBlendSpaceSample" => "ExplicitComponent",
+            "animBlueprintDirect" or "animBlueprintTargetSkeleton" or "animBlueprintDependency" => "AnimBlueprintDirect",
+            "characterDataSet" => "CharacterDataSet",
+            "componentAnimClass" => "AnimClassContext",
+            "uniqueSkeleton" => "UniqueSkeletonCompatible",
+            "sharedSkeleton" => "SharedSkeletonCompatible",
+            _ => "Unknown",
+        };
+    }
+
+    private static string ClassifyAnimationRelationshipKind(string? candidateReason)
+    {
+        return candidateReason switch
+        {
+            "componentOwner" or "componentOwnerBlendSpaceSample" or
+                "animBlueprintDirect" or "animBlueprintTargetSkeleton" or "animBlueprintDependency" or
+                "characterDataSet" => "deterministicUsage",
+            "componentAnimClass" => "contextualUsage",
+            "uniqueSkeleton" or "sharedSkeleton" => "compatibilityCandidate",
+            _ => "unknown",
+        };
+    }
+
+    private static string ClassifyAnimationRecommendedUse(string? exportStatus, string validationStatus, string? candidateReason)
+    {
+        if (!IsUsableAnimationCandidate(exportStatus, validationStatus, candidateReason))
+            return "notUsable";
+
+        var relationshipKind = ClassifyAnimationRelationshipKind(candidateReason);
+        if (!string.Equals(validationStatus, "ok", StringComparison.OrdinalIgnoreCase))
+            return relationshipKind == "compatibilityCandidate" ? "compatibleNeedsReview" : "manualReview";
+
+        return relationshipKind switch
+        {
+            "deterministicUsage" => "defaultTrusted",
+            "compatibilityCandidate" => "compatibleCandidate",
+            "contextualUsage" => "manualReview",
+            _ => "manualReview",
+        };
+    }
+
+    private static string[] BuildAnimationEvidenceChain(string? candidateReason)
+    {
+        return candidateReason switch
+        {
+            "componentOwner" => ["USkeletalMeshComponent.SkeletalMesh", "USkeletalMeshComponent.AnimationData.AnimToPlay", "sameOwnerObject", "sameUSkeleton", "trackValidation"],
+            "componentOwnerBlendSpaceSample" => ["USkeletalMeshComponent.SkeletalMesh", "animationContainerReference", "animation_segments.referenced_animation_path", "sameUSkeleton", "trackValidation"],
+            "animBlueprintDirect" => ["USkeletalMeshComponent.AnimClass", "anim_blueprint_animation_refs", "sameUSkeleton", "trackValidation"],
+            "animBlueprintTargetSkeleton" => ["AnimBlueprintGeneratedClass.TargetSkeleton", "matchedModelSkeleton", "anim_blueprint_animation_refs", "sameUSkeleton", "trackValidation"],
+            "animBlueprintDependency" => ["USkeletalMeshComponent.AnimClass", "asset_registry_dependencies", "sameUSkeleton", "trackValidation"],
+            "characterDataSet" => ["asset_registry_dependencies", "dataAssetReferencesModelAndAnimation", "sameUSkeleton", "trackValidation"],
+            "componentAnimClass" => ["USkeletalMeshComponent.AnimClass", "componentOwnerAnimationReferences", "sameUSkeleton", "trackValidation"],
+            "uniqueSkeleton" => ["sameUSkeleton", "singleModelForSkeletonInLibrary", "trackValidation"],
+            "sharedSkeleton" => ["sameUSkeleton", "sharedSkeletonCompatibilityCandidate", "trackValidation"],
+            _ => ["unknown"],
+        };
+    }
+
+    private static bool IsDeterministicAnimationUsage(string? candidateReason)
+    {
+        return candidateReason is "componentOwner"
+            or "componentOwnerBlendSpaceSample"
+            or "animBlueprintDirect"
+            or "animBlueprintTargetSkeleton"
+            or "animBlueprintDependency"
+            or "characterDataSet";
     }
 
     private static bool IsUsableRelationAnimation(JObject animation)
@@ -4652,7 +5096,7 @@ internal static class UELibraryPostProcessor
             {
                 "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
                 "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但源索引确认到对象时记录为 sourceIndexedPathEvidence。",
-                "动画 actionableError 来自显式/唯一骨架等默认关系链路；fallbackDiagnosticError 来自 sharedSkeleton 兜底诊断，保留用于排查但不进入默认可用动画。",
+                "动画 explicitUsage 来自 UE 组件/蓝图/AnimClass 等显式关系；skeletonCompatibility 来自同 USkeleton 且骨骼覆盖验证通过的可复用候选。验证 error 不进入可用动画。",
                 "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
             },
         });
@@ -5051,7 +5495,8 @@ internal static class UELibraryPostProcessor
         JArray skeletonGroups,
         JObject modelAnimationRelations,
         JObject modelCoverage,
-        AnimationValidationSummary animationValidation)
+        AnimationValidationSummary animationValidation,
+        SourceIndexSnapshot sourceIndex)
     {
         var dbPath = Path.Combine(root, "library_index.db");
         DeleteSqliteOutput(dbPath);
@@ -5088,6 +5533,60 @@ internal static class UELibraryPostProcessor
                 extension TEXT NOT NULL,
                 hard_linked INTEGER NOT NULL,
                 link_error TEXT
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE export_manifest (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exported_at TEXT,
+                game_title TEXT,
+                kind TEXT,
+                source TEXT,
+                object_type TEXT,
+                name TEXT,
+                object_path TEXT,
+                output TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                indexed_at TEXT,
+                game_title TEXT,
+                status TEXT,
+                error TEXT,
+                source TEXT,
+                source_type TEXT,
+                name TEXT,
+                object_path TEXT,
+                output TEXT,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                skeleton_guid TEXT,
+                duration REAL,
+                frame_count INTEGER,
+                track_count INTEGER,
+                notify_count INTEGER NOT NULL,
+                curve_count INTEGER NOT NULL,
+                segment_count INTEGER NOT NULL,
+                section_count INTEGER NOT NULL,
+                requires_acl INTEGER NOT NULL,
+                compression TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE auto_referenced_exports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stage TEXT,
+                status TEXT,
+                relation_type TEXT,
+                target_path TEXT,
+                source TEXT,
+                output_type TEXT,
+                reason TEXT,
+                raw_json TEXT NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -5246,6 +5745,47 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE asset_registry_dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                registry_path TEXT,
+                source_package TEXT,
+                source_asset_name TEXT,
+                source_asset_class TEXT,
+                source_identifier TEXT,
+                dependency_package TEXT,
+                dependency_asset_name TEXT,
+                dependency_asset_class TEXT,
+                dependency_identifier TEXT,
+                dependency_category TEXT NOT NULL,
+                dependency_kind TEXT NOT NULL,
+                dependency_flags INTEGER,
+                dependency_flags_text TEXT,
+                is_hard_package INTEGER NOT NULL,
+                is_soft_package INTEGER NOT NULL,
+                is_name_dependency INTEGER NOT NULL,
+                is_manage_dependency INTEGER NOT NULL,
+                relation_source TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE anim_blueprint_animation_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT,
+                anim_blueprint_object_path TEXT NOT NULL,
+                generated_class_object_path TEXT,
+                referenced_animation_path TEXT NOT NULL,
+                referenced_animation_name TEXT,
+                referenced_animation_type TEXT,
+                property_path TEXT,
+                node_type TEXT,
+                skeleton_path TEXT,
+                relation_source TEXT,
+                confidence_hint TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE model_animation_relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model TEXT NOT NULL,
@@ -5280,6 +5820,9 @@ internal static class UELibraryPostProcessor
                 output TEXT,
                 status TEXT,
                 relation_source TEXT,
+                usage_evidence TEXT,
+                is_explicit_usage INTEGER NOT NULL,
+                is_skeleton_compatible INTEGER NOT NULL,
                 validation_status TEXT,
                 validation_category TEXT,
                 validation_reason TEXT,
@@ -5290,6 +5833,12 @@ internal static class UELibraryPostProcessor
                 hierarchy_compatible INTEGER NOT NULL,
                 is_container_animation INTEGER NOT NULL,
                 is_usable_candidate INTEGER NOT NULL,
+                confidence_tier TEXT,
+                relationship_kind TEXT,
+                recommended_use TEXT,
+                evidence_chain_json TEXT NOT NULL,
+                is_deterministic_usage INTEGER NOT NULL,
+                is_compatibility_candidate INTEGER NOT NULL,
                 segment_count INTEGER NOT NULL,
                 referenced_animation_count INTEGER NOT NULL,
                 exported_referenced_animation_count INTEGER NOT NULL,
@@ -5326,6 +5875,10 @@ internal static class UELibraryPostProcessor
         foreach (var link in textureLinks)
             InsertTextureLink(connection, transaction, link);
 
+        InsertExportManifestRows(connection, transaction, root);
+        InsertAnimationBindingRows(connection, transaction, root);
+        InsertAutoReferencedExportRows(connection, transaction, root);
+
         foreach (var report in reports)
             InsertModelValidation(connection, transaction, report);
 
@@ -5345,6 +5898,12 @@ internal static class UELibraryPostProcessor
         foreach (var row in packageObjectMaps)
             InsertPackageObjectMap(connection, transaction, row);
 
+        foreach (var row in sourceIndex.AssetRegistryDependencies)
+            InsertAssetRegistryDependency(connection, transaction, row);
+
+        foreach (var row in sourceIndex.AnimBlueprintAnimationRefs)
+            InsertAnimBlueprintAnimationRef(connection, transaction, row);
+
         InsertSkeletonGroups(connection, transaction, skeletonGroups);
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
@@ -5361,6 +5920,13 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_export_manifest_source ON export_manifest(source, kind);");
+        Execute(connection, transaction, "CREATE INDEX idx_export_manifest_object ON export_manifest(object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_export_manifest_output ON export_manifest(output);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_bindings_object ON animation_bindings(object_path, status);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_bindings_skeleton ON animation_bindings(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_auto_referenced_exports_target ON auto_referenced_exports(target_path, relation_type);");
+        Execute(connection, transaction, "CREATE INDEX idx_auto_referenced_exports_status ON auto_referenced_exports(stage, status, reason);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
@@ -5377,10 +5943,19 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_source ON asset_registry_dependencies(source_package, dependency_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_dependency ON asset_registry_dependencies(dependency_package, dependency_kind);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_class ON asset_registry_dependencies(source_asset_class, dependency_asset_class);");
+        Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_owner ON anim_blueprint_animation_refs(anim_blueprint_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_generated ON anim_blueprint_animation_refs(generated_class_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_animation ON anim_blueprint_animation_refs(referenced_animation_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_usage ON relation_animations(usage_evidence, is_explicit_usage, is_skeleton_compatible);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_confidence ON relation_animations(confidence_tier, is_deterministic_usage, is_compatibility_candidate);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_recommended ON relation_animations(relationship_kind, recommended_use);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
     }
@@ -5445,6 +6020,128 @@ internal static class UELibraryPostProcessor
         Add(command, "$hardLinked", link.HardLinked ? 1 : 0);
         Add(command, "$linkError", link.LinkError);
         command.ExecuteNonQuery();
+    }
+
+    private static void InsertExportManifestRows(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        foreach (var row in ReadJsonLines(Path.Combine(root, "export_manifest.jsonl")))
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO export_manifest (
+                    exported_at, game_title, kind, source, object_type, name, object_path, output, raw_json
+                )
+                VALUES (
+                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output, $rawJson
+                );
+                """;
+            Add(command, "$exportedAt", (string?)row["exportedAt"]);
+            Add(command, "$gameTitle", (string?)row["gameTitle"]);
+            Add(command, "$kind", (string?)row["kind"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$objectType", (string?)row["objectType"]);
+            Add(command, "$name", (string?)row["name"]);
+            Add(command, "$objectPath", (string?)row["objectPath"]);
+            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAnimationBindingRows(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        foreach (var row in ReadJsonLines(Path.Combine(root, "animation_bindings.jsonl")))
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_bindings (
+                    indexed_at, game_title, status, error, source, source_type, name, object_path, output,
+                    skeleton_path, skeleton_name, skeleton_guid, duration, frame_count, track_count,
+                    notify_count, curve_count, segment_count, section_count, requires_acl, compression, raw_json
+                )
+                VALUES (
+                    $indexedAt, $gameTitle, $status, $error, $source, $sourceType, $name, $objectPath, $output,
+                    $skeletonPath, $skeletonName, $skeletonGuid, $duration, $frameCount, $trackCount,
+                    $notifyCount, $curveCount, $segmentCount, $sectionCount, $requiresAcl, $compression, $rawJson
+                );
+                """;
+            Add(command, "$indexedAt", (string?)row["indexedAt"]);
+            Add(command, "$gameTitle", (string?)row["gameTitle"]);
+            Add(command, "$status", (string?)row["status"]);
+            Add(command, "$error", (string?)row["error"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$sourceType", (string?)row["sourceType"]);
+            Add(command, "$name", (string?)row["name"]);
+            Add(command, "$objectPath", (string?)row["objectPath"]);
+            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)row["skeletonName"]);
+            Add(command, "$skeletonGuid", (string?)row["skeletonGuid"]);
+            Add(command, "$duration", (double?)row["duration"]);
+            Add(command, "$frameCount", (int?)row["frameCount"]);
+            Add(command, "$trackCount", (int?)row["trackCount"]);
+            Add(command, "$notifyCount", (int?)row["notifyCount"] ?? 0);
+            Add(command, "$curveCount", (int?)row["curveCount"] ?? 0);
+            Add(command, "$segmentCount", row["segments"] is JArray segments ? segments.Count : 0);
+            Add(command, "$sectionCount", row["sections"] is JArray sections ? sections.Count : 0);
+            Add(command, "$requiresAcl", ((bool?)row["requiresAcl"] ?? false) ? 1 : 0);
+            Add(command, "$compression", (string?)row["compression"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAutoReferencedExportRows(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        foreach (var row in ReadJsonLines(Path.Combine(root, "auto_referenced_exports.jsonl")))
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO auto_referenced_exports (
+                    stage, status, relation_type, target_path, source, output_type, reason, raw_json
+                )
+                VALUES (
+                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason, $rawJson
+                );
+                """;
+            Add(command, "$stage", (string?)row["stage"]);
+            Add(command, "$status", (string?)row["status"]);
+            Add(command, "$relationType", (string?)row["relationType"]);
+            Add(command, "$targetPath", (string?)row["targetPath"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$outputType", (string?)row["outputType"]);
+            Add(command, "$reason", (string?)row["reason"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static IEnumerable<JObject> ReadJsonLines(string path)
+    {
+        if (!File.Exists(path))
+            yield break;
+
+        foreach (var line in File.ReadLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            JObject? row = null;
+            try
+            {
+                row = JObject.Parse(line);
+            }
+            catch (JsonException)
+            {
+                // JSONL 是流式日志，旧版本或中断导出可能留下半行；索引重建时跳过坏行。
+            }
+
+            if (row != null)
+                yield return row;
+        }
     }
 
     private static void InsertModelValidation(SqliteConnection connection, SqliteTransaction transaction, ModelValidationEntry report)
@@ -5753,6 +6450,85 @@ internal static class UELibraryPostProcessor
         command.ExecuteNonQuery();
     }
 
+    private static void InsertAssetRegistryDependency(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SourceAssetRegistryDependency row)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO asset_registry_dependencies (
+                registry_path, source_package, source_asset_name, source_asset_class, source_identifier,
+                dependency_package, dependency_asset_name, dependency_asset_class, dependency_identifier,
+                dependency_category, dependency_kind, dependency_flags, dependency_flags_text,
+                is_hard_package, is_soft_package, is_name_dependency, is_manage_dependency,
+                relation_source, raw_json
+            )
+            VALUES (
+                $registryPath, $sourcePackage, $sourceAssetName, $sourceAssetClass, $sourceIdentifier,
+                $dependencyPackage, $dependencyAssetName, $dependencyAssetClass, $dependencyIdentifier,
+                $dependencyCategory, $dependencyKind, $dependencyFlags, $dependencyFlagsText,
+                $isHardPackage, $isSoftPackage, $isNameDependency, $isManageDependency,
+                $relationSource, $rawJson
+            );
+            """;
+        Add(command, "$registryPath", row.RegistryPath);
+        Add(command, "$sourcePackage", row.SourcePackage);
+        Add(command, "$sourceAssetName", row.SourceAssetName);
+        Add(command, "$sourceAssetClass", row.SourceAssetClass);
+        Add(command, "$sourceIdentifier", row.SourceIdentifier);
+        Add(command, "$dependencyPackage", row.DependencyPackage);
+        Add(command, "$dependencyAssetName", row.DependencyAssetName);
+        Add(command, "$dependencyAssetClass", row.DependencyAssetClass);
+        Add(command, "$dependencyIdentifier", row.DependencyIdentifier);
+        Add(command, "$dependencyCategory", row.DependencyCategory);
+        Add(command, "$dependencyKind", row.DependencyKind);
+        Add(command, "$dependencyFlags", row.DependencyFlags);
+        Add(command, "$dependencyFlagsText", row.DependencyFlagsText);
+        Add(command, "$isHardPackage", row.IsHardPackage ? 1 : 0);
+        Add(command, "$isSoftPackage", row.IsSoftPackage ? 1 : 0);
+        Add(command, "$isNameDependency", row.IsNameDependency ? 1 : 0);
+        Add(command, "$isManageDependency", row.IsManageDependency ? 1 : 0);
+        Add(command, "$relationSource", row.RelationSource);
+        Add(command, "$rawJson", row.RawJson);
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertAnimBlueprintAnimationRef(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SourceAnimBlueprintAnimationRef row)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO anim_blueprint_animation_refs (
+                source_path, anim_blueprint_object_path, generated_class_object_path,
+                referenced_animation_path, referenced_animation_name, referenced_animation_type,
+                property_path, node_type, skeleton_path, relation_source, confidence_hint, raw_json
+            )
+            VALUES (
+                $sourcePath, $animBlueprintObjectPath, $generatedClassObjectPath,
+                $referencedAnimationPath, $referencedAnimationName, $referencedAnimationType,
+                $propertyPath, $nodeType, $skeletonPath, $relationSource, $confidenceHint, $rawJson
+            );
+            """;
+        Add(command, "$sourcePath", row.SourcePath);
+        Add(command, "$animBlueprintObjectPath", row.AnimBlueprintObjectPath);
+        Add(command, "$generatedClassObjectPath", row.GeneratedClassObjectPath);
+        Add(command, "$referencedAnimationPath", row.ReferencedAnimationPath);
+        Add(command, "$referencedAnimationName", row.ReferencedAnimationName);
+        Add(command, "$referencedAnimationType", row.ReferencedAnimationType);
+        Add(command, "$propertyPath", row.PropertyPath);
+        Add(command, "$nodeType", row.NodeType);
+        Add(command, "$skeletonPath", row.SkeletonPath);
+        Add(command, "$relationSource", row.RelationSource);
+        Add(command, "$confidenceHint", row.ConfidenceHint);
+        Add(command, "$rawJson", row.RawJson);
+        command.ExecuteNonQuery();
+    }
+
     private static void InsertSkeletonGroups(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -5852,14 +6628,18 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO relation_animations (
                 relation_id, name, source, output, status, duration, frame_count, track_count,
-                relation_source, validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
-                is_usable_candidate, segment_count, referenced_animation_count, exported_referenced_animation_count,
+                relation_source, usage_evidence, is_explicit_usage, is_skeleton_compatible,
+                validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
+                is_usable_candidate, confidence_tier, relationship_kind, recommended_use, evidence_chain_json, is_deterministic_usage, is_compatibility_candidate,
+                segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count, raw_json
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
-                $relationSource, $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
-                $isUsableCandidate, $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
+                $relationSource, $usageEvidence, $isExplicitUsage, $isSkeletonCompatible,
+                $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                $isUsableCandidate, $confidenceTier, $relationshipKind, $recommendedUse, $evidenceChainJson, $isDeterministicUsage, $isCompatibilityCandidate,
+                $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
             """;
@@ -5869,6 +6649,9 @@ internal static class UELibraryPostProcessor
         Add(command, "$output", (string?)animation["output"]);
         Add(command, "$status", (string?)animation["status"]);
         Add(command, "$relationSource", (string?)animation["relationSource"]);
+        Add(command, "$usageEvidence", (string?)animation["usageEvidence"]);
+        Add(command, "$isExplicitUsage", ((bool?)animation["isExplicitUsage"] ?? false) ? 1 : 0);
+        Add(command, "$isSkeletonCompatible", ((bool?)animation["isSkeletonCompatible"] ?? false) ? 1 : 0);
         Add(command, "$validationStatus", (string?)animation["validationStatus"]);
         Add(command, "$validationCategory", (string?)animation["validationCategory"]);
         Add(command, "$validationReason", (string?)animation["validationReason"]);
@@ -5879,6 +6662,12 @@ internal static class UELibraryPostProcessor
         Add(command, "$hierarchyCompatible", ((bool?)animation["hierarchyCompatible"] ?? false) ? 1 : 0);
         Add(command, "$isContainerAnimation", ((bool?)animation["isContainerAnimation"] ?? false) ? 1 : 0);
         Add(command, "$isUsableCandidate", ((bool?)animation["isUsableCandidate"] ?? false) ? 1 : 0);
+        Add(command, "$confidenceTier", (string?)animation["confidenceTier"]);
+        Add(command, "$relationshipKind", (string?)animation["relationshipKind"]);
+        Add(command, "$recommendedUse", (string?)animation["recommendedUse"]);
+        Add(command, "$evidenceChainJson", animation["evidenceChain"]?.ToString(Formatting.None) ?? "[]");
+        Add(command, "$isDeterministicUsage", ((bool?)animation["isDeterministicUsage"] ?? false) ? 1 : 0);
+        Add(command, "$isCompatibilityCandidate", ((bool?)animation["isCompatibilityCandidate"] ?? false) ? 1 : 0);
         Add(command, "$segmentCount", (int?)animation["segmentCount"] ?? 0);
         Add(command, "$referencedAnimationCount", (int?)animation["referencedAnimationCount"] ?? 0);
         Add(command, "$exportedReferencedAnimationCount", (int?)animation["exportedReferencedAnimationCount"] ?? 0);
@@ -6202,7 +6991,7 @@ internal static class UELibraryPostProcessor
             {
                 ["level"] = "info",
                 ["area"] = "animations",
-                ["message"] = $"另有 {fallbackDiagnosticValidationErrors} 个 sharedSkeleton 兜底诊断候选缺少部分 track 骨骼，已保留在明细中但不会作为默认可用动画。",
+                ["message"] = $"另有 {fallbackDiagnosticValidationErrors} 个 sharedSkeleton 兼容候选缺少必要 track 骨骼，已保留在明细中但不会作为可用动画。",
             });
         if (linkErrors > 0)
             issues.Add(new JObject { ["level"] = "warning", ["area"] = "textures", ["message"] = $"有 {linkErrors} 个共享贴图硬链接创建失败。" });
@@ -6404,6 +7193,22 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要，包含组件节点、父子关系、socket 和 transform。 |");
         sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 摘要；完整原始依赖和导出对象记录保留在 `ue_source_index.db`。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
+        sb.AppendLine();
+        sb.AppendLine("## 模型动画关系字段");
+        sb.AppendLine();
+        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 保留同一份关系的 JSON 视图。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
+        sb.AppendLine();
+        sb.AppendLine("| 字段 | 用途 |");
+        sb.AppendLine("| --- | --- |");
+        sb.AppendLine("| `confidence_tier` / `confidenceTier` | 关系最高置信层级，例如 `ExplicitComponent`、`AnimBlueprintDirect`、`CharacterDataSet`、`UniqueSkeletonCompatible`、`SharedSkeletonCompatible`。 |");
+        sb.AppendLine("| `relationship_kind` / `relationshipKind` | 关系大类：`deterministicUsage`、`contextualUsage`、`compatibilityCandidate`、`unknown`。 |");
+        sb.AppendLine("| `recommended_use` / `recommendedUse` | 默认推荐状态：`defaultTrusted`、`compatibleCandidate`、`manualReview`、`compatibleNeedsReview`、`notUsable`。 |");
+        sb.AppendLine("| `evidence_chain_json` / `evidenceChain` | 证据链，说明关系来自组件、AnimBP、DataAsset、同 Skeleton、track 验证等哪几步。 |");
+        sb.AppendLine("| `usage_evidence` / `usageEvidence` | 兼容旧报告的粗粒度证据字段，新 UI 不应只靠它判断可信度。 |");
+        sb.AppendLine("| `is_deterministic_usage` / `isDeterministicUsage` | 是否来自确定性使用或强上下文证据。 |");
+        sb.AppendLine("| `is_compatibility_candidate` / `isCompatibilityCandidate` | 是否只是同 Skeleton/唯一 Skeleton 兼容候选。 |");
+        sb.AppendLine();
+        sb.AppendLine("`library_index.db` 还会同步 `export_manifest.jsonl`、`animation_bindings.jsonl` 和 `auto_referenced_exports.jsonl` 到 `export_manifest`、`animation_bindings`、`auto_referenced_exports` 表，供浏览器直接查询导出来源、动画绑定和自动补导诊断。");
         sb.AppendLine();
         sb.AppendLine("## 下一步");
         sb.AppendLine();
@@ -6793,6 +7598,8 @@ internal static class UELibraryPostProcessor
         public Dictionary<string, SourceAnimationSegment[]> SegmentsByAnimation { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourceMaterialTextureSlot[] MaterialTextureSlots { get; set; } = [];
         public SourceComponentAssetRelation[] ComponentAssetRelations { get; set; } = [];
+        public SourceAssetRegistryDependency[] AssetRegistryDependencies { get; set; } = [];
+        public SourceAnimBlueprintAnimationRef[] AnimBlueprintAnimationRefs { get; set; } = [];
         public HashSet<string> UnsupportedAnimationObjectPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> UnsupportedAutoReferencedAnimationPaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public SourcePackageObjectMap[] PackageObjectMaps { get; set; } = [];
@@ -6877,6 +7684,45 @@ internal static class UELibraryPostProcessor
         public double? ScaleX { get; set; }
         public double? ScaleY { get; set; }
         public double? ScaleZ { get; set; }
+    }
+
+    private sealed class SourceAssetRegistryDependency
+    {
+        public string? RegistryPath { get; set; }
+        public string SourcePackage { get; set; } = string.Empty;
+        public string? SourceAssetName { get; set; }
+        public string? SourceAssetClass { get; set; }
+        public string? SourceIdentifier { get; set; }
+        public string DependencyPackage { get; set; } = string.Empty;
+        public string? DependencyAssetName { get; set; }
+        public string? DependencyAssetClass { get; set; }
+        public string? DependencyIdentifier { get; set; }
+        public string DependencyCategory { get; set; } = string.Empty;
+        public string DependencyKind { get; set; } = string.Empty;
+        public int? DependencyFlags { get; set; }
+        public string? DependencyFlagsText { get; set; }
+        public bool IsHardPackage { get; set; }
+        public bool IsSoftPackage { get; set; }
+        public bool IsNameDependency { get; set; }
+        public bool IsManageDependency { get; set; }
+        public string RelationSource { get; set; } = string.Empty;
+        public string RawJson { get; set; } = "{}";
+    }
+
+    private sealed class SourceAnimBlueprintAnimationRef
+    {
+        public string? SourcePath { get; set; }
+        public string AnimBlueprintObjectPath { get; set; } = string.Empty;
+        public string GeneratedClassObjectPath { get; set; } = string.Empty;
+        public string ReferencedAnimationPath { get; set; } = string.Empty;
+        public string? ReferencedAnimationName { get; set; }
+        public string? ReferencedAnimationType { get; set; }
+        public string? PropertyPath { get; set; }
+        public string? NodeType { get; set; }
+        public string? SkeletonPath { get; set; }
+        public string RelationSource { get; set; } = string.Empty;
+        public string ConfidenceHint { get; set; } = string.Empty;
+        public string RawJson { get; set; } = "{}";
     }
 
     private sealed class SourcePackageObjectMap

@@ -72,6 +72,12 @@ internal static class UeLibraryIndexReader
             var relationKey = MakeLibraryRelative(root, output);
             animationsByModel.TryGetValue(relationKey, out var animations);
             var usable = animations?.Count(x => x.IsPreviewable) ?? 0;
+            var trusted = animations?.Count(x => x.IsDefaultTrusted) ?? 0;
+            var compatible = animations?.Count(x => string.Equals(x.RecommendedUse, "compatibleCandidate", StringComparison.OrdinalIgnoreCase)) ?? 0;
+            var review = animations?.Count(x =>
+                string.Equals(x.RecommendedUse, "manualReview", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(x.RecommendedUse, "compatibleNeedsReview", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(x.RecommendedUse, "notUsable", StringComparison.OrdinalIgnoreCase)) ?? 0;
             var reportedCount = ReadInt32(reader, 12);
 
             models.Add(new UeLibraryModel
@@ -89,7 +95,10 @@ internal static class UeLibraryIndexReader
                 ValidationStatus = ReadString(reader, 10) ?? "",
                 Confidence = ReadString(reader, 11) ?? "",
                 AnimationCount = Math.Max(reportedCount, animations?.Count ?? 0),
-                UsableAnimationCount = usable
+                UsableAnimationCount = usable,
+                TrustedAnimationCount = trusted,
+                CompatibleAnimationCount = compatible,
+                ReviewAnimationCount = review
             });
         }
 
@@ -98,14 +107,95 @@ internal static class UeLibraryIndexReader
 
     private static Dictionary<string, List<UeLibraryAnimation>> LoadAnimations(string root, SqliteConnection connection)
     {
+        var hasUsageEvidence = HasColumn(connection, "relation_animations", "usage_evidence");
+        var hasExplicitUsage = HasColumn(connection, "relation_animations", "is_explicit_usage");
+        var hasSkeletonCompatible = HasColumn(connection, "relation_animations", "is_skeleton_compatible");
+        var hasConfidenceTier = HasColumn(connection, "relation_animations", "confidence_tier");
+        var hasRelationshipKind = HasColumn(connection, "relation_animations", "relationship_kind");
+        var hasRecommendedUse = HasColumn(connection, "relation_animations", "recommended_use");
+        var hasEvidenceChain = HasColumn(connection, "relation_animations", "evidence_chain_json");
+        var hasDeterministicUsage = HasColumn(connection, "relation_animations", "is_deterministic_usage");
+        var hasCompatibilityCandidate = HasColumn(connection, "relation_animations", "is_compatibility_candidate");
+        var usageEvidenceSelect = hasUsageEvidence
+            ? "ra.usage_evidence"
+            : """
+              CASE
+                WHEN ra.relation_source IN ('componentOwner', 'componentOwnerBlendSpaceSample') THEN 'explicitUsage'
+                WHEN ra.relation_source IN ('animBlueprintDirect', 'animBlueprintTargetSkeleton', 'animBlueprintDependency') THEN 'animBlueprintDirect'
+                WHEN ra.relation_source = 'characterDataSet' THEN 'characterDataSet'
+                WHEN ra.relation_source = 'componentAnimClass' THEN 'animClassContext'
+                WHEN ra.relation_source IN ('uniqueSkeleton', 'sharedSkeleton') THEN 'skeletonCompatibility'
+                ELSE 'unknown'
+              END
+              """;
+        var explicitUsageSelect = hasExplicitUsage
+            ? "ra.is_explicit_usage"
+            : "CASE WHEN ra.relation_source IN ('componentOwner', 'componentOwnerBlendSpaceSample') THEN 1 ELSE 0 END";
+        var skeletonCompatibleSelect = hasSkeletonCompatible
+            ? "ra.is_skeleton_compatible"
+            : "CASE WHEN ra.relation_source IN ('uniqueSkeleton', 'sharedSkeleton') THEN 1 ELSE 0 END";
+        var confidenceTierSelect = hasConfidenceTier
+            ? "ra.confidence_tier"
+            : """
+              CASE ra.relation_source
+                WHEN 'componentOwner' THEN 'ExplicitComponent'
+                WHEN 'componentOwnerBlendSpaceSample' THEN 'ExplicitComponent'
+                WHEN 'animBlueprintDirect' THEN 'AnimBlueprintDirect'
+                WHEN 'animBlueprintTargetSkeleton' THEN 'AnimBlueprintDirect'
+                WHEN 'animBlueprintDependency' THEN 'AnimBlueprintDirect'
+                WHEN 'characterDataSet' THEN 'CharacterDataSet'
+                WHEN 'componentAnimClass' THEN 'AnimClassContext'
+                WHEN 'uniqueSkeleton' THEN 'UniqueSkeletonCompatible'
+                WHEN 'sharedSkeleton' THEN 'SharedSkeletonCompatible'
+                ELSE 'Unknown'
+              END
+              """;
+        var relationshipKindSelect = hasRelationshipKind
+            ? "ra.relationship_kind"
+            : """
+              CASE
+                WHEN ra.relation_source IN ('componentOwner', 'componentOwnerBlendSpaceSample', 'animBlueprintDirect', 'animBlueprintTargetSkeleton', 'animBlueprintDependency', 'characterDataSet') THEN 'deterministicUsage'
+                WHEN ra.relation_source = 'componentAnimClass' THEN 'contextualUsage'
+                WHEN ra.relation_source IN ('uniqueSkeleton', 'sharedSkeleton') THEN 'compatibilityCandidate'
+                ELSE 'unknown'
+              END
+              """;
+        var recommendedUseFallback = $"""
+            CASE
+              WHEN COALESCE(ra.is_usable_candidate, 0) = 0 OR LOWER(COALESCE(ra.validation_status, '')) = 'error' THEN 'notUsable'
+              WHEN LOWER(COALESCE(ra.validation_status, '')) <> 'ok' THEN
+                CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 'compatibleNeedsReview' ELSE 'manualReview' END
+              WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 'defaultTrusted'
+              WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 'compatibleCandidate'
+              ELSE 'manualReview'
+            END
+            """;
+        var recommendedUseSelect = hasRecommendedUse ? "ra.recommended_use" : recommendedUseFallback;
+        var evidenceChainSelect = hasEvidenceChain ? "ra.evidence_chain_json" : "''";
+        var deterministicUsageSelect = hasDeterministicUsage
+            ? "ra.is_deterministic_usage"
+            : "CASE WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 1 ELSE 0 END";
+        var compatibilityCandidateSelect = hasCompatibilityCandidate
+            ? "ra.is_compatibility_candidate"
+            : "CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 1 ELSE 0 END";
+
         using var command = connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             SELECT mar.model,
                    ra.name,
                    ra.output,
                    ra.source,
                    ra.status,
                    ra.relation_source,
+                   {usageEvidenceSelect},
+                   {explicitUsageSelect},
+                   {skeletonCompatibleSelect},
+                   {confidenceTierSelect},
+                   {relationshipKindSelect},
+                   {recommendedUseSelect},
+                   {evidenceChainSelect},
+                   {deterministicUsageSelect},
+                   {compatibilityCandidateSelect},
                    ra.validation_status,
                    ra.validation_category,
                    ra.validation_reason,
@@ -118,7 +208,16 @@ internal static class UeLibraryIndexReader
                    ra.is_usable_candidate
             FROM relation_animations ra
             JOIN model_animation_relations mar ON mar.id = ra.relation_id
-            ORDER BY mar.model COLLATE NOCASE, ra.is_usable_candidate DESC, ra.name COLLATE NOCASE;
+            ORDER BY mar.model COLLATE NOCASE,
+                     CASE
+                       WHEN ({recommendedUseSelect}) = 'defaultTrusted' THEN 0
+                       WHEN ({recommendedUseSelect}) = 'compatibleCandidate' THEN 1
+                       WHEN ({recommendedUseSelect}) = 'manualReview' THEN 2
+                       WHEN ({recommendedUseSelect}) = 'compatibleNeedsReview' THEN 3
+                       ELSE 4
+                     END,
+                     ra.is_usable_candidate DESC,
+                     ra.name COLLATE NOCASE;
             """;
 
         var result = new Dictionary<string, List<UeLibraryAnimation>>(StringComparer.OrdinalIgnoreCase);
@@ -137,16 +236,25 @@ internal static class UeLibraryIndexReader
                 Source = ReadString(reader, 3) ?? "",
                 Status = ReadString(reader, 4) ?? "",
                 RelationSource = ReadString(reader, 5) ?? "",
-                ValidationStatus = ReadString(reader, 6) ?? "",
-                ValidationCategory = ReadString(reader, 7) ?? "",
-                ValidationReason = ReadString(reader, 8) ?? "",
-                Duration = ReadDouble(reader, 9),
-                FrameCount = ReadInt32(reader, 10),
-                TrackCount = ReadInt32(reader, 11),
-                TrackCoverage = ReadDouble(reader, 12),
-                HierarchyCompatible = ReadBool(reader, 13),
-                IsContainerAnimation = ReadBool(reader, 14),
-                IsUsableCandidate = ReadBool(reader, 15)
+                UsageEvidence = ReadString(reader, 6) ?? "",
+                IsExplicitUsage = ReadBool(reader, 7),
+                IsSkeletonCompatible = ReadBool(reader, 8),
+                ConfidenceTier = ReadString(reader, 9) ?? "",
+                RelationshipKind = ReadString(reader, 10) ?? "",
+                RecommendedUse = ReadString(reader, 11) ?? "",
+                EvidenceChainJson = ReadString(reader, 12) ?? "",
+                IsDeterministicUsage = ReadBool(reader, 13),
+                IsCompatibilityCandidate = ReadBool(reader, 14),
+                ValidationStatus = ReadString(reader, 15) ?? "",
+                ValidationCategory = ReadString(reader, 16) ?? "",
+                ValidationReason = ReadString(reader, 17) ?? "",
+                Duration = ReadDouble(reader, 18),
+                FrameCount = ReadInt32(reader, 19),
+                TrackCount = ReadInt32(reader, 20),
+                TrackCoverage = ReadDouble(reader, 21),
+                HierarchyCompatible = ReadBool(reader, 22),
+                IsContainerAnimation = ReadBool(reader, 23),
+                IsUsableCandidate = ReadBool(reader, 24)
             };
 
             if (!result.TryGetValue(model, out var list))
@@ -168,6 +276,20 @@ internal static class UeLibraryIndexReader
         command.Parameters.AddWithValue("$name", tableName);
         if (command.ExecuteScalar() == null)
             throw new InvalidDataException($"library_index.db 缺少表 {tableName}，请重新后处理素材库。");
+    }
+
+    private static bool HasColumn(SqliteConnection connection, string tableName, string columnName)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({tableName});";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(ReadString(reader, 1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     public static string MakeLibraryRelative(string root, string path)

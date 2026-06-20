@@ -176,12 +176,14 @@ internal sealed class MainForm : Form
         _animationGrid.BackgroundColor = SystemColors.Window;
 
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 30 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Previewable", HeaderText = "可预览", FillWeight = 9 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "关系来源", FillWeight = 12 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Recommended", HeaderText = "推荐", FillWeight = 12 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relationship", HeaderText = "关系", FillWeight = 12 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Confidence", HeaderText = "置信", FillWeight = 13 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "来源", FillWeight = 11 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Validation", HeaderText = "验证", FillWeight = 12 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时长", FillWeight = 8 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 8 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", FillWeight = 21 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", FillWeight = 18 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
@@ -262,7 +264,9 @@ internal sealed class MainForm : Form
         var filter = _modelFilter.Text.Trim();
         var models = _index.Models
             .Where(x => MatchesModelFilter(x, filter))
-            .OrderByDescending(x => x.UsableAnimationCount)
+            .OrderByDescending(x => x.TrustedAnimationCount)
+            .ThenByDescending(x => x.CompatibleAnimationCount)
+            .ThenByDescending(x => x.UsableAnimationCount)
             .ThenByDescending(x => x.AnimationCount)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -304,7 +308,8 @@ internal sealed class MainForm : Form
         var filter = _animationFilter.Text.Trim();
         var visible = animations
             .Where(x => MatchesAnimationFilter(x, filter))
-            .OrderByDescending(x => x.IsPreviewable)
+            .OrderBy(x => RecommendedUseSortKey(x.RecommendedUse))
+            .ThenByDescending(x => x.IsPreviewable)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -312,7 +317,9 @@ internal sealed class MainForm : Form
         {
             var rowIndex = _animationGrid.Rows.Add(
                 animation.Name,
-                animation.IsPreviewable ? "yes" : "no",
+                DisplayRecommendedUse(animation),
+                DisplayRelationshipKind(animation),
+                string.IsNullOrWhiteSpace(animation.ConfidenceTier) ? DisplayUsageEvidence(animation) : animation.ConfidenceTier,
                 animation.RelationSource,
                 string.IsNullOrWhiteSpace(animation.ValidationStatus) ? animation.Status : animation.ValidationStatus,
                 animation.Duration > 0 ? animation.Duration.ToString("0.###") : "",
@@ -325,7 +332,7 @@ internal sealed class MainForm : Form
                 row.DefaultCellStyle.ForeColor = Color.DimGray;
         }
 
-        _animationHeader.Text = $"动画: {model.Name}  总数 {model.AnimationCount} / 可预览 {model.UsableAnimationCount}";
+        _animationHeader.Text = $"动画: {model.Name}  默认可信 {model.TrustedAnimationCount} / 兼容候选 {model.CompatibleAnimationCount} / 可预览 {model.UsableAnimationCount} / 总数 {model.AnimationCount}";
         if (_animationGrid.Rows.Count > 0)
             _animationGrid.Rows[0].Selected = true;
         ShowSelectedAnimationDetails();
@@ -480,7 +487,7 @@ internal sealed class MainForm : Form
     private static string BuildModelCardText(UeLibraryModel model)
     {
         var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
-        return $"{name}{Environment.NewLine}动画 {model.AnimationCount} / 可预览 {model.UsableAnimationCount}";
+        return $"{name}{Environment.NewLine}可信 {model.TrustedAnimationCount} 兼容 {model.CompatibleAnimationCount}{Environment.NewLine}预览 {model.UsableAnimationCount} 总 {model.AnimationCount}";
     }
 
     private static bool MatchesModelFilter(UeLibraryModel model, string filter)
@@ -504,6 +511,10 @@ internal sealed class MainForm : Form
         return Contains(animation.Name, filter)
             || Contains(animation.Output, filter)
             || Contains(animation.Source, filter)
+            || Contains(animation.UsageEvidence, filter)
+            || Contains(animation.ConfidenceTier, filter)
+            || Contains(animation.RelationshipKind, filter)
+            || Contains(animation.RecommendedUse, filter)
             || Contains(animation.RelationSource, filter)
             || Contains(animation.ValidationStatus, filter)
             || Contains(animation.ValidationReason, filter);
@@ -538,7 +549,7 @@ internal sealed class MainForm : Form
            Skeleton: {model.SkeletonPath}
            Bones: {model.BoneCount}
            Materials: {model.MaterialCount}
-           Animations: {model.UsableAnimationCount}/{model.AnimationCount}
+           Animations: trusted={model.TrustedAnimationCount}, compatible={model.CompatibleAnimationCount}, previewable={model.UsableAnimationCount}, total={model.AnimationCount}
            Validation: {model.ValidationStatus}
            """;
 
@@ -551,6 +562,15 @@ internal sealed class MainForm : Form
            Animation file: {animation.Output}
            Source: {animation.Source}
            Relation: {animation.RelationSource}
+           Recommended use: {animation.RecommendedUse}
+           Relationship kind: {animation.RelationshipKind}
+           Confidence tier: {animation.ConfidenceTier}
+           Evidence: {DisplayUsageEvidence(animation)} ({animation.UsageEvidence})
+           Evidence chain: {animation.EvidenceChainJson}
+           Deterministic usage: {animation.IsDeterministicUsage}
+           Compatibility candidate: {animation.IsCompatibilityCandidate}
+           Explicit usage: {animation.IsExplicitUsage}
+           Skeleton compatible: {animation.IsSkeletonCompatible}
            Status: {animation.Status}
            Validation: {animation.ValidationStatus} / {animation.ValidationCategory}
            Reason: {animation.ValidationReason}
@@ -562,6 +582,47 @@ internal sealed class MainForm : Form
            Container animation: {animation.IsContainerAnimation}
            Previewable: {animation.IsPreviewable}
            """;
+
+    private static string DisplayUsageEvidence(UeLibraryAnimation animation)
+    {
+        if (animation.IsExplicitUsage)
+            return "显式使用";
+        if (animation.IsSkeletonCompatible)
+            return "Skeleton兼容";
+        return string.IsNullOrWhiteSpace(animation.UsageEvidence) ? "未知" : animation.UsageEvidence;
+    }
+
+    private static string DisplayRecommendedUse(UeLibraryAnimation animation)
+        => animation.RecommendedUse switch
+        {
+            "defaultTrusted" => animation.IsPreviewable ? "默认可信" : "默认可信(不可预览)",
+            "compatibleCandidate" => animation.IsPreviewable ? "兼容候选" : "兼容候选(不可预览)",
+            "manualReview" => "人工复查",
+            "compatibleNeedsReview" => "兼容复查",
+            "notUsable" => "不可用",
+            _ => string.IsNullOrWhiteSpace(animation.RecommendedUse) ? "未知" : animation.RecommendedUse
+        };
+
+    private static string DisplayRelationshipKind(UeLibraryAnimation animation)
+        => animation.RelationshipKind switch
+        {
+            "deterministicUsage" => "确定使用",
+            "contextualUsage" => "上下文",
+            "compatibilityCandidate" => "兼容候选",
+            "unknown" => "未知",
+            _ => string.IsNullOrWhiteSpace(animation.RelationshipKind) ? "未知" : animation.RelationshipKind
+        };
+
+    private static int RecommendedUseSortKey(string value)
+        => value switch
+        {
+            "defaultTrusted" => 0,
+            "compatibleCandidate" => 1,
+            "manualReview" => 2,
+            "compatibleNeedsReview" => 3,
+            "notUsable" => 4,
+            _ => 5
+        };
 
     private static Image BuildPlaceholderImage()
     {

@@ -36,18 +36,24 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
 
 5. 模型动画关系
-   - `model_animations.json` 只按 UE Skeleton 原始引用建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section、子动画引用和子动画导出完整度，不能只报一个无 track 的 warning。
+   - `model_animations.json` 按 UE Skeleton、组件引用、AnimBlueprint、DataAsset/AssetRegistry 等确定性或结构兼容证据建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section、子动画引用和子动画导出完整度，不能只报一个无 track 的 warning。
+   - 每条动画关系必须区分确定性使用关系和兼容候选：`confidenceTier` / `library_index.db.relation_animations.confidence_tier` 表示最高关系等级，`evidenceChain` / `evidence_chain_json` 记录证据链，`isDeterministicUsage` / `is_deterministic_usage` 表示是否来自确定性使用或强上下文证据，`isCompatibilityCandidate` / `is_compatibility_candidate` 表示只是同 Skeleton 可复用候选。
+   - `relationshipKind` / `relationship_kind` 是 UI 和查询脚本优先使用的关系大类，当前取值为 `deterministicUsage`、`contextualUsage`、`compatibilityCandidate`、`unknown`。
+   - `recommendedUse` / `recommended_use` 是默认筛选推荐状态，当前取值为 `defaultTrusted`、`compatibleCandidate`、`manualReview`、`compatibleNeedsReview`、`notUsable`。浏览器默认可信动画列表应使用 `recommendedUse=defaultTrusted`，兼容候选应单独显示，不能和确定使用动画混成一个总数。
+   - 旧字段 `usageEvidence`、`isExplicitUsage`、`isSkeletonCompatible` 仅用于兼容和粗略统计。AnimBP/DataAsset 等新增强证据可能 `isExplicitUsage=false` 但 `isDeterministicUsage=true`；团队后续 UI 和验收脚本应优先看 `recommendedUse`、`relationshipKind`、`confidenceTier` 与 `evidenceChain`。
    - 未匹配时保留 `NoMatchingAnimationExported`，不硬猜。
    - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 
 6. 索引与报告
-   - `asset_catalog.jsonl` 是素材库 JSONL 总入口，必须合并导出主链路数据和验证数据。
-   - `library_index.db` 是已导出素材库的 SQLite 查询入口，必须包含 assets、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations 和 animation_validation。
-   - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象。
-   - `auto_referenced_exports.jsonl` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因。
+   - `library_index.db` 是已导出素材库的 SQLite 优先查询入口，浏览器、筛选器和验收脚本默认应读 SQLite；JSON/JSONL 保留为流式导出日志、人工 diff 和兼容旧工具的产物。
+   - `asset_catalog.jsonl` 是素材库 JSONL 总入口，必须合并导出主链路数据和验证数据，并同步到 `library_index.db.assets`。
+   - `library_index.db` 必须包含 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、package_object_maps 等常用查询表。
+   - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`。
+   - `animation_bindings.jsonl` 记录动画发现、导出状态、Skeleton、track/segment/section 和压缩信息，并同步到 `library_index.db.animation_bindings`。
+   - `auto_referenced_exports.jsonl` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因，并同步到 `library_index.db.auto_referenced_exports`。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox，并结合材质 sidecar 与 `material_texture_slots` 判断外部材质贴图关系，避免把未内嵌贴图但关系完整的模型误报为异常。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
-   - `library_index.db` 面向已导出素材库，记录 assets、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations 和 animation_validation。
+   - `library_index.db` 面向已导出素材库，记录 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation 和 package_object_maps。常用筛选字段必须显式列化，完整细节可继续保留在 `raw_json`。
 
 ## 优化列表
 

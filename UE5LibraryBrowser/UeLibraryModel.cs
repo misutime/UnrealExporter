@@ -13,6 +13,9 @@ internal sealed class UeLibraryModel
     public string Confidence { get; init; } = "";
     public int AnimationCount { get; init; }
     public int UsableAnimationCount { get; init; }
+    public int TrustedAnimationCount { get; init; }
+    public int CompatibleAnimationCount { get; init; }
+    public int ReviewAnimationCount { get; init; }
     public int BoneCount { get; init; }
     public int MaterialCount { get; init; }
     public bool HasSkin { get; init; }

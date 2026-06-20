@@ -7,6 +7,15 @@ internal sealed class UeLibraryAnimation
     public string Source { get; init; } = "";
     public string Status { get; init; } = "";
     public string RelationSource { get; init; } = "";
+    public string UsageEvidence { get; init; } = "";
+    public string ConfidenceTier { get; init; } = "";
+    public string RelationshipKind { get; init; } = "";
+    public string RecommendedUse { get; init; } = "";
+    public string EvidenceChainJson { get; init; } = "";
+    public bool IsExplicitUsage { get; init; }
+    public bool IsSkeletonCompatible { get; init; }
+    public bool IsDeterministicUsage { get; init; }
+    public bool IsCompatibilityCandidate { get; init; }
     public string ValidationStatus { get; init; } = "";
     public string ValidationCategory { get; init; } = "";
     public string ValidationReason { get; init; } = "";
@@ -17,6 +26,8 @@ internal sealed class UeLibraryAnimation
     public bool HierarchyCompatible { get; init; }
     public bool IsContainerAnimation { get; init; }
     public bool IsUsableCandidate { get; init; }
+    public bool IsDefaultTrusted =>
+        string.Equals(RecommendedUse, "defaultTrusted", StringComparison.OrdinalIgnoreCase);
 
     public bool IsPreviewable =>
         IsUsableCandidate

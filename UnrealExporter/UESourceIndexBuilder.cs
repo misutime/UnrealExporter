@@ -1,4 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Collections;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
@@ -15,6 +17,8 @@ using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.WorldPartition;
+using CUE4Parse.UE4.AssetRegistry;
+using CUE4Parse.UE4.AssetRegistry.Objects;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.IO.Objects;
@@ -23,17 +27,21 @@ using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.UObject;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace UnrealExporter;
 
 internal static class UESourceIndexBuilder
 {
+    private const int CommitInterval = 500;
+
     public static void Build(AbstractFileProvider provider, ConfigObj config)
     {
         var outputRoot = Path.GetFullPath(config.OutputDir);
         Directory.CreateDirectory(outputRoot);
         var dbPath = Path.Combine(outputRoot, "ue_source_index.db");
-        DeleteSqliteOutput(dbPath);
+        var progressPath = Path.Combine(outputRoot, "ue_source_index.progress.txt");
+        var metadataPath = Path.Combine(outputRoot, "ue_source_index.metadata.json");
 
         var packagePatterns = BuildPackagePatterns(config);
         var packageFiles = provider.Files.Values
@@ -45,48 +53,284 @@ internal static class UESourceIndexBuilder
             packageFiles = packageFiles.Take(config.SourceIndexLimit).ToArray();
 
         Console.WriteLine($"UE source index: files={provider.Files.Count}, packagesToInspect={packageFiles.Length}");
+        var fingerprint = BuildSourceIndexFingerprint(config, packageFiles);
+        if (TryUseCompletedSourceIndex(dbPath, metadataPath, fingerprint, packageFiles.Length))
+            return;
+
+        var resumeExisting = CanResumeSourceIndex(dbPath, metadataPath, fingerprint);
+        if (!resumeExisting)
+        {
+            DeleteSqliteOutput(dbPath);
+            if (File.Exists(progressPath))
+                File.Delete(progressPath);
+            if (File.Exists(metadataPath))
+                File.Delete(metadataPath);
+        }
+        else
+        {
+            Console.WriteLine("UE source index resume: continuing existing partial index.");
+        }
 
         using var connection = new SqliteConnection($"Data Source={dbPath}");
         connection.Open();
+        Execute(connection, "PRAGMA busy_timeout = 10000;");
         Execute(connection, "PRAGMA journal_mode = WAL;");
         Execute(connection, "PRAGMA synchronous = NORMAL;");
-        using var transaction = connection.BeginTransaction();
-        CreateSchema(connection, transaction);
 
-        foreach (var file in provider.Files.Values.OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase))
-            InsertSourceFile(connection, transaction, file);
-
-        var inspected = 0;
-        var indexedMaterialSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var file in packageFiles)
+        if (!resumeExisting)
         {
-            inspected++;
-            try
-            {
-                var package = provider.LoadPackage(file);
-                InsertPackageObjectMaps(connection, transaction, file.Path, package);
-                var exports = package.GetExports().ToArray();
-                foreach (var obj in exports)
-                    InsertSourceObject(connection, transaction, file, obj, indexedMaterialSlots);
-            }
-            catch (Exception ex)
-            {
-                InsertError(connection, transaction, file.Path, ex.Message);
-            }
+            using var setupTransaction = connection.BeginTransaction();
+            CreateSchema(connection, setupTransaction);
 
-            if (inspected % 500 == 0)
-                Console.WriteLine($"UE source index inspected {inspected}/{packageFiles.Length}");
+            foreach (var file in provider.Files.Values.OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase))
+                InsertSourceFile(connection, setupTransaction, file);
+
+            InsertAssetRegistryDependencies(connection, setupTransaction, provider);
+            setupTransaction.Commit();
         }
 
-        transaction.Commit();
+        var inspected = 0;
+        var completedPackages = resumeExisting
+            ? LoadCompletedSourceIndexPackages(connection)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (completedPackages.Count > 0)
+            Console.WriteLine($"UE source index resume: {completedPackages.Count}/{packageFiles.Length} package(s) already committed.");
+        WriteSourceIndexMetadata(metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
+        var indexedMaterialSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var transaction = connection.BeginTransaction();
+        try
+        {
+            foreach (var file in packageFiles)
+            {
+                if (completedPackages.Contains(file.Path))
+                    continue;
+
+                inspected++;
+                WriteProgress(progressPath, completedPackages.Count + 1, packageFiles.Length, file.Path);
+                string status;
+                string? error = null;
+                try
+                {
+                    var package = provider.LoadPackage(file);
+                    InsertPackageObjectMaps(connection, transaction, file.Path, package);
+                    var exports = package.GetExports().ToArray();
+                    foreach (var obj in exports)
+                        InsertSourceObject(connection, transaction, file, obj, indexedMaterialSlots);
+                    status = "ok";
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                    InsertError(connection, transaction, file.Path, error);
+                    status = "error";
+                }
+                UpsertSourceIndexPackage(connection, transaction, file.Path, status, error);
+                completedPackages.Add(file.Path);
+
+                if (completedPackages.Count % CommitInterval == 0)
+                {
+                    transaction.Commit();
+                    transaction.Dispose();
+                    Execute(connection, "PRAGMA wal_checkpoint(PASSIVE);");
+                    Console.WriteLine($"UE source index inspected {completedPackages.Count}/{packageFiles.Length} (last: {file.Path})");
+                    WriteSourceIndexMetadata(metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
+                    transaction = connection.BeginTransaction();
+                }
+            }
+
+            transaction.Commit();
+        }
+        finally
+        {
+            transaction.Dispose();
+        }
+
+        WriteProgress(progressPath, completedPackages.Count, packageFiles.Length, "complete");
+        WriteSourceIndexMetadata(metadataPath, config, fingerprint, "complete", packageFiles.Length, completedPackages.Count);
         FinalizeSqliteOutput(connection);
         Console.WriteLine($"UE source index written: {dbPath}");
     }
 
+    private static void WriteProgress(string progressPath, int inspected, int total, string sourcePath)
+    {
+        File.WriteAllText(progressPath, $"{DateTime.UtcNow:O}{Environment.NewLine}{inspected}/{total}{Environment.NewLine}{sourcePath}{Environment.NewLine}");
+    }
+
+    private static string BuildSourceIndexFingerprint(ConfigObj config, GameFile[] packageFiles)
+    {
+        var raw = JsonConvert.SerializeObject(new
+        {
+            config.GameTitle,
+            config.Version,
+            config.PaksDir,
+            config.SourceIndexRegex,
+            config.Exclude,
+            config.SourceIndexLimit,
+            packageCount = packageFiles.Length,
+            firstPackage = packageFiles.FirstOrDefault()?.Path,
+            lastPackage = packageFiles.LastOrDefault()?.Path,
+        });
+        return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+    }
+
+    private static bool TryUseCompletedSourceIndex(string dbPath, string metadataPath, string fingerprint, int packageCount)
+    {
+        var metadata = LoadSourceIndexMetadata(metadataPath);
+        if (metadata == null ||
+            !string.Equals((string?)metadata["status"], "complete", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase) ||
+            (int?)metadata["packageCount"] != packageCount ||
+            !File.Exists(dbPath))
+            return false;
+
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            if (!TableExists(connection, "source_index_packages"))
+                return false;
+
+            var completed = CountCompletedSourceIndexPackages(connection);
+            if (completed < packageCount)
+                return false;
+
+            Console.WriteLine($"UE source index resume: complete existing index found ({completed}/{packageCount}); skipping rebuild.");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool CanResumeSourceIndex(string dbPath, string metadataPath, string fingerprint)
+    {
+        var metadata = LoadSourceIndexMetadata(metadataPath);
+        if (metadata == null ||
+            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase) ||
+            !File.Exists(dbPath))
+            return false;
+
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            return TableExists(connection, "source_index_packages") &&
+                   TableExists(connection, "source_files") &&
+                   TableExists(connection, "source_objects");
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static JObject? LoadSourceIndexMetadata(string metadataPath)
+    {
+        if (!File.Exists(metadataPath))
+            return null;
+
+        try
+        {
+            return JObject.Parse(File.ReadAllText(metadataPath));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void WriteSourceIndexMetadata(
+        string metadataPath,
+        ConfigObj config,
+        string fingerprint,
+        string status,
+        int packageCount,
+        int completedPackageCount)
+    {
+        var metadata = new JObject
+        {
+            ["updatedAt"] = DateTime.UtcNow.ToString("O"),
+            ["gameTitle"] = config.GameTitle,
+            ["version"] = config.Version,
+            ["fingerprint"] = fingerprint,
+            ["status"] = status,
+            ["packageCount"] = packageCount,
+            ["completedPackageCount"] = completedPackageCount,
+        };
+        File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
+    }
+
+    private static HashSet<string> LoadCompletedSourceIndexPackages(SqliteConnection connection)
+    {
+        var rows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!TableExists(connection, "source_index_packages"))
+            return rows;
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT source_path FROM source_index_packages;";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            rows.Add(reader.GetString(0));
+
+        return rows;
+    }
+
+    private static int CountCompletedSourceIndexPackages(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM source_index_packages;";
+        return Convert.ToInt32(command.ExecuteScalar());
+    }
+
+    private static bool TableExists(SqliteConnection connection, string tableName)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $tableName LIMIT 1;";
+        command.Parameters.AddWithValue("$tableName", tableName);
+        return command.ExecuteScalar() != null;
+    }
+
+    private static void UpsertSourceIndexPackage(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string status,
+        string? error)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO source_index_packages (source_path, status, error, completed_at)
+            VALUES ($sourcePath, $status, $error, $completedAt)
+            ON CONFLICT(source_path) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                completed_at = excluded.completed_at;
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$status", status);
+        Add(command, "$error", error);
+        Add(command, "$completedAt", DateTime.UtcNow.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
     private static void FinalizeSqliteOutput(SqliteConnection connection)
     {
-        Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
-        Execute(connection, "PRAGMA journal_mode = DELETE;");
+        TryExecuteFinalizePragma(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+        TryExecuteFinalizePragma(connection, "PRAGMA journal_mode = DELETE;");
+    }
+
+    private static void TryExecuteFinalizePragma(SqliteConnection connection, string sql)
+    {
+        try
+        {
+            Execute(connection, sql);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6)
+        {
+            Console.WriteLine($"WARN: source index finalize skipped '{sql}' because SQLite is busy: {ex.Message}");
+        }
     }
 
     private static void DeleteSqliteOutput(string dbPath)
@@ -204,6 +448,14 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE source_index_packages (
+                source_path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT,
+                completed_at TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE source_objects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -261,6 +513,30 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, """
+            CREATE TABLE asset_registry_dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                registry_path TEXT NOT NULL,
+                source_package TEXT,
+                source_asset_name TEXT,
+                source_asset_class TEXT,
+                source_identifier TEXT,
+                dependency_package TEXT,
+                dependency_asset_name TEXT,
+                dependency_asset_class TEXT,
+                dependency_identifier TEXT,
+                dependency_category TEXT NOT NULL,
+                dependency_kind TEXT NOT NULL,
+                dependency_flags INTEGER,
+                dependency_flags_text TEXT,
+                is_hard_package INTEGER NOT NULL,
+                is_soft_package INTEGER NOT NULL,
+                is_name_dependency INTEGER NOT NULL,
+                is_manage_dependency INTEGER NOT NULL,
+                relation_source TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
             CREATE TABLE material_texture_slots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL,
@@ -273,6 +549,23 @@ internal static class UESourceIndexBuilder
                 texture_class_name TEXT,
                 texture_class_path TEXT,
                 relation_source TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE anim_blueprint_animation_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                anim_blueprint_object_path TEXT NOT NULL,
+                generated_class_object_path TEXT,
+                referenced_animation_path TEXT NOT NULL,
+                referenced_animation_name TEXT,
+                referenced_animation_type TEXT,
+                property_path TEXT,
+                node_type TEXT,
+                skeleton_path TEXT,
+                relation_source TEXT NOT NULL,
+                confidence_hint TEXT NOT NULL,
+                raw_json TEXT NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -422,14 +715,20 @@ internal static class UESourceIndexBuilder
             );
             """);
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_type ON source_objects(object_type);");
+        Execute(connection, transaction, "CREATE INDEX idx_source_index_packages_status ON source_index_packages(status);");
         Execute(connection, transaction, "CREATE INDEX idx_source_objects_skeleton ON source_objects(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_source_relations_type ON source_relations(relation_type, target_path);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_source ON package_object_maps(source_path, map_type);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_object ON package_object_maps(object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_package_object_maps_class ON package_object_maps(class_name, class_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_source ON asset_registry_dependencies(source_package, dependency_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_dependency ON asset_registry_dependencies(dependency_package, dependency_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_asset_registry_dependencies_kind ON asset_registry_dependencies(dependency_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_slot ON material_texture_slots(slot_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_owner ON anim_blueprint_animation_refs(anim_blueprint_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_animation ON anim_blueprint_animation_refs(referenced_animation_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_owner ON skeleton_bones(owner_object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_bones_skeleton ON skeleton_bones(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_mesh_sockets_owner ON mesh_sockets(owner_object_path);");
@@ -470,6 +769,312 @@ internal static class UESourceIndexBuilder
         Add(command, "$compression", file.CompressionMethod.ToString());
         command.ExecuteNonQuery();
     }
+
+    private static void InsertAssetRegistryDependencies(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AbstractFileProvider provider)
+    {
+        var registryFiles = provider.Files.Values
+            .Where(x => x.Path.EndsWith("AssetRegistry.bin", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (registryFiles.Length == 0)
+            return;
+
+        var inserted = 0;
+        foreach (var registryFile in registryFiles)
+        {
+            try
+            {
+                using var reader = registryFile.CreateReader();
+                var state = new FAssetRegistryState(reader);
+                inserted += InsertAssetRegistryDependencies(connection, transaction, registryFile.Path, state);
+            }
+            catch (Exception ex)
+            {
+                InsertError(connection, transaction, registryFile.Path, $"AssetRegistry: {ex.Message}");
+            }
+        }
+
+        if (inserted > 0)
+            Console.WriteLine($"UE source index asset registry dependencies={inserted}");
+    }
+
+    private static int InsertAssetRegistryDependencies(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string registryPath,
+        FAssetRegistryState state)
+    {
+        var assetsByPackage = state.PreallocatedAssetDataBuffers
+            .GroupBy(x => FNameText(x.PackageName), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+
+        var inserted = 0;
+        foreach (var node in state.PreallocatedDependsNodeDataBuffers)
+        {
+            var sourcePackage = IdentifierPackage(node.Identifier);
+            var sourceAsset = FindAssetData(assetsByPackage, sourcePackage);
+
+            inserted += InsertAssetRegistryDependencyGroup(
+                connection,
+                transaction,
+                registryPath,
+                state.PreallocatedDependsNodeDataBuffers,
+                assetsByPackage,
+                node,
+                sourceAsset,
+                "Package",
+                "PackageDependency",
+                node.PackageDependencies,
+                node.PackageFlags,
+                5);
+            inserted += InsertAssetRegistryDependencyGroup(
+                connection,
+                transaction,
+                registryPath,
+                state.PreallocatedDependsNodeDataBuffers,
+                assetsByPackage,
+                node,
+                sourceAsset,
+                "Name",
+                "NameDependency",
+                node.NameDependencies,
+                null,
+                0);
+            var manageWidth = node.ManageDependencies.Length > 0 && node.ManageFlags is { Count: > 0 }
+                ? Math.Max(1, node.ManageFlags.Count / node.ManageDependencies.Length)
+                : 0;
+            inserted += InsertAssetRegistryDependencyGroup(
+                connection,
+                transaction,
+                registryPath,
+                state.PreallocatedDependsNodeDataBuffers,
+                assetsByPackage,
+                node,
+                sourceAsset,
+                "Manage",
+                "ManageDependency",
+                node.ManageDependencies,
+                node.ManageFlags,
+                manageWidth);
+        }
+
+        return inserted;
+    }
+
+    private static int InsertAssetRegistryDependencyGroup(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string registryPath,
+        FDependsNode[] nodes,
+        Dictionary<string, FAssetData[]> assetsByPackage,
+        FDependsNode sourceNode,
+        FAssetData? sourceAsset,
+        string category,
+        string defaultKind,
+        int[]? dependencyIndexes,
+        BitArray? flags,
+        int flagWidth)
+    {
+        if (dependencyIndexes is not { Length: > 0 })
+            return 0;
+
+        var count = 0;
+        for (var index = 0; index < dependencyIndexes.Length; index++)
+        {
+            var dependencyIndex = dependencyIndexes[index];
+            if (dependencyIndex < 0 || dependencyIndex >= nodes.Length)
+                continue;
+
+            var dependencyNode = nodes[dependencyIndex];
+            var dependencyPackage = IdentifierPackage(dependencyNode.Identifier);
+            var dependencyAsset = FindAssetData(assetsByPackage, dependencyPackage);
+            var flagBits = GetPackedDependencyFlags(flags, index, flagWidth);
+            var isHardPackage = category.Equals("Package", StringComparison.OrdinalIgnoreCase) && (flagBits & 1) != 0;
+            var isSoftPackage = category.Equals("Package", StringComparison.OrdinalIgnoreCase) && !isHardPackage;
+            var kind = category switch
+            {
+                "Package" => isHardPackage ? "HardPackage" : "SoftPackage",
+                "Name" => "SearchableName",
+                "Manage" => "Manage",
+                _ => defaultKind,
+            };
+
+            InsertAssetRegistryDependency(
+                connection,
+                transaction,
+                registryPath,
+                sourceNode,
+                sourceAsset,
+                dependencyNode,
+                dependencyAsset,
+                category,
+                kind,
+                flagBits,
+                flags == null ? null : BuildPackedDependencyFlagText(flagBits),
+                isHardPackage,
+                isSoftPackage,
+                category.Equals("Name", StringComparison.OrdinalIgnoreCase),
+                category.Equals("Manage", StringComparison.OrdinalIgnoreCase));
+            count++;
+        }
+
+        return count;
+    }
+
+    private static void InsertAssetRegistryDependency(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string registryPath,
+        FDependsNode sourceNode,
+        FAssetData? sourceAsset,
+        FDependsNode dependencyNode,
+        FAssetData? dependencyAsset,
+        string category,
+        string kind,
+        int? flags,
+        string? flagsText,
+        bool isHardPackage,
+        bool isSoftPackage,
+        bool isNameDependency,
+        bool isManageDependency)
+    {
+        var sourcePackage = IdentifierPackage(sourceNode.Identifier);
+        var dependencyPackage = IdentifierPackage(dependencyNode.Identifier);
+        var raw = new
+        {
+            registryPath,
+            sourceIdentifier = IdentifierText(sourceNode.Identifier),
+            dependencyIdentifier = IdentifierText(dependencyNode.Identifier),
+            category,
+            kind,
+            flags,
+            flagsText,
+            sourceAssetClass = sourceAsset == null ? null : FNameText(sourceAsset.AssetClass),
+            dependencyAssetClass = dependencyAsset == null ? null : FNameText(dependencyAsset.AssetClass),
+        };
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO asset_registry_dependencies (
+                registry_path, source_package, source_asset_name, source_asset_class, source_identifier,
+                dependency_package, dependency_asset_name, dependency_asset_class, dependency_identifier,
+                dependency_category, dependency_kind, dependency_flags, dependency_flags_text,
+                is_hard_package, is_soft_package, is_name_dependency, is_manage_dependency,
+                relation_source, raw_json
+            )
+            VALUES (
+                $registryPath, $sourcePackage, $sourceAssetName, $sourceAssetClass, $sourceIdentifier,
+                $dependencyPackage, $dependencyAssetName, $dependencyAssetClass, $dependencyIdentifier,
+                $dependencyCategory, $dependencyKind, $dependencyFlags, $dependencyFlagsText,
+                $isHardPackage, $isSoftPackage, $isNameDependency, $isManageDependency,
+                $relationSource, $rawJson
+            );
+            """;
+        Add(command, "$registryPath", registryPath);
+        Add(command, "$sourcePackage", sourcePackage);
+        Add(command, "$sourceAssetName", sourceAsset == null ? null : FNameText(sourceAsset.AssetName));
+        Add(command, "$sourceAssetClass", sourceAsset == null ? null : FNameText(sourceAsset.AssetClass));
+        Add(command, "$sourceIdentifier", IdentifierText(sourceNode.Identifier));
+        Add(command, "$dependencyPackage", dependencyPackage);
+        Add(command, "$dependencyAssetName", dependencyAsset == null ? null : FNameText(dependencyAsset.AssetName));
+        Add(command, "$dependencyAssetClass", dependencyAsset == null ? null : FNameText(dependencyAsset.AssetClass));
+        Add(command, "$dependencyIdentifier", IdentifierText(dependencyNode.Identifier));
+        Add(command, "$dependencyCategory", category);
+        Add(command, "$dependencyKind", kind);
+        Add(command, "$dependencyFlags", flags);
+        Add(command, "$dependencyFlagsText", flagsText);
+        Add(command, "$isHardPackage", isHardPackage ? 1 : 0);
+        Add(command, "$isSoftPackage", isSoftPackage ? 1 : 0);
+        Add(command, "$isNameDependency", isNameDependency ? 1 : 0);
+        Add(command, "$isManageDependency", isManageDependency ? 1 : 0);
+        Add(command, "$relationSource", "AssetRegistry");
+        Add(command, "$rawJson", JsonConvert.SerializeObject(raw));
+        command.ExecuteNonQuery();
+    }
+
+    private static FAssetData? FindAssetData(Dictionary<string, FAssetData[]> assetsByPackage, string? package)
+    {
+        if (string.IsNullOrWhiteSpace(package) || !assetsByPackage.TryGetValue(package, out var assets))
+            return null;
+
+        return assets.FirstOrDefault();
+    }
+
+    private static int GetPackedDependencyFlags(BitArray? flags, int dependencyIndex, int flagWidth)
+    {
+        if (flags == null || flagWidth <= 0)
+            return 0;
+
+        var start = dependencyIndex * flagWidth;
+        var result = 0;
+        for (var bit = 0; bit < flagWidth && start + bit < flags.Count; bit++)
+        {
+            if (flags[start + bit])
+                result |= 1 << bit;
+        }
+
+        return result;
+    }
+
+    private static string BuildPackedDependencyFlagText(int flags)
+    {
+        var names = new List<string>();
+        if ((flags & 1) != 0)
+            names.Add("HardOrDirect");
+        if ((flags & 2) != 0)
+            names.Add("GameOrCookRule");
+        if ((flags & 4) != 0)
+            names.Add("Build");
+        if ((flags & 8) != 0)
+            names.Add("Direct");
+        if ((flags & 16) != 0)
+            names.Add("CookRule");
+        return names.Count == 0 ? "None" : string.Join("|", names);
+    }
+
+    private static string? IdentifierPackage(FAssetIdentifier? identifier)
+    {
+        if (identifier == null)
+            return null;
+
+        var package = FNameText(identifier.PackageName);
+        if (!string.IsNullOrWhiteSpace(package) && !package.Equals("None", StringComparison.OrdinalIgnoreCase))
+            return package;
+
+        var objectName = FNameText(identifier.ObjectName);
+        if (string.IsNullOrWhiteSpace(objectName) || objectName.Equals("None", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var dot = objectName.LastIndexOf('.');
+        return dot > 0 ? objectName[..dot] : objectName;
+    }
+
+    private static string IdentifierText(FAssetIdentifier? identifier)
+    {
+        if (identifier == null)
+            return "";
+
+        var parts = new List<string>();
+        AddIdentifierPart(parts, "Package", identifier.PackageName);
+        AddIdentifierPart(parts, "PrimaryAssetType", identifier.PrimaryAssetType);
+        AddIdentifierPart(parts, "Object", identifier.ObjectName);
+        AddIdentifierPart(parts, "Value", identifier.ValueName);
+        return parts.Count == 0 ? "None" : string.Join(";", parts);
+    }
+
+    private static void AddIdentifierPart(List<string> parts, string name, CUE4Parse.UE4.Objects.UObject.FName value)
+    {
+        var text = FNameText(value);
+        if (!string.IsNullOrWhiteSpace(text) && !text.Equals("None", StringComparison.OrdinalIgnoreCase))
+            parts.Add($"{name}={text}");
+    }
+
+    private static string FNameText(CUE4Parse.UE4.Objects.UObject.FName name)
+        => name.Text;
 
     private static void InsertPackageObjectMaps(
         SqliteConnection connection,
@@ -929,6 +1534,9 @@ internal static class UESourceIndexBuilder
             InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj, "ActorProperty");
         else if (ShouldScanBlueprintPropertyReferences(obj))
             InsertObjectPropertyAssetRelations(connection, transaction, file.Path, obj, "BlueprintProperty");
+
+        if (ShouldScanAnimBlueprintAnimationReferences(obj))
+            InsertAnimBlueprintAnimationRefs(connection, transaction, file.Path, obj);
     }
 
     private static void InsertBlueprintComponentRelations(
@@ -1468,8 +2076,136 @@ internal static class UESourceIndexBuilder
 
     private static bool ShouldScanBlueprintPropertyReferences(UObject obj)
         => obj is UBlueprintGeneratedClass
+           || obj is UAnimBlueprint
            || obj.Flags.HasFlag(EObjectFlags.RF_ClassDefaultObject)
            || obj.Name.StartsWith("Default__", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldScanAnimBlueprintAnimationReferences(UObject obj)
+    {
+        var typeText = $"{obj.GetType().Name} {obj.ExportType} {obj.GetPathName()}";
+        return obj is UAnimBlueprint
+               || obj is UAnimBlueprintGeneratedClass
+               || typeText.Contains("AnimBlueprint", StringComparison.OrdinalIgnoreCase)
+               || (obj.Flags.HasFlag(EObjectFlags.RF_ClassDefaultObject) &&
+                   typeText.Contains("Anim", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void InsertAnimBlueprintAnimationRefs(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        UObject obj)
+    {
+        var ownerPath = obj.GetPathName();
+        var generatedClassPath = obj is UAnimBlueprintGeneratedClass ? ownerPath : null;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in EnumeratePropertyAssetTargets(obj.Properties, "Property"))
+        {
+            if (!IsAnimationRelation(reference.Target.RelationType))
+                continue;
+
+            var animationPath = reference.Target.TargetPath;
+            if (string.IsNullOrWhiteSpace(animationPath))
+                continue;
+
+            var key = $"{ownerPath}\n{reference.PropertyPath}\n{animationPath}";
+            if (!seen.Add(key))
+                continue;
+
+            InsertAnimBlueprintAnimationRef(
+                connection,
+                transaction,
+                sourcePath,
+                ownerPath,
+                generatedClassPath,
+                animationPath,
+                reference.Target.TargetName,
+                reference.Target.TargetObjectType,
+                reference.PropertyPath,
+                InferAnimBlueprintNodeType(reference.PropertyPath, reference.Target.TargetObjectType),
+                null,
+                "AnimBlueprintProperty",
+                "StaticPropertyReference");
+        }
+    }
+
+    private static bool IsAnimationRelation(string relationType)
+        => relationType.Equals("Animation", StringComparison.OrdinalIgnoreCase);
+
+    private static string InferAnimBlueprintNodeType(string propertyPath, string? targetObjectType)
+    {
+        var text = $"{propertyPath} {targetObjectType}";
+        if (text.Contains("BlendSpace", StringComparison.OrdinalIgnoreCase))
+            return "BlendSpaceReference";
+        if (text.Contains("Montage", StringComparison.OrdinalIgnoreCase))
+            return "MontageReference";
+        if (text.Contains("Composite", StringComparison.OrdinalIgnoreCase))
+            return "CompositeReference";
+        if (text.Contains("Sequence", StringComparison.OrdinalIgnoreCase))
+            return "SequenceReference";
+        if (text.Contains("AnimNode", StringComparison.OrdinalIgnoreCase))
+            return "AnimGraphNodeReference";
+        return "AnimationAssetReference";
+    }
+
+    private static void InsertAnimBlueprintAnimationRef(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sourcePath,
+        string animBlueprintObjectPath,
+        string? generatedClassObjectPath,
+        string referencedAnimationPath,
+        string? referencedAnimationName,
+        string? referencedAnimationType,
+        string? propertyPath,
+        string? nodeType,
+        string? skeletonPath,
+        string relationSource,
+        string confidenceHint)
+    {
+        var raw = new
+        {
+            sourcePath,
+            animBlueprintObjectPath,
+            generatedClassObjectPath,
+            referencedAnimationPath,
+            referencedAnimationName,
+            referencedAnimationType,
+            propertyPath,
+            nodeType,
+            skeletonPath,
+            relationSource,
+            confidenceHint,
+        };
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO anim_blueprint_animation_refs (
+                source_path, anim_blueprint_object_path, generated_class_object_path,
+                referenced_animation_path, referenced_animation_name, referenced_animation_type,
+                property_path, node_type, skeleton_path, relation_source, confidence_hint, raw_json
+            )
+            VALUES (
+                $sourcePath, $animBlueprintObjectPath, $generatedClassObjectPath,
+                $referencedAnimationPath, $referencedAnimationName, $referencedAnimationType,
+                $propertyPath, $nodeType, $skeletonPath, $relationSource, $confidenceHint, $rawJson
+            );
+            """;
+        Add(command, "$sourcePath", sourcePath);
+        Add(command, "$animBlueprintObjectPath", animBlueprintObjectPath);
+        Add(command, "$generatedClassObjectPath", generatedClassObjectPath);
+        Add(command, "$referencedAnimationPath", referencedAnimationPath);
+        Add(command, "$referencedAnimationName", referencedAnimationName);
+        Add(command, "$referencedAnimationType", referencedAnimationType);
+        Add(command, "$propertyPath", propertyPath);
+        Add(command, "$nodeType", nodeType);
+        Add(command, "$skeletonPath", skeletonPath);
+        Add(command, "$relationSource", relationSource);
+        Add(command, "$confidenceHint", confidenceHint);
+        Add(command, "$rawJson", JsonConvert.SerializeObject(raw));
+        command.ExecuteNonQuery();
+    }
 
     private static void InsertObjectPropertyAssetRelations(
         SqliteConnection connection,
@@ -1659,7 +2395,7 @@ internal static class UESourceIndexBuilder
         if (relationType == null)
             return false;
 
-        target = new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name);
+        target = new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name, loaded?.GetType().Name ?? loaded?.ExportType);
         return true;
     }
 
@@ -1742,12 +2478,12 @@ internal static class UESourceIndexBuilder
         command.ExecuteNonQuery();
     }
 
-    private readonly record struct ComponentAssetTarget(string RelationType, string? TargetPath, string? TargetName)
+    private readonly record struct ComponentAssetTarget(string RelationType, string? TargetPath, string? TargetName, string? TargetObjectType = null)
     {
         public static ComponentAssetTarget FromPackageIndex(string relationType, FPackageIndex packageIndex)
         {
             var loaded = packageIndex.Load<UObject>();
-            return new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name);
+            return new ComponentAssetTarget(relationType, GetPackageIndexPath(packageIndex), loaded?.Name ?? packageIndex.Name, loaded?.GetType().Name ?? loaded?.ExportType);
         }
     }
 
