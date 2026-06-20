@@ -51,6 +51,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 大型 UE5 全量导出应配置 `maxHeavyExportDegreeOfParallelism` 和 `memorySoftLimitGb`。`maxDegreeOfParallelism` 控制整体扫描并发，`maxHeavyExportDegreeOfParallelism` 只限制 `uasset` / `umap` 包加载、贴图解码、模型/动画导出这类重活的同时数量；`memorySoftLimitGb` 按进程 Private Bytes 做软水位，超过后会暂停新重活、触发 GC，等内存回落后继续。它们只影响调度和稳定性，不改变 Mesh、贴图、材质、骨骼、动画导出内容。
    - `sourceIndexCommitInterval` 控制源索引事务提交批次。全量 NTE/Batman 这类 20 万级包索引建议保持在 100 左右，降低 SQLite WAL、事务和 CUE4Parse 临时对象叠加造成的峰值；需要极限吞吐时可以调大，但内存峰值也会更难控。
    - `createNewCheckpoint` 默认写 `checkpoints/*.checkpoint.db`，用 `checkpoint_files(path, size)` 替代旧版 `.ckpt` JSON 字典；`useCheckpointFile: "latest"` 读取最新同名 SQLite checkpoint。
+   - `resumeExports` 的运行状态写入 `export_resume_state.db.export_jobs` 和 `export_resume_state.db.export_job_outputs`；输出文件列表按行保存，不再用 `outputs_json` 数组。
    - `library_index.db.assets` 是素材库资产查询总入口；`asset_catalog.jsonl` 仅作为兼容视图，导出主链路数据优先来自 `export_events.db.asset_catalog`，后处理再同步到 `library_index.db.assets`。
    - `library_index.db` 必须包含 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports、package_object_maps 等常用查询表；贴图去重摘要写入 `library_reports` 的 `texture_dedupe` 记录。
    - `export_events.db.export_manifest` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`；`export_manifest.jsonl` 仅作为兼容视图。

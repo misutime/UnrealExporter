@@ -16,6 +16,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Data | SQLite source of truth | JSON/JSONL status |
 | --- | --- | --- |
 | Export manifest | `export_events.db.export_manifest`, then `library_index.db.export_manifest` | `export_manifest.jsonl` is a compatibility view |
+| Export resume state | `export_resume_state.db.export_jobs` and `export_resume_state.db.export_job_outputs` | older `outputs_json` rows are discarded when the resume DB is opened |
 | Asset catalog | `export_events.db.asset_catalog`, then `library_index.db.assets` | `asset_catalog.jsonl` is a compatibility view |
 | Animation bindings | `export_events.db.animation_bindings`, then `library_index.db.animation_bindings` | `animation_bindings.jsonl` is a compatibility view |
 | Auto referenced export diagnostics | `export_events.db.auto_referenced_exports`, then `library_index.db.auto_referenced_exports` | `auto_referenced_exports.jsonl` is a compatibility view |
@@ -79,6 +80,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
 - `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.
+- `export_resume_state.db` stores completed job outputs in `export_job_outputs` rows instead of an `outputs_json` blob.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - Auto referenced export diagnostics now stream to `export_events.db.auto_referenced_exports` in bounded batches during rule planning; `auto_referenced_exports.jsonl` is only written when compatibility JSON is explicitly enabled.
 - `--materialize-animation-metadata` updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` by default; `.ueanim.metadata.json`, `asset_catalog.jsonl` and `animation_bindings.jsonl` are only written or updated when `--compat-json` is explicitly requested.

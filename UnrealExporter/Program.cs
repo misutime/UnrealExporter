@@ -2754,8 +2754,10 @@ public class UnrealExporter
             var connection = new SqliteConnection($"Data Source={dbPath}");
             connection.Open();
             ExecuteResumeSql(connection, "PRAGMA busy_timeout = 10000;");
+            ExecuteResumeSql(connection, "PRAGMA foreign_keys = ON;");
             ExecuteResumeSql(connection, "PRAGMA journal_mode = WAL;");
             ExecuteResumeSql(connection, "PRAGMA synchronous = NORMAL;");
+            ResetLegacyResumeSchemaIfNeeded(connection);
             ExecuteResumeSql(connection, """
                 CREATE TABLE IF NOT EXISTS export_jobs (
                     job_key TEXT PRIMARY KEY,
@@ -2766,42 +2768,52 @@ public class UnrealExporter
                     output_type TEXT NOT NULL,
                     auto_referenced_target TEXT,
                     auto_referenced_relation_type TEXT,
-                    outputs_json TEXT NOT NULL,
                     status TEXT NOT NULL
+                );
+                """);
+            ExecuteResumeSql(connection, """
+                CREATE TABLE IF NOT EXISTS export_job_outputs (
+                    job_key TEXT NOT NULL,
+                    output TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (job_key, output),
+                    FOREIGN KEY (job_key) REFERENCES export_jobs(job_key) ON DELETE CASCADE
                 );
                 """);
             ExecuteResumeSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_jobs_source ON export_jobs(source, output_type);");
             ExecuteResumeSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_jobs_status ON export_jobs(status);");
+            ExecuteResumeSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_job_outputs_job ON export_job_outputs(job_key, ordinal);");
 
             var entries = new Dictionary<string, ExportResumeEntry>(StringComparer.OrdinalIgnoreCase);
             using var command = connection.CreateCommand();
             command.CommandText = """
-                SELECT job_key, source_size, outputs_json, status
-                FROM export_jobs
-                WHERE status = 'exported';
+                SELECT j.job_key, j.source_size, j.status, o.output
+                FROM export_jobs j
+                LEFT JOIN export_job_outputs o ON o.job_key = j.job_key
+                WHERE j.status = 'exported'
+                ORDER BY j.job_key COLLATE NOCASE, o.ordinal;
                 """;
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
                 var jobKey = reader.GetString(0);
-                string[] outputs;
-                try
+                if (!entries.TryGetValue(jobKey, out var entry))
                 {
-                    outputs = JsonConvert.DeserializeObject<string[]>(reader.GetString(2)) ?? [];
-                }
-                catch
-                {
-                    outputs = [];
+                    entry = new ExportResumeEntry
+                    {
+                        JobKey = jobKey,
+                        SourceSize = reader.GetInt64(1),
+                        Status = reader.GetString(2),
+                    };
+                    entries[jobKey] = entry;
                 }
 
-                entries[jobKey] = new ExportResumeEntry
-                {
-                    JobKey = jobKey,
-                    SourceSize = reader.GetInt64(1),
-                    Outputs = outputs,
-                    Status = reader.GetString(3),
-                };
+                if (!reader.IsDBNull(3))
+                    entry.OutputList.Add(reader.GetString(3));
             }
+
+            foreach (var entry in entries.Values)
+                entry.Outputs = entry.OutputList.ToArray();
 
             return new ExportResumeStore(connection, entries, config.GameTitle);
         }
@@ -2840,14 +2852,16 @@ public class UnrealExporter
             lock (ResumeWriteLock)
             {
                 using var command = _connection.CreateCommand();
+                using var transaction = _connection.BeginTransaction();
+                command.Transaction = transaction;
                 command.CommandText = """
                     INSERT INTO export_jobs (
                         job_key, completed_at, game_title, source, source_size, output_type,
-                        auto_referenced_target, auto_referenced_relation_type, outputs_json, status
+                        auto_referenced_target, auto_referenced_relation_type, status
                     )
                     VALUES (
                         $jobKey, $completedAt, $gameTitle, $source, $sourceSize, $outputType,
-                        $autoReferencedTarget, $autoReferencedRelationType, $outputsJson, $status
+                        $autoReferencedTarget, $autoReferencedRelationType, $status
                     )
                     ON CONFLICT(job_key) DO UPDATE SET
                         completed_at = excluded.completed_at,
@@ -2857,7 +2871,6 @@ public class UnrealExporter
                         output_type = excluded.output_type,
                         auto_referenced_target = excluded.auto_referenced_target,
                         auto_referenced_relation_type = excluded.auto_referenced_relation_type,
-                        outputs_json = excluded.outputs_json,
                         status = excluded.status;
                     """;
                 command.Parameters.AddWithValue("$jobKey", jobKey);
@@ -2868,10 +2881,37 @@ public class UnrealExporter
                 command.Parameters.AddWithValue("$outputType", outputType);
                 command.Parameters.AddWithValue("$autoReferencedTarget", (object?)rule?.TargetPath ?? DBNull.Value);
                 command.Parameters.AddWithValue("$autoReferencedRelationType", (object?)rule?.RelationType ?? DBNull.Value);
-                command.Parameters.AddWithValue("$outputsJson", JsonConvert.SerializeObject(existingOutputs));
                 command.Parameters.AddWithValue("$status", "exported");
                 command.ExecuteNonQuery();
 
+                using (var deleteOutputs = _connection.CreateCommand())
+                {
+                    deleteOutputs.Transaction = transaction;
+                    deleteOutputs.CommandText = "DELETE FROM export_job_outputs WHERE job_key = $jobKey;";
+                    deleteOutputs.Parameters.AddWithValue("$jobKey", jobKey);
+                    deleteOutputs.ExecuteNonQuery();
+                }
+
+                using (var insertOutput = _connection.CreateCommand())
+                {
+                    insertOutput.Transaction = transaction;
+                    insertOutput.CommandText = """
+                        INSERT INTO export_job_outputs (job_key, output, ordinal)
+                        VALUES ($jobKey, $output, $ordinal);
+                        """;
+                    var keyParam = insertOutput.Parameters.Add("$jobKey", SqliteType.Text);
+                    var outputParam = insertOutput.Parameters.Add("$output", SqliteType.Text);
+                    var ordinalParam = insertOutput.Parameters.Add("$ordinal", SqliteType.Integer);
+                    keyParam.Value = jobKey;
+                    for (var i = 0; i < existingOutputs.Length; i++)
+                    {
+                        outputParam.Value = existingOutputs[i];
+                        ordinalParam.Value = i;
+                        insertOutput.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
                 _entries[jobKey] = new ExportResumeEntry
                 {
                     JobKey = jobKey,
@@ -2905,6 +2945,24 @@ public class UnrealExporter
             command.CommandText = sql;
             command.ExecuteNonQuery();
         }
+
+        private static void ResetLegacyResumeSchemaIfNeeded(SqliteConnection connection)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "PRAGMA table_info(export_jobs);";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var columnName = reader.GetString(1);
+                if (!columnName.Equals("outputs_json", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                reader.Close();
+                ExecuteResumeSql(connection, "DROP TABLE IF EXISTS export_job_outputs;");
+                ExecuteResumeSql(connection, "DROP TABLE IF EXISTS export_jobs;");
+                return;
+            }
+        }
     }
 
     private sealed class ExportResumeEntry
@@ -2912,6 +2970,7 @@ public class UnrealExporter
         public string JobKey { get; set; } = "";
         public long SourceSize { get; set; }
         public string[] Outputs { get; set; } = [];
+        public List<string> OutputList { get; } = [];
         public string Status { get; set; } = "";
     }
 
