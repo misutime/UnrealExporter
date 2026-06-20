@@ -6876,8 +6876,7 @@ internal static class UELibraryPostProcessor
                 skeleton_path TEXT,
                 skeleton_name TEXT,
                 confidence TEXT NOT NULL,
-                animation_count INTEGER NOT NULL,
-                raw_json TEXT NOT NULL
+                animation_count INTEGER NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -8268,11 +8267,11 @@ internal static class UELibraryPostProcessor
             command.CommandText = """
                 INSERT INTO model_animation_relations (
                     model, model_name, model_source, skeleton_path, skeleton_name,
-                    confidence, animation_count, raw_json
+                    confidence, animation_count
                 )
                 VALUES (
                     $model, $modelName, $modelSource, $skeletonPath, $skeletonName,
-                    $confidence, $animationCount, $rawJson
+                    $confidence, $animationCount
                 );
                 SELECT last_insert_rowid();
                 """;
@@ -8284,32 +8283,11 @@ internal static class UELibraryPostProcessor
             Add(command, "$skeletonName", (string?)relationObj["skeletonName"]);
             Add(command, "$confidence", (string?)relationObj["confidence"] ?? "Unknown");
             Add(command, "$animationCount", animations.Count);
-            Add(command, "$rawJson", BuildModelAnimationRelationDbRawJson(relationObj, animations));
             var relationId = (long)command.ExecuteScalar()!;
 
             foreach (var animation in animations.OfType<JObject>())
                 InsertRelationAnimation(connection, transaction, relationId, animation);
         }
-    }
-
-    private static string BuildModelAnimationRelationDbRawJson(JObject relationObj, JArray animations)
-    {
-        // 完整动画数组已经逐条写入 relation_animations。
-        // SQLite 这一列只保留模型级摘要，避免大库里把同一批动画 JSON 重复写两遍。
-        var summary = new JObject();
-        foreach (var property in relationObj.Properties())
-        {
-            if (!string.Equals(property.Name, "animations", StringComparison.OrdinalIgnoreCase))
-                summary[property.Name] = property.Value.DeepClone();
-        }
-
-        summary["totalAnimationCount"] = animations.Count;
-        summary["usableAnimationCount"] = animations
-            .OfType<JObject>()
-            .Count(x => (bool?)x["isUsableCandidate"] ?? false);
-        summary["sqliteRawJsonMode"] = "summaryOnly";
-        summary["sqliteRawJsonNote"] = "动画明细存放在 relation_animations；SQLite-only 模式下不会重复写 model_animations.json 兼容视图。";
-        return summary.ToString(Formatting.None);
     }
 
     private static void InsertRelationAnimation(
