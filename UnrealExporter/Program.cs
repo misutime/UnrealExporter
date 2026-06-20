@@ -44,6 +44,9 @@ public class UnrealExporter
     private const string FortnitePortingApiBase = "https://api.fortniteporting.app";
     private const string FortniteApiBase = "https://api.fortniteapi.com";
     private static readonly ConcurrentDictionary<string, object> FileLocks = [];
+    private static readonly ConcurrentDictionary<string, bool> TextureAlphaCache = new(
+        StringComparer.OrdinalIgnoreCase
+    );
     private static readonly HttpClient Http = new()
     {
         Timeout = TimeSpan.FromSeconds(60),
@@ -2732,12 +2735,17 @@ public class UnrealExporter
                     string? alphaMode = material["alphaMode"]?.Value<string>();
                     string? blendMode = material["extras"]?["blendMode"]?.Value<string>();
                     string? shadingModel = material["extras"]?["shadingModel"]?.Value<string>();
+                    bool baseColorTextureHasAlpha = MaterialBaseColorTextureHasMeaningfulAlpha(
+                        gltf,
+                        material,
+                        savedFilePath
+                    );
                     if (
-                        alphaMode?.Equals("MASK", StringComparison.OrdinalIgnoreCase) == true
-                        || alphaMode?.Equals("BLEND", StringComparison.OrdinalIgnoreCase) == true
+                        baseColorTextureHasAlpha
+                        && alphaMode?.Equals("BLEND", StringComparison.OrdinalIgnoreCase) != true
                     )
                     {
-                        material.Remove("alphaMode");
+                        material["alphaMode"] = "BLEND";
                         material.Remove("alphaCutoff");
                         changed = true;
                     }
@@ -2753,14 +2761,12 @@ public class UnrealExporter
                         changed = true;
                     }
 
-                    if (
-                        material["pbrMetallicRoughness"]?["baseColorFactor"]
-                            is JArray baseColorFactor
+                    if (material["pbrMetallicRoughness"]?["baseColorFactor"] is JArray baseColorFactor
                         && baseColorFactor.Count >= 4
                         && baseColorFactor[3]?.Value<double>() < 1.0
-                    )
+                        && material["alphaMode"] is null)
                     {
-                        baseColorFactor[3] = 1.0;
+                        material["alphaMode"] = "BLEND";
                         changed = true;
                     }
                 }
@@ -2991,6 +2997,79 @@ public class UnrealExporter
             material["extensions"] = extensions;
 
         extensions["KHR_materials_unlit"] = new JObject();
+    }
+
+    private static bool MaterialBaseColorTextureHasMeaningfulAlpha(
+        JObject gltf,
+        JObject material,
+        string savedFilePath
+    )
+    {
+        if (!TryGetMaterialBaseColorImagePath(gltf, material, savedFilePath, out string imagePath))
+            return false;
+
+        return TextureAlphaCache.GetOrAdd(imagePath, TextureHasMeaningfulAlpha);
+    }
+
+    private static bool TryGetMaterialBaseColorImagePath(
+        JObject gltf,
+        JObject material,
+        string savedFilePath,
+        out string imagePath
+    )
+    {
+        imagePath = string.Empty;
+        int? textureIndex = material["pbrMetallicRoughness"]?["baseColorTexture"]?["index"]?.Value<int>();
+        if (textureIndex is null || gltf["textures"] is not JArray textures || gltf["images"] is not JArray images)
+            return false;
+        if (textureIndex < 0 || textureIndex >= textures.Count || textures[textureIndex.Value] is not JObject texture)
+            return false;
+
+        int? sourceIndex = texture["source"]?.Value<int>();
+        if (sourceIndex is null || sourceIndex < 0 || sourceIndex >= images.Count || images[sourceIndex.Value] is not JObject image)
+            return false;
+
+        string? uri = image["uri"]?.Value<string>();
+        if (string.IsNullOrWhiteSpace(uri) || IsNonFileImageUri(uri))
+            return false;
+
+        string? directory = Path.GetDirectoryName(savedFilePath);
+        if (string.IsNullOrWhiteSpace(directory))
+            return false;
+
+        string nativeUri = Uri.UnescapeDataString(uri).Replace('/', Path.DirectorySeparatorChar);
+        imagePath = Path.GetFullPath(Path.Combine(directory, nativeUri));
+        return File.Exists(imagePath);
+    }
+
+    private static bool IsNonFileImageUri(string uri)
+        => uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+            || uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+    private static bool TextureHasMeaningfulAlpha(string imagePath)
+    {
+        try
+        {
+            using var bitmap = SKBitmap.Decode(imagePath);
+            if (bitmap is null)
+                return false;
+
+            for (int y = 0; y < bitmap.Height; y++)
+            {
+                for (int x = 0; x < bitmap.Width; x++)
+                {
+                    if (bitmap.GetPixel(x, y).Alpha <= 245)
+                        return true;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
     }
 
     private static void WriteGlb(string savedFilePath, JObject gltf, byte[] binData)

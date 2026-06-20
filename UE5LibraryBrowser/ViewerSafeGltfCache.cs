@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Drawing;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -6,6 +8,7 @@ namespace UE5LibraryBrowser;
 
 internal sealed class ViewerSafeGltfCache
 {
+    private static readonly ConcurrentDictionary<string, bool> TextureAlphaCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _cacheRoot;
 
     public ViewerSafeGltfCache(string libraryRoot)
@@ -20,7 +23,7 @@ internal sealed class ViewerSafeGltfCache
             return modelPath;
 
         var info = new FileInfo(modelPath);
-        var cachePath = Path.Combine(_cacheRoot, $"{Hash("viewer-safe-v3|" + modelPath)}_{info.LastWriteTimeUtc.Ticks}.glb");
+        var cachePath = Path.Combine(_cacheRoot, $"{Hash("viewer-safe-v4|" + modelPath)}_{info.LastWriteTimeUtc.Ticks}.glb");
         if (File.Exists(cachePath))
             return cachePath;
 
@@ -31,6 +34,7 @@ internal sealed class ViewerSafeGltfCache
                 return modelPath;
 
             var changed = RewriteVertexColorsToWhite(json, binChunk);
+            changed |= ApplyAlphaModes(json, modelPath);
             if (!changed)
                 return modelPath;
 
@@ -67,6 +71,99 @@ internal sealed class ViewerSafeGltfCache
         }
 
         return changed;
+    }
+
+    private static bool ApplyAlphaModes(JsonNode json, string originalModelPath)
+    {
+        if (json["materials"] is not JsonArray materials)
+            return false;
+
+        var changed = false;
+        foreach (var material in materials.OfType<JsonObject>())
+        {
+            var alphaMode = material["alphaMode"]?.GetValue<string>();
+            if (MaterialBaseColorTextureHasMeaningfulAlpha(json, material, originalModelPath) &&
+                !string.Equals(alphaMode, "BLEND", StringComparison.OrdinalIgnoreCase))
+            {
+                material["alphaMode"] = "BLEND";
+                material.Remove("alphaCutoff");
+                changed = true;
+            }
+
+            if (material["pbrMetallicRoughness"] is JsonObject pbr &&
+                pbr["baseColorFactor"] is JsonArray baseColorFactor &&
+                baseColorFactor.Count >= 4 &&
+                baseColorFactor[3]?.GetValue<double>() < 1.0 &&
+                material["alphaMode"] is null)
+            {
+                material["alphaMode"] = "BLEND";
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool MaterialBaseColorTextureHasMeaningfulAlpha(JsonNode json, JsonObject material, string originalModelPath)
+    {
+        if (!TryGetMaterialBaseColorImagePath(json, material, originalModelPath, out var imagePath))
+            return false;
+
+        return TextureAlphaCache.GetOrAdd(imagePath, TextureHasMeaningfulAlpha);
+    }
+
+    private static bool TryGetMaterialBaseColorImagePath(JsonNode json, JsonObject material, string originalModelPath, out string imagePath)
+    {
+        imagePath = string.Empty;
+        if (material["pbrMetallicRoughness"] is not JsonObject pbr ||
+            pbr["baseColorTexture"] is not JsonObject baseColorTexture ||
+            baseColorTexture["index"]?.GetValue<int>() is not { } textureIndex)
+            return false;
+        if (json["textures"] is not JsonArray textures ||
+            textureIndex < 0 ||
+            textureIndex >= textures.Count ||
+            textures[textureIndex] is not JsonObject texture)
+            return false;
+        if (json["images"] is not JsonArray images ||
+            texture["source"]?.GetValue<int>() is not { } sourceIndex ||
+            sourceIndex < 0 ||
+            sourceIndex >= images.Count ||
+            images[sourceIndex] is not JsonObject image)
+            return false;
+
+        var uri = image["uri"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(uri) || IsNonFileUri(uri))
+            return false;
+
+        var originalDirectory = Path.GetDirectoryName(originalModelPath);
+        if (string.IsNullOrWhiteSpace(originalDirectory))
+            return false;
+
+        var nativeUri = Uri.UnescapeDataString(uri).Replace('/', Path.DirectorySeparatorChar);
+        imagePath = Path.GetFullPath(Path.Combine(originalDirectory, nativeUri));
+        return File.Exists(imagePath);
+    }
+
+    private static bool TextureHasMeaningfulAlpha(string imagePath)
+    {
+        try
+        {
+            using var bitmap = new Bitmap(imagePath);
+            for (var y = 0; y < bitmap.Height; y++)
+            {
+                for (var x = 0; x < bitmap.Width; x++)
+                {
+                    if (bitmap.GetPixel(x, y).A <= 245)
+                        return true;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
     }
 
     private static bool WriteWhiteColorAccessor(JsonNode json, byte[] binChunk, int accessorIndex)
