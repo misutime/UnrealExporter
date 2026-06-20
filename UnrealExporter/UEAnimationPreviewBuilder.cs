@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using SharpGLTF.IO;
 using SharpGLTF.Schema2;
@@ -7,7 +8,7 @@ namespace UnrealExporter;
 
 internal static class UEAnimationPreviewBuilder
 {
-    public static int Run(string modelPath, string animationPath, string outputPath, string? reportPath = null)
+    public static int Run(string modelPath, string animationPath, string outputPath, string? reportPath = null, string? skipBoneRegex = null)
     {
         reportPath = string.IsNullOrWhiteSpace(reportPath)
             ? Path.ChangeExtension(Path.GetFullPath(outputPath), ".preview_validation.json")
@@ -19,6 +20,9 @@ internal static class UEAnimationPreviewBuilder
         {
             var animation = UEAnimReader.Read(animationPath);
             var model = ModelRoot.Load(modelPath, new ReadSettings());
+            Regex? skipBonePattern = string.IsNullOrWhiteSpace(skipBoneRegex)
+                ? null
+                : new Regex(skipBoneRegex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
             var nodesByName = model.LogicalNodes
                 .Where(x => !string.IsNullOrWhiteSpace(x.Name))
                 .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
@@ -43,9 +47,17 @@ internal static class UEAnimationPreviewBuilder
             var retargetedTranslationTracks = 0;
             var skippedStaticTranslationTracks = 0;
             var retargetedRotationTracks = 0;
+            var skippedStaticRotationTracks = 0;
+            var skippedByRegexTracks = 0;
             var missingBones = new List<string>();
             foreach (var track in animation.Tracks)
             {
+                if (skipBonePattern?.IsMatch(track.BoneName) == true)
+                {
+                    skippedByRegexTracks++;
+                    continue;
+                }
+
                 if (!nodesByName.TryGetValue(track.BoneName, out var node))
                 {
                     missingBones.Add(track.BoneName);
@@ -71,13 +83,19 @@ internal static class UEAnimationPreviewBuilder
                 if (track.Rotations.Count > 0)
                 {
                     var rotation = BuildRotationKeyMap(track, node, animation.FramesPerSecond);
-                    gltfAnimation.CreateRotationChannel(
-                        node,
-                        rotation.Keys,
-                        linear: true);
-                    writtenChannels++;
+                    if (rotation.Keys.Count > 0)
+                    {
+                        gltfAnimation.CreateRotationChannel(
+                            node,
+                            rotation.Keys,
+                            linear: true);
+                        writtenChannels++;
+                    }
+
                     if (rotation.Retargeted)
                         retargetedRotationTracks++;
+                    if (rotation.SkippedStatic)
+                        skippedStaticRotationTracks++;
                 }
 
                 if (track.Scales.Count > 0)
@@ -91,9 +109,12 @@ internal static class UEAnimationPreviewBuilder
             }
 
             model.SaveGLB(outputPath, new WriteSettings());
+            UnrealExporter.SanitizeGlbForPreview(outputPath);
+            var anyRetarget = retargetedTranslationTracks > 0 || retargetedRotationTracks > 0;
+            var anyAdjustedOrSkipped = anyRetarget || skippedStaticTranslationTracks > 0 || skippedStaticRotationTracks > 0;
             var heavyTranslationRetarget = matchedTracks > 0 && retargetedTranslationTracks > matchedTracks * 0.5f;
             var status = matchedTracks > 0 && writtenChannels > 0 && File.Exists(outputPath)
-                ? missingBones.Count == 0 && !heavyTranslationRetarget ? "ok" : "warning"
+                ? missingBones.Count == 0 && !anyAdjustedOrSkipped && !heavyTranslationRetarget ? "ok" : "warning"
                 : "error";
             WriteReport(reportPath, new
             {
@@ -115,12 +136,25 @@ internal static class UEAnimationPreviewBuilder
                 retargetedTranslationTracks,
                 skippedStaticTranslationTracks,
                 retargetedRotationTracks,
+                skippedStaticRotationTracks,
+                skippedByRegexTracks,
+                skipBoneRegex,
+                anyRetarget,
+                anyAdjustedOrSkipped,
                 heavyTranslationRetarget,
+                visualAcceptance = new
+                {
+                    status = anyAdjustedOrSkipped || missingBones.Count > 0 ? "notAccepted" : "requiresManualReview",
+                    reason = anyAdjustedOrSkipped
+                        ? "Preview generation applied or skipped uncertain transform channels. This can prove a diagnostic preview was generated, but cannot prove humanoid animation correctness."
+                        : "Preview generated without automatic retargeting, but humanoid animation correctness still requires manual rest/mid/end visual review.",
+                    requiresScreenshots = new[] { "restPose", "animationStart", "animationMiddle", "animationEnd" }
+                },
                 missingBones = missingBones.Take(64).ToArray(),
             });
 
             Console.WriteLine($"=> {outputPath}");
-            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, retargetedRotations={retargetedRotationTracks}");
+            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, retargetedRotations={retargetedRotationTracks}, skippedStaticRotations={skippedStaticRotationTracks}, skippedByRegex={skippedByRegexTracks}");
             return status == "error" ? 2 : 0;
         }
         catch (Exception ex)
@@ -142,8 +176,9 @@ internal static class UEAnimationPreviewBuilder
     private static Vector3 SwapYZ(Vector3 value)
         => new(value.X, value.Z, value.Y);
 
+    // Swapping Y/Z is a handedness-changing basis reflection; quaternion W must flip too.
     private static Quaternion SwapYZ(Quaternion value)
-        => Quaternion.Normalize(new Quaternion(value.X, value.Z, value.Y, value.W));
+        => Quaternion.Normalize(new Quaternion(value.X, value.Z, value.Y, -value.W));
 
     private static TranslationKeyMap BuildTranslationKeyMap(UEAnimTrack track, Node node, float framesPerSecond)
     {
@@ -183,31 +218,23 @@ internal static class UEAnimationPreviewBuilder
     private static RotationKeyMap BuildRotationKeyMap(UEAnimTrack track, Node node, float framesPerSecond)
     {
         var directKeys = BuildKeyMap(track.Rotations, framesPerSecond, SwapYZ);
-        if (directKeys.Count == 0)
-            return new RotationKeyMap(directKeys, Retargeted: false);
+        if (directKeys.Count == 1)
+        {
+            var rest = Quaternion.Normalize(node.LocalTransform.Rotation);
+            var first = directKeys.Values.First();
+            if (!IsRotationCompatibleWithRest(first, rest))
+                return new RotationKeyMap([], Retargeted: false, SkippedStatic: true);
+        }
 
-        var first = directKeys
-            .OrderBy(x => x.Key)
-            .First()
-            .Value;
-        var rest = Quaternion.Normalize(node.LocalTransform.Rotation);
-        if (IsRotationCompatibleWithRest(first, rest))
-            return new RotationKeyMap(directKeys, Retargeted: false);
-
-        // 和 translation 一样，UE 动画 rotation 可能来自另一个源参考姿态。
-        // 这里把第一帧对齐到目标模型 rest pose，再保留后续相对旋转变化。
-        var offset = Quaternion.Normalize(rest * Quaternion.Inverse(first));
-        var retargetedKeys = directKeys.ToDictionary(
-            x => x.Key,
-            x => Quaternion.Normalize(offset * x.Value));
-        return new RotationKeyMap(retargetedKeys, Retargeted: true);
+        return new RotationKeyMap(directKeys, Retargeted: false, SkippedStatic: false);
     }
 
     private static bool IsRotationCompatibleWithRest(Quaternion first, Quaternion rest)
     {
         var dot = MathF.Abs(Quaternion.Dot(Quaternion.Normalize(first), Quaternion.Normalize(rest)));
-        var angle = 2f * MathF.Acos(MathF.Min(1f, dot));
-        return angle <= 10f * MathF.PI / 180f;
+        dot = Math.Clamp(dot, -1f, 1f);
+        var angle = 2f * MathF.Acos(dot);
+        return angle <= 0.35f;
     }
 
     private static Dictionary<float, TOut> BuildKeyMap<TIn, TOut>(
@@ -240,4 +267,5 @@ internal readonly record struct TranslationKeyMap(
 
 internal readonly record struct RotationKeyMap(
     Dictionary<float, Quaternion> Keys,
-    bool Retargeted);
+    bool Retargeted,
+    bool SkippedStatic);

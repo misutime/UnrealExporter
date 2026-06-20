@@ -187,6 +187,7 @@ public class UnrealExporter
         var animation = GetCommandOption(args, "--animation");
         var output = GetCommandOption(args, "--output");
         var report = GetCommandOption(args, "--report");
+        var skipBoneRegex = GetCommandOption(args, "--skip-animation-bone-regex");
         if (string.IsNullOrWhiteSpace(model) ||
             string.IsNullOrWhiteSpace(animation) ||
             string.IsNullOrWhiteSpace(output))
@@ -196,7 +197,7 @@ public class UnrealExporter
             return true;
         }
 
-        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report);
+        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report, skipBoneRegex);
         return true;
     }
 
@@ -875,21 +876,27 @@ public class UnrealExporter
                 var outputPath = outputDir + Path.DirectorySeparatorChar + fileName;
 
                 var normalizedFilePath = NormalizeAssetPath(file.Value.Path);
-                string regexMatch = config.Export.FirstOrDefault(
-                    path =>
-                        new Regex(
-                            "^" + path[..path.LastIndexOf(':')] + "$",
-                            RegexOptions.IgnoreCase
-                        ).IsMatch(file.Value.Path),
-                    ""
-                );
-                var matchedByConfig = regexMatch.Length > 0;
-                autoReferencedExportRules.TryGetValue(normalizedFilePath, out var autoReferencedRules);
-                var exportJobs = BuildExportJobs(regexMatch, matchedByConfig, autoReferencedRules);
-
+                var regexMatches = config.Export
+                    .Where(path =>
+                    {
+                        var separator = path.LastIndexOf(':');
+                        return separator > 0
+                               && new Regex(
+                                   "^" + path[..separator] + "$",
+                                   RegexOptions.IgnoreCase
+                               ).IsMatch(file.Value.Path);
+                    })
+                    .ToArray();
+                var matchedByConfig = regexMatches.Length > 0;
                 bool isExclude = config.Exclude.Any(path =>
                     new Regex("^" + path + "$", RegexOptions.IgnoreCase).IsMatch(file.Value.Path)
                 );
+                autoReferencedExportRules.TryGetValue(normalizedFilePath, out var autoReferencedRules);
+                var exportJobs = BuildExportJobs(
+                    regexMatches,
+                    matchedByConfig,
+                    explicitRulesAreActive: !isExclude,
+                    autoReferencedRules);
                 var activeExportJobs = isExclude
                     ? exportJobs.Where(x => x.AutoReferencedRule != null).ToList()
                     : exportJobs;
@@ -1854,16 +1861,26 @@ public class UnrealExporter
     }
 
     private static List<ExportJob> BuildExportJobs(
-        string regexMatch,
+        IEnumerable<string> regexMatches,
         bool matchedByConfig,
+        bool explicitRulesAreActive,
         AutoReferencedExportRule[]? autoReferencedRules)
     {
         var jobs = new List<ExportJob>();
-        if (regexMatch.Length > 0)
-            jobs.Add(new ExportJob(regexMatch.SubstringAfterLast(':').ToLower(), matchedByConfig, null));
+        foreach (var regexMatch in regexMatches)
+        {
+            var outputType = regexMatch.SubstringAfterLast(':').ToLowerInvariant();
+            if (outputType.Length == 0 || jobs.Any(x => x.AutoReferencedRule == null && x.OutputType.Equals(outputType, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            jobs.Add(new ExportJob(outputType, matchedByConfig, null));
+        }
 
         foreach (var rule in autoReferencedRules ?? [])
         {
+            if (matchedByConfig && explicitRulesAreActive && IsCoveredByExplicitJob(jobs, rule.OutputType))
+                continue;
+
             // 自动补导必须逐对象执行；同一个 uasset 里可能同时塞了多个贴图或动画。
             if (jobs.Any(x =>
                     x.AutoReferencedRule != null &&
@@ -1876,6 +1893,19 @@ public class UnrealExporter
 
         return jobs;
     }
+
+    private static bool IsCoveredByExplicitJob(List<ExportJob> jobs, string outputType)
+    {
+        if (jobs.Any(x => x.AutoReferencedRule == null && x.OutputType.Equals(outputType, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        return IsModelOutput(outputType) &&
+               jobs.Any(x => x.AutoReferencedRule == null && IsModelOutput(x.OutputType));
+    }
+
+    private static bool IsModelOutput(string outputType)
+        => outputType.Equals("glb", StringComparison.OrdinalIgnoreCase) ||
+           outputType.Equals("gltf", StringComparison.OrdinalIgnoreCase);
 
     private static bool MatchesAutoReferencedTarget(UObject obj, AutoReferencedExportRule? rule)
     {
@@ -2745,6 +2775,9 @@ public class UnrealExporter
                     bufferViews
                 );
 
+            if (meshes is not null)
+                changed |= SanitizeInvalidMorphTargets(gltf, meshes);
+
             if (changed)
                 WriteGlb(savedFilePath, gltf, binData);
         }
@@ -2889,6 +2922,59 @@ public class UnrealExporter
         }
 
         return changed;
+    }
+
+    private static bool SanitizeInvalidMorphTargets(JObject gltf, JArray meshes)
+    {
+        bool changed = false;
+        foreach (JObject mesh in meshes.Children<JObject>())
+        {
+            var primitives = mesh["primitives"]?.Children<JObject>().ToArray() ?? [];
+            if (primitives.Length == 0)
+                continue;
+
+            var targetCounts = primitives
+                .Select(x => (x["targets"] as JArray)?.Count ?? 0)
+                .Distinct()
+                .ToArray();
+            bool extrasIsString = mesh["extras"]?.Type == JTokenType.String;
+            bool inconsistentTargets = targetCounts.Length > 1;
+            if (!extrasIsString && !inconsistentTargets)
+                continue;
+
+            foreach (var primitive in primitives)
+            {
+                if (primitive.Remove("targets"))
+                    changed = true;
+            }
+
+            if (mesh.Remove("weights"))
+                changed = true;
+            if (mesh.Remove("extras"))
+                changed = true;
+
+            RemoveWeightAnimationChannels(gltf, mesh);
+        }
+
+        return changed;
+    }
+
+    private static void RemoveWeightAnimationChannels(JObject gltf, JObject mesh)
+    {
+        if (gltf["animations"] is not JArray animations)
+            return;
+
+        foreach (JObject animation in animations.Children<JObject>())
+        {
+            if (animation["channels"] is not JArray channels)
+                continue;
+
+            for (int i = channels.Count - 1; i >= 0; i--)
+            {
+                if (channels[i]?["target"]?["path"]?.Value<string>() == "weights")
+                    channels.RemoveAt(i);
+            }
+        }
     }
 
     private static void AddUnlitPreviewExtension(JObject gltf, JObject material)
