@@ -1,0 +1,77 @@
+using System.Text.Json;
+
+namespace UE5LibraryBrowser;
+
+internal static class Program
+{
+    [STAThread]
+    private static void Main(string[] args)
+    {
+        if (args.Length == 2 && args[0].Equals("--validate-library", StringComparison.OrdinalIgnoreCase))
+        {
+            ValidateLibrary(args[1]);
+            return;
+        }
+
+        if (args.Length == 2 && args[0].Equals("--smoke-preview", StringComparison.OrdinalIgnoreCase))
+        {
+            SmokePreviewAsync(args[1]).GetAwaiter().GetResult();
+            return;
+        }
+
+        Application.SetHighDpiMode(HighDpiMode.SystemAware);
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new MainForm(args.FirstOrDefault()));
+    }
+
+    private static void ValidateLibrary(string root)
+    {
+        var index = UeLibraryIndexReader.Load(root);
+        var payload = new
+        {
+            root = index.Root,
+            models = index.Models.Count,
+            modelsWithAnimations = index.Models.Count(x => x.AnimationCount > 0),
+            animations = index.Models.Sum(x => x.AnimationCount),
+            usableAnimations = index.AnimationsByModel.Values.SelectMany(x => x).Count(x => x.IsUsableCandidate),
+            source = "library_index.db"
+        };
+        Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static async Task SmokePreviewAsync(string root)
+    {
+        var index = UeLibraryIndexReader.Load(root);
+        var pair = index.Models
+            .Select(model =>
+            {
+                var key = UeLibraryIndexReader.MakeLibraryRelative(index.Root, model.Output);
+                index.AnimationsByModel.TryGetValue(key, out var animations);
+                return new
+                {
+                    Model = model,
+                    Animation = animations?.FirstOrDefault(x => x.IsPreviewable)
+                };
+            })
+            .FirstOrDefault(x => x.Animation != null);
+
+        if (pair?.Animation == null)
+            throw new InvalidDataException("没有找到可预览的模型动画组合。");
+
+        var composer = new PreviewComposer(index.Root);
+        var result = await composer.EnsurePreviewAsync(pair.Model, pair.Animation, CancellationToken.None);
+        var payload = new
+        {
+            result.Success,
+            model = pair.Model.Name,
+            animation = pair.Animation.Name,
+            result.OutputPath,
+            result.ReportPath,
+            result.Message
+        };
+        Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+        if (!result.Success)
+            Environment.ExitCode = 1;
+    }
+}
