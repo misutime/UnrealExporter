@@ -60,7 +60,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `export_events.db.auto_referenced_exports` 记录自动补导的计划和执行结果，包括关系来源、目标对象、源包、输出类型和失败原因，并同步到 `library_index.db.auto_referenced_exports`；`auto_referenced_exports.jsonl` 仅作为兼容视图。
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox，并结合材质 sidecar 与 `material_texture_slots` 判断外部材质贴图关系，避免把未内嵌贴图但关系完整的模型误报为异常。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_index_metadata、source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
-   - `library_index.db` 面向已导出素材库，记录 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports 和 package_object_maps。常用筛选字段必须显式列化，完整细节可继续保留在 `raw_json`。
+   - `library_index.db` 面向已导出素材库，记录 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports 和 package_object_maps。常用筛选字段必须显式列化，完整机器细节应优先拆成子表；`raw_json` 只作为尚未迁移字段的临时过渡或人工调试信息。
    - 浏览器合成 `.ueanim` 预览时，验证报告默认写入预览缓存目录的 `preview_validation.db.preview_validation_reports`；`preview_validation.json` 仅作为命令行 `--report` 人工调试输出。
 
 ## 优化列表
@@ -84,7 +84,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - 已支持 `package_object_maps`，在源索引阶段记录 UE 包 ImportMap/ExportMap，并同步生成素材库侧 `package_object_maps.jsonl` 和 `library_index.db.package_object_maps`，用于分析包级依赖、导出对象、class/outer/super/template 关系。
 - 已支持 `animation_notifies` 和 `animation_curves`，记录通知事件、曲线名、曲线 key 数和值域，便于区分事件/表情/材质驱动类动画。
 - 已支持 `animation_segments` 和 `animation_sections`，记录 Montage/Composite 的子动画引用、slot、section、时间范围、播放速度和循环次数。
-- `model_animations.json` 和 `library_index.db.relation_animations` 已保留动画 segment/section 摘要和完整 raw_json，用于区分直接可采样 AnimSequence 与 Montage/Composite 容器动画。
+- `model_animations.json` 仅作为显式兼容/调试视图；`library_index.db.relation_animations` 保留动画 segment/section 计数，完整 segment/section 明细写入 `relation_animation_segments` 和 `relation_animation_sections`，用于区分直接可采样 AnimSequence 与 Montage/Composite 容器动画。
 - 下一步继续扩展 ExternalActor 描述数据和更完整依赖图，减少每次靠目录扫描和临时加载。
 
 ### P1：共享贴图主链路

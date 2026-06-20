@@ -329,7 +329,7 @@ ORDER BY relationship_kind, recommended_use, confidence_tier;
 当前关键 SQLite 表：
 
 - `assets`：素材总目录，合并模型、贴图、材质、动画等导出资产。
-- `relation_animations`：模型与动画的逐条关系明细，包含 `confidence_tier`、`relationship_kind`、`recommended_use`、`evidence_summary`、验证状态和调试用 `raw_json`。
+- `relation_animations`：模型与动画的逐条关系明细，包含 `confidence_tier`、`relationship_kind`、`recommended_use`、`evidence_summary` 和验证状态；证据链、容器 segment、section 明细分别在 `relation_animation_evidence`、`relation_animation_segments`、`relation_animation_sections`。
 - `relation_animation_evidence`：模型动画关系的有序证据链明细，按 `relation_animation_id` + `step_index` 保存，替代旧的证据链 JSON 数组机器读取路径。
 - `model_animation_relations`：模型维度的关系摘要和数量统计。
 - `animation_validation`：动画与模型配对的结构验证结果。
@@ -340,7 +340,7 @@ ORDER BY relationship_kind, recommended_use, confidence_tier;
 团队约定：
 
 - 新 UI 默认读取 SQLite；只有展示原始日志、排查写入顺序或兼容旧流程时再读 JSON/JSONL。
-- `raw_json` 是兜底字段，用于保留 SQLite 列尚未展开的细节；常用筛选条件必须提升为显式列。
+- 新工具应优先使用显式列和子表；旧 JSON 报告只用于人工阅读或调试。新增机器字段必须继续列化或拆入子表，避免重新引入大块 `raw_json`。
 - 判断“默认可信动画”优先看 `recommended_use = 'defaultTrusted'`，不要只看 `is_explicit_usage` 或 `validation_status = 'ok'`。
 
 ### Tier 1：确定性使用关系

@@ -6987,7 +6987,6 @@ internal static class UELibraryPostProcessor
                 exported_referenced_animation_count INTEGER NOT NULL,
                 missing_referenced_animation_count INTEGER NOT NULL,
                 section_count INTEGER NOT NULL,
-                raw_json TEXT NOT NULL,
                 FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
             );
             """);
@@ -6997,6 +6996,39 @@ internal static class UELibraryPostProcessor
                 relation_animation_id INTEGER NOT NULL,
                 step_index INTEGER NOT NULL,
                 evidence_step TEXT NOT NULL,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL,
+                slot_name TEXT,
+                referenced_animation_path TEXT,
+                referenced_animation_name TEXT,
+                start_pos REAL,
+                anim_start_time REAL,
+                anim_end_time REAL,
+                play_rate REAL,
+                looping_count INTEGER,
+                length REAL,
+                relation_source TEXT,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                section_index INTEGER NOT NULL,
+                section_name TEXT,
+                next_section_name TEXT,
+                slot_index INTEGER,
+                segment_index INTEGER,
+                segment_begin_time REAL,
+                link_method TEXT,
+                cached_link_method TEXT,
                 FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
             );
             """);
@@ -7164,6 +7196,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_confidence ON relation_animations(confidence_tier, is_deterministic_usage, is_compatibility_candidate);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_recommended ON relation_animations(relationship_kind, recommended_use);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animation_evidence_animation ON relation_animation_evidence(relation_animation_id, step_index);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_segments_ref ON relation_animation_segments(referenced_animation_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_sections_name ON relation_animation_sections(section_name);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_missing_bones ON animation_validation_missing_track_bones(bone_name, animation_validation_id);");
@@ -8512,7 +8546,7 @@ internal static class UELibraryPostProcessor
                 validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
                 is_usable_candidate, confidence_tier, relationship_kind, recommended_use, evidence_summary, is_deterministic_usage, is_compatibility_candidate,
                 segment_count, referenced_animation_count, exported_referenced_animation_count,
-                missing_referenced_animation_count, section_count, raw_json
+                missing_referenced_animation_count, section_count
             )
             VALUES (
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
@@ -8520,7 +8554,7 @@ internal static class UELibraryPostProcessor
                 $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
                 $isUsableCandidate, $confidenceTier, $relationshipKind, $recommendedUse, $evidenceSummary, $isDeterministicUsage, $isCompatibilityCandidate,
                 $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
-                $missingReferencedAnimationCount, $sectionCount, $rawJson
+                $missingReferencedAnimationCount, $sectionCount
             );
             """;
         Add(command, "$relationId", relationId);
@@ -8554,10 +8588,11 @@ internal static class UELibraryPostProcessor
         Add(command, "$exportedReferencedAnimationCount", (int?)animation["exportedReferencedAnimationCount"] ?? 0);
         Add(command, "$missingReferencedAnimationCount", (int?)animation["missingReferencedAnimationCount"] ?? 0);
         Add(command, "$sectionCount", (int?)animation["sectionCount"] ?? 0);
-        Add(command, "$rawJson", animation.ToString(Formatting.None));
         command.ExecuteNonQuery();
         var animationId = GetLastInsertRowId(connection, transaction);
         InsertRelationAnimationEvidence(connection, transaction, animationId, evidenceSteps);
+        InsertRelationAnimationSegments(connection, transaction, animationId, (JArray?)animation["segments"]);
+        InsertRelationAnimationSections(connection, transaction, animationId, (JArray?)animation["sections"]);
     }
 
     private static string[] ReadEvidenceSteps(JToken? evidenceChain)
@@ -8610,6 +8645,87 @@ internal static class UELibraryPostProcessor
         {
             indexParam.Value = i;
             stepParam.Value = evidenceSteps[i];
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertRelationAnimationSegments(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long relationAnimationId,
+        JArray? segments)
+    {
+        if (relationAnimationId <= 0)
+            return;
+
+        foreach (var segment in (segments ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO relation_animation_segments (
+                    relation_animation_id, segment_index, slot_name,
+                    referenced_animation_path, referenced_animation_name,
+                    start_pos, anim_start_time, anim_end_time, play_rate,
+                    looping_count, length, relation_source
+                )
+                VALUES (
+                    $relationAnimationId, $segmentIndex, $slotName,
+                    $referencedAnimationPath, $referencedAnimationName,
+                    $startPos, $animStartTime, $animEndTime, $playRate,
+                    $loopingCount, $length, $relationSource
+                );
+                """;
+            Add(command, "$relationAnimationId", relationAnimationId);
+            Add(command, "$segmentIndex", (int?)segment["segmentIndex"] ?? 0);
+            Add(command, "$slotName", (string?)segment["slotName"]);
+            Add(command, "$referencedAnimationPath", (string?)segment["referencedAnimationPath"]);
+            Add(command, "$referencedAnimationName", (string?)segment["referencedAnimationName"]);
+            Add(command, "$startPos", (double?)segment["startPos"]);
+            Add(command, "$animStartTime", (double?)segment["animStartTime"]);
+            Add(command, "$animEndTime", (double?)segment["animEndTime"]);
+            Add(command, "$playRate", (double?)segment["playRate"]);
+            Add(command, "$loopingCount", (int?)segment["loopingCount"]);
+            Add(command, "$length", (double?)segment["length"]);
+            Add(command, "$relationSource", (string?)segment["relationSource"]);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertRelationAnimationSections(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long relationAnimationId,
+        JArray? sections)
+    {
+        if (relationAnimationId <= 0)
+            return;
+
+        foreach (var section in (sections ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO relation_animation_sections (
+                    relation_animation_id, section_index, section_name,
+                    next_section_name, slot_index, segment_index,
+                    segment_begin_time, link_method, cached_link_method
+                )
+                VALUES (
+                    $relationAnimationId, $sectionIndex, $sectionName,
+                    $nextSectionName, $slotIndex, $segmentIndex,
+                    $segmentBeginTime, $linkMethod, $cachedLinkMethod
+                );
+                """;
+            Add(command, "$relationAnimationId", relationAnimationId);
+            Add(command, "$sectionIndex", (int?)section["sectionIndex"] ?? 0);
+            Add(command, "$sectionName", (string?)section["sectionName"]);
+            Add(command, "$nextSectionName", (string?)section["nextSectionName"]);
+            Add(command, "$slotIndex", (int?)section["slotIndex"]);
+            Add(command, "$segmentIndex", (int?)section["segmentIndex"]);
+            Add(command, "$segmentBeginTime", (double?)section["segmentBeginTime"]);
+            Add(command, "$linkMethod", (string?)section["linkMethod"]);
+            Add(command, "$cachedLinkMethod", (string?)section["cachedLinkMethod"]);
             command.ExecuteNonQuery();
         }
     }
