@@ -15,7 +15,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 
 | Data | SQLite source of truth | JSON/JSONL status |
 | --- | --- | --- |
-| Export manifest | `export_events.db.export_manifest`, then `library_index.db.export_manifest` | `export_manifest.jsonl` is a debug/human view |
+| Export manifest | `export_events.db.export_manifest`, then `library_index.db.export_manifest` | `export_manifest.jsonl` is a debug/human view; manifest facts are explicit columns without `raw_json` |
 | Export resume state | `export_resume_state.db.export_jobs` and `export_resume_state.db.export_job_outputs` | older `outputs_json` rows are discarded when the resume DB is opened |
 | Asset catalog | `export_events.db.asset_catalog`, then `library_index.db.assets` | `asset_catalog.jsonl` is a debug/human view |
 | Animation bindings | `export_events.db.animation_bindings`, then `library_index.db.animation_bindings` | `animation_bindings.jsonl` is a debug/human view |
@@ -83,6 +83,7 @@ SQLite-first indexing is the normal and non-configurable machine path. `writeDeb
 - `model_animation_relations` is a lightweight model-level summary table without a `raw_json` blob. Query `relation_animations` for per-animation details, `relation_animation_evidence` for ordered deterministic evidence, and `relation_animation_segments` / `relation_animation_sections` for Montage/Composite/BlendSpace container details. `relation_animations` no longer keeps a per-row raw JSON copy.
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes debug JSONL when explicitly requested.
+- `export_manifest` rows in both `export_events.db` and `library_index.db` now store only explicit columns and no longer keep a duplicate `raw_json` blob.
 - `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.
 - `export_resume_state.db` stores completed job outputs in `export_job_outputs` rows instead of an `outputs_json` blob.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.

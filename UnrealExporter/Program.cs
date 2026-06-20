@@ -2500,10 +2500,10 @@ public class UnrealExporter
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO export_manifest (
-                    exported_at, game_title, kind, source, object_type, name, object_path, output, raw_json
+                    exported_at, game_title, kind, source, object_type, name, object_path, output
                 )
                 VALUES (
-                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output, $rawJson
+                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output
                 );
                 """;
             Add(command, "$exportedAt", (string?)row["exportedAt"]);
@@ -2514,7 +2514,6 @@ public class UnrealExporter
             Add(command, "$name", (string?)row["name"]);
             Add(command, "$objectPath", (string?)row["objectPath"]);
             Add(command, "$output", (string?)row["output"]);
-            Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
         }
 
@@ -2642,10 +2641,10 @@ public class UnrealExporter
                     object_type TEXT,
                     name TEXT,
                     object_path TEXT,
-                    output TEXT,
-                    raw_json TEXT NOT NULL
+                    output TEXT
                 );
                 """);
+            EnsureExportManifestNoRawJson(connection);
             ExecuteExportEventSql(connection, """
                 CREATE TABLE IF NOT EXISTS asset_catalog (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2709,6 +2708,49 @@ public class UnrealExporter
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_asset_object ON asset_catalog(object_path);");
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_animation_object ON animation_bindings(object_path, status);");
             ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_auto_target ON auto_referenced_exports(target_path, relation_type);");
+        }
+
+        private static void EnsureExportManifestNoRawJson(SqliteConnection connection)
+        {
+            if (!ExportEventTableColumnExists(connection, "export_manifest", "raw_json"))
+                return;
+
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE export_manifest_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exported_at TEXT,
+                    game_title TEXT,
+                    kind TEXT,
+                    source TEXT,
+                    object_type TEXT,
+                    name TEXT,
+                    object_path TEXT,
+                    output TEXT
+                );
+                """);
+            ExecuteExportEventSql(connection, """
+                INSERT INTO export_manifest_new (
+                    id, exported_at, game_title, kind, source, object_type, name, object_path, output
+                )
+                SELECT id, exported_at, game_title, kind, source, object_type, name, object_path, output
+                FROM export_manifest;
+                """);
+            ExecuteExportEventSql(connection, "DROP TABLE export_manifest;");
+            ExecuteExportEventSql(connection, "ALTER TABLE export_manifest_new RENAME TO export_manifest;");
+        }
+
+        private static bool ExportEventTableColumnExists(SqliteConnection connection, string tableName, string columnName)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = $"PRAGMA table_info({ValidateExportEventTableName(tableName)});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
         }
 
         private static string ValidateExportEventTableName(string tableName)

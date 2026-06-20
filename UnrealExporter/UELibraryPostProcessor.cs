@@ -6588,8 +6588,7 @@ internal static class UELibraryPostProcessor
                 object_type TEXT,
                 name TEXT,
                 object_path TEXT,
-                output TEXT,
-                raw_json TEXT NOT NULL
+                output TEXT
             );
             """);
         Execute(connection, transaction, """
@@ -7405,10 +7404,10 @@ internal static class UELibraryPostProcessor
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO export_manifest (
-                    exported_at, game_title, kind, source, object_type, name, object_path, output, raw_json
+                    exported_at, game_title, kind, source, object_type, name, object_path, output
                 )
                 VALUES (
-                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output, $rawJson
+                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output
                 );
                 """;
             Add(command, "$exportedAt", (string?)row["exportedAt"]);
@@ -7419,7 +7418,6 @@ internal static class UELibraryPostProcessor
             Add(command, "$name", (string?)row["name"]);
             Add(command, "$objectPath", (string?)row["objectPath"]);
             Add(command, "$output", (string?)row["output"]);
-            Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
         }
     }
@@ -7534,6 +7532,13 @@ internal static class UELibraryPostProcessor
                 var count = Convert.ToInt64(countCommand.ExecuteScalar());
                 if (count > 0)
                 {
+                    if (string.Equals(tableName, "export_manifest", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var row in ReadExportManifestEventRows(connection))
+                            yield return row;
+                        yield break;
+                    }
+
                     using var command = connection.CreateCommand();
                     command.CommandText = $"SELECT raw_json FROM {ValidateExportEventTableName(tableName)} ORDER BY id;";
                     using var reader = command.ExecuteReader();
@@ -7560,6 +7565,31 @@ internal static class UELibraryPostProcessor
 
         foreach (var row in ReadJsonLines(legacyJsonLinesPath))
             yield return row;
+    }
+
+    private static IEnumerable<JObject> ReadExportManifestEventRows(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT exported_at, game_title, kind, source, object_type, name, object_path, output
+            FROM export_manifest
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            yield return new JObject
+            {
+                ["exportedAt"] = GetString(reader, 0),
+                ["gameTitle"] = GetString(reader, 1),
+                ["kind"] = GetString(reader, 2),
+                ["source"] = GetString(reader, 3),
+                ["objectType"] = GetString(reader, 4),
+                ["name"] = GetString(reader, 5),
+                ["objectPath"] = GetString(reader, 6),
+                ["output"] = GetString(reader, 7),
+            };
+        }
     }
 
     private static string ValidateExportEventTableName(string tableName)
