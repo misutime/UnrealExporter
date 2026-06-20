@@ -394,6 +394,32 @@ internal static class UELibraryPostProcessor
     private static int JArrayCount(JToken? token)
         => token is JArray array ? array.Count : 0;
 
+    private static double? GetJsonDouble(JToken? token)
+    {
+        if (token == null || token.Type == JTokenType.Null)
+            return null;
+
+        try
+        {
+            return token.Value<double?>();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static double? GetJsonArrayDouble(JToken? token, int index)
+        => token is JArray array && index >= 0 && index < array.Count
+            ? GetJsonDouble(array[index])
+            : null;
+
+    private static double? GetComponentTransformDouble(JObject row, string pascalName, string camelName, string snakeName, string groupName, int index)
+        => GetJsonDouble(row[pascalName])
+           ?? GetJsonDouble(row[camelName])
+           ?? GetJsonDouble(row[snakeName])
+           ?? GetJsonArrayDouble(row["transform"]?[groupName], index);
+
     private static string BuildAnimationMetadataPath(string root, JObject row)
     {
         var output = (string?)row["output"];
@@ -2560,7 +2586,15 @@ internal static class UELibraryPostProcessor
                 match_reason TEXT,
                 socket_name TEXT,
                 parent_component_path TEXT,
-                transform_json TEXT,
+                location_x REAL,
+                location_y REAL,
+                location_z REAL,
+                rotation_pitch REAL,
+                rotation_yaw REAL,
+                rotation_roll REAL,
+                scale_x REAL,
+                scale_y REAL,
+                scale_z REAL,
                 source_path TEXT
             );
             """);
@@ -2717,7 +2751,15 @@ internal static class UELibraryPostProcessor
                 MatchReason = matchReason,
                 SocketName = relation.SocketName,
                 ParentComponentPath = relation.ParentComponentPath,
-                Transform = BuildTransformObject(relation),
+                LocationX = relation.LocationX,
+                LocationY = relation.LocationY,
+                LocationZ = relation.LocationZ,
+                RotationPitch = relation.RotationPitch,
+                RotationYaw = relation.RotationYaw,
+                RotationRoll = relation.RotationRoll,
+                ScaleX = relation.ScaleX,
+                ScaleY = relation.ScaleY,
+                ScaleZ = relation.ScaleZ,
             });
         }
 
@@ -2753,7 +2795,15 @@ internal static class UELibraryPostProcessor
             MatchReason = matchReason,
             SocketName = relation.SocketName,
             ParentComponentPath = relation.ParentComponentPath,
-            Transform = BuildTransformObject(relation),
+            LocationX = relation.LocationX,
+            LocationY = relation.LocationY,
+            LocationZ = relation.LocationZ,
+            RotationPitch = relation.RotationPitch,
+            RotationYaw = relation.RotationYaw,
+            RotationRoll = relation.RotationRoll,
+            ScaleX = relation.ScaleX,
+            ScaleY = relation.ScaleY,
+            ScaleZ = relation.ScaleZ,
         };
     }
 
@@ -2778,7 +2828,7 @@ internal static class UELibraryPostProcessor
             link.MatchReason,
             link.SocketName,
             link.ParentComponentPath,
-            transform = link.Transform,
+            transform = BuildTransformObject(link),
             link.SourcePath,
         });
 
@@ -2992,16 +3042,16 @@ internal static class UELibraryPostProcessor
         return string.IsNullOrWhiteSpace(extension) ? text : text[..^extension.Length];
     }
 
-    private static object? BuildTransformObject(SourceComponentAssetRelation relation)
+    private static object? BuildTransformObject(ComponentAssetRelationLink link)
     {
-        if (relation.LocationX == null && relation.RotationPitch == null && relation.ScaleX == null)
+        if (link.LocationX == null && link.RotationPitch == null && link.ScaleX == null)
             return null;
 
         return new
         {
-            location = new[] { relation.LocationX ?? 0, relation.LocationY ?? 0, relation.LocationZ ?? 0 },
-            rotation = new[] { relation.RotationPitch ?? 0, relation.RotationYaw ?? 0, relation.RotationRoll ?? 0 },
-            scale = new[] { relation.ScaleX ?? 1, relation.ScaleY ?? 1, relation.ScaleZ ?? 1 },
+            location = new[] { link.LocationX ?? 0, link.LocationY ?? 0, link.LocationZ ?? 0 },
+            rotation = new[] { link.RotationPitch ?? 0, link.RotationYaw ?? 0, link.RotationRoll ?? 0 },
+            scale = new[] { link.ScaleX ?? 1, link.ScaleY ?? 1, link.ScaleZ ?? 1 },
         };
     }
 
@@ -3114,7 +3164,7 @@ internal static class UELibraryPostProcessor
                             x.ComponentVariableName,
                             x.ParentComponentPath,
                             x.SocketName,
-                            x.Transform,
+                            transform = BuildTransformObject(x),
                         })
                         .ToArray(),
                     models = group
@@ -6714,7 +6764,15 @@ internal static class UELibraryPostProcessor
                 match_reason TEXT,
                 socket_name TEXT,
                 parent_component_path TEXT,
-                transform_json TEXT,
+                location_x REAL,
+                location_y REAL,
+                location_z REAL,
+                rotation_pitch REAL,
+                rotation_yaw REAL,
+                rotation_roll REAL,
+                scale_x REAL,
+                scale_y REAL,
+                scale_z REAL,
                 source_path TEXT
             );
             """);
@@ -7808,13 +7866,21 @@ internal static class UELibraryPostProcessor
                 owner_object_path, owner_type, component_object_path, component_type,
                 component_name, component_variable_name, relation_source, relation_type,
                 target_path, target_name, target_asset_name, target_asset_kind, target_asset_output,
-                match_status, match_reason, socket_name, parent_component_path, transform_json, source_path
+                match_status, match_reason, socket_name, parent_component_path,
+                location_x, location_y, location_z,
+                rotation_pitch, rotation_yaw, rotation_roll,
+                scale_x, scale_y, scale_z,
+                source_path
             )
             VALUES (
                 $ownerObjectPath, $ownerType, $componentObjectPath, $componentType,
                 $componentName, $componentVariableName, $relationSource, $relationType,
                 $targetPath, $targetName, $targetAssetName, $targetAssetKind, $targetAssetOutput,
-                $matchStatus, $matchReason, $socketName, $parentComponentPath, $transformJson, $sourcePath
+                $matchStatus, $matchReason, $socketName, $parentComponentPath,
+                $locationX, $locationY, $locationZ,
+                $rotationPitch, $rotationYaw, $rotationRoll,
+                $scaleX, $scaleY, $scaleZ,
+                $sourcePath
             );
             """;
         Add(command, "$ownerObjectPath", link.OwnerObjectPath);
@@ -7834,7 +7900,15 @@ internal static class UELibraryPostProcessor
         Add(command, "$matchReason", link.MatchReason);
         Add(command, "$socketName", link.SocketName);
         Add(command, "$parentComponentPath", link.ParentComponentPath);
-        Add(command, "$transformJson", link.Transform == null ? null : JsonConvert.SerializeObject(link.Transform));
+        Add(command, "$locationX", link.LocationX);
+        Add(command, "$locationY", link.LocationY);
+        Add(command, "$locationZ", link.LocationZ);
+        Add(command, "$rotationPitch", link.RotationPitch);
+        Add(command, "$rotationYaw", link.RotationYaw);
+        Add(command, "$rotationRoll", link.RotationRoll);
+        Add(command, "$scaleX", link.ScaleX);
+        Add(command, "$scaleY", link.ScaleY);
+        Add(command, "$scaleZ", link.ScaleZ);
         Add(command, "$sourcePath", link.SourcePath);
         command.ExecuteNonQuery();
     }
@@ -7889,7 +7963,11 @@ internal static class UELibraryPostProcessor
             SELECT owner_object_path, owner_type, component_object_path, component_type,
                    component_name, component_variable_name, relation_source, relation_type,
                    target_path, target_name, target_asset_name, target_asset_kind, target_asset_output,
-                   match_status, match_reason, socket_name, parent_component_path, transform_json, source_path
+                   match_status, match_reason, socket_name, parent_component_path,
+                   location_x, location_y, location_z,
+                   rotation_pitch, rotation_yaw, rotation_roll,
+                   scale_x, scale_y, scale_z,
+                   source_path
             FROM component_asset_relations
             ORDER BY id;
             """;
@@ -7926,7 +8004,15 @@ internal static class UELibraryPostProcessor
             MatchReason = (string?)row["MatchReason"] ?? (string?)row["matchReason"],
             SocketName = (string?)row["SocketName"] ?? (string?)row["socketName"],
             ParentComponentPath = (string?)row["ParentComponentPath"] ?? (string?)row["parentComponentPath"],
-            Transform = row["transform"]?.ToObject<object>(),
+            LocationX = GetComponentTransformDouble(row, "LocationX", "locationX", "location_x", "location", 0),
+            LocationY = GetComponentTransformDouble(row, "LocationY", "locationY", "location_y", "location", 1),
+            LocationZ = GetComponentTransformDouble(row, "LocationZ", "locationZ", "location_z", "location", 2),
+            RotationPitch = GetComponentTransformDouble(row, "RotationPitch", "rotationPitch", "rotation_pitch", "rotation", 0),
+            RotationYaw = GetComponentTransformDouble(row, "RotationYaw", "rotationYaw", "rotation_yaw", "rotation", 1),
+            RotationRoll = GetComponentTransformDouble(row, "RotationRoll", "rotationRoll", "rotation_roll", "rotation", 2),
+            ScaleX = GetComponentTransformDouble(row, "ScaleX", "scaleX", "scale_x", "scale", 0),
+            ScaleY = GetComponentTransformDouble(row, "ScaleY", "scaleY", "scale_y", "scale", 1),
+            ScaleZ = GetComponentTransformDouble(row, "ScaleZ", "scaleZ", "scale_z", "scale", 2),
         };
 
     private static ComponentAssetRelationLink ReadComponentAssetRelationLink(SqliteDataReader reader)
@@ -7949,8 +8035,16 @@ internal static class UELibraryPostProcessor
             MatchReason = GetString(reader, 14),
             SocketName = GetString(reader, 15),
             ParentComponentPath = GetString(reader, 16),
-            Transform = TryParseJson(GetString(reader, 17)),
-            SourcePath = GetString(reader, 18),
+            LocationX = GetNullableDouble(reader, 17),
+            LocationY = GetNullableDouble(reader, 18),
+            LocationZ = GetNullableDouble(reader, 19),
+            RotationPitch = GetNullableDouble(reader, 20),
+            RotationYaw = GetNullableDouble(reader, 21),
+            RotationRoll = GetNullableDouble(reader, 22),
+            ScaleX = GetNullableDouble(reader, 23),
+            ScaleY = GetNullableDouble(reader, 24),
+            ScaleZ = GetNullableDouble(reader, 25),
+            SourcePath = GetString(reader, 26),
         };
 
     private static void InsertComponentGroups(
@@ -9664,7 +9758,15 @@ internal static class UELibraryPostProcessor
         public string? MatchReason { get; set; }
         public string? SocketName { get; set; }
         public string? ParentComponentPath { get; set; }
-        public object? Transform { get; set; }
+        public double? LocationX { get; set; }
+        public double? LocationY { get; set; }
+        public double? LocationZ { get; set; }
+        public double? RotationPitch { get; set; }
+        public double? RotationYaw { get; set; }
+        public double? RotationRoll { get; set; }
+        public double? ScaleX { get; set; }
+        public double? ScaleY { get; set; }
+        public double? ScaleZ { get; set; }
     }
 
     private sealed class ComponentGroupRow

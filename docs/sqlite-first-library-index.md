@@ -54,6 +54,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 - Postprocess should prefer `export_events.db` over JSONL for export-time rows.
 - Full component relations must be streamed into SQLite; do not materialize millions of relation rows only to build convenience summaries.
 - Large nested JSON summaries are optional. If they would duplicate large SQLite tables, write a small human-readable summary and point to the SQLite table.
+- Component relation transforms are structured columns in `component_asset_relations`: `location_x/y/z`, `rotation_pitch/yaw/roll` and `scale_x/y/z`. They come from deterministic UE component data and should not be stored as a nested JSON blob in the SQLite path.
 
 ## Large-library memory controls
 
@@ -88,7 +89,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - `--materialize-animation-metadata` updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` by default; `.ueanim.metadata.json`, `asset_catalog.jsonl` and `animation_bindings.jsonl` are only written or updated when `--compat-json` is explicitly requested.
 - Model validation cache now writes to `library_work.db.model_validation_cache`. Old per-model `.ue_model_validation_cache.json` files are read once for compatibility and migrated into SQLite, then deleted when possible.
 - Material sidecar summaries now write to `library_work.db.material_sidecars` and synchronize to `library_index.db.material_sidecars`; new postprocess runs prefer export-event Material rows over recursive `*.json` scans.
-- Postprocess can now stream full component relations to `library_work.db` and skips `component_asset_relations.jsonl` by default.
+- Postprocess can now stream full component relations to `library_work.db` and skips `component_asset_relations.jsonl` by default. Component transforms are stored as explicit location/rotation/scale numeric columns in both `library_work.db.component_asset_relations` and `library_index.db.component_asset_relations`.
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skips their JSONL views by default.
 - Texture dedupe summary now writes to `library_work.db.library_reports(name='texture_dedupe')` and syncs to `library_index.db.library_reports`; `texture_dedupe_summary.json` is only an explicitly requested debug view.
 - Standalone shared-texture dedupe now honors the SQLite-first defaults from export configs instead of always writing JSONL/JSON.
