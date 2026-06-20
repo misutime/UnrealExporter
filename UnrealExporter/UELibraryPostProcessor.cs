@@ -6889,7 +6889,69 @@ internal static class UELibraryPostProcessor
                 animation_count INTEGER NOT NULL,
                 bone_count INTEGER NOT NULL,
                 source_object_count INTEGER NOT NULL,
-                raw_json TEXT NOT NULL
+                relation_basis TEXT,
+                source_index_available INTEGER NOT NULL,
+                bone_names_truncated INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE skeleton_group_paths (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_group_id INTEGER NOT NULL,
+                path_index INTEGER NOT NULL,
+                skeleton_path TEXT NOT NULL,
+                FOREIGN KEY (skeleton_group_id) REFERENCES skeleton_groups(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE skeleton_group_source_objects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_group_id INTEGER NOT NULL,
+                source_index INTEGER NOT NULL,
+                source_path TEXT,
+                owner_object_path TEXT,
+                owner_type TEXT,
+                bone_count INTEGER NOT NULL,
+                FOREIGN KEY (skeleton_group_id) REFERENCES skeleton_groups(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE skeleton_group_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_group_id INTEGER NOT NULL,
+                model_index INTEGER NOT NULL,
+                name TEXT,
+                output TEXT,
+                resource_kind TEXT,
+                source TEXT,
+                object_path TEXT,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                FOREIGN KEY (skeleton_group_id) REFERENCES skeleton_groups(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE skeleton_group_animations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_group_id INTEGER NOT NULL,
+                animation_index INTEGER NOT NULL,
+                name TEXT,
+                source TEXT,
+                output TEXT,
+                status TEXT,
+                duration REAL,
+                frame_count INTEGER,
+                track_count INTEGER,
+                FOREIGN KEY (skeleton_group_id) REFERENCES skeleton_groups(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE skeleton_group_bone_names (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skeleton_group_id INTEGER NOT NULL,
+                bone_index INTEGER NOT NULL,
+                bone_name TEXT NOT NULL,
+                FOREIGN KEY (skeleton_group_id) REFERENCES skeleton_groups(id)
             );
             """);
         Execute(connection, transaction, """
@@ -7091,6 +7153,11 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_anim_blueprint_refs_animation ON anim_blueprint_animation_refs(referenced_animation_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_path ON skeleton_groups(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_skeleton_groups_counts ON skeleton_groups(model_count, animation_count);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_group_paths_path ON skeleton_group_paths(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_group_source_objects_owner ON skeleton_group_source_objects(owner_object_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_group_models_output ON skeleton_group_models(output);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_group_animations_output ON skeleton_group_animations(output);");
+        Execute(connection, transaction, "CREATE INDEX idx_skeleton_group_bone_names_name ON skeleton_group_bone_names(bone_name);");
         Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_usage ON relation_animations(usage_evidence, is_explicit_usage, is_skeleton_compatible);");
@@ -8235,12 +8302,15 @@ internal static class UELibraryPostProcessor
             command.CommandText = """
                 INSERT INTO skeleton_groups (
                     skeleton_id, skeleton_path, skeleton_name,
-                    model_count, animation_count, bone_count, source_object_count, raw_json
+                    model_count, animation_count, bone_count, source_object_count,
+                    relation_basis, source_index_available, bone_names_truncated
                 )
                 VALUES (
                     $skeletonId, $skeletonPath, $skeletonName,
-                    $modelCount, $animationCount, $boneCount, $sourceObjectCount, $rawJson
+                    $modelCount, $animationCount, $boneCount, $sourceObjectCount,
+                    $relationBasis, $sourceIndexAvailable, $boneNamesTruncated
                 );
+                SELECT last_insert_rowid();
                 """;
             Add(command, "$skeletonId", (string?)token["skeletonId"] ?? "");
             Add(command, "$skeletonPath", (string?)token["skeletonPath"]);
@@ -8249,7 +8319,144 @@ internal static class UELibraryPostProcessor
             Add(command, "$animationCount", (int?)token["animationCount"] ?? 0);
             Add(command, "$boneCount", (int?)token["boneCount"] ?? 0);
             Add(command, "$sourceObjectCount", token["skeletonSourceObjects"] is JArray sources ? sources.Count : 0);
-            Add(command, "$rawJson", token.ToString(Formatting.None));
+            Add(command, "$relationBasis", (string?)token["relationBasis"]);
+            Add(command, "$sourceIndexAvailable", ((bool?)token["sourceIndexAvailable"] ?? false) ? 1 : 0);
+            Add(command, "$boneNamesTruncated", ((bool?)token["boneNamesTruncated"] ?? false) ? 1 : 0);
+            var skeletonGroupId = (long)command.ExecuteScalar()!;
+
+            InsertSkeletonGroupPaths(connection, transaction, skeletonGroupId, (JArray?)token["skeletonPaths"]);
+            InsertSkeletonGroupSourceObjects(connection, transaction, skeletonGroupId, (JArray?)token["skeletonSourceObjects"]);
+            InsertSkeletonGroupModels(connection, transaction, skeletonGroupId, (JArray?)token["models"]);
+            InsertSkeletonGroupAnimations(connection, transaction, skeletonGroupId, (JArray?)token["animations"]);
+            InsertSkeletonGroupBoneNames(connection, transaction, skeletonGroupId, (JArray?)token["boneNames"]);
+        }
+    }
+
+    private static void InsertSkeletonGroupPaths(SqliteConnection connection, SqliteTransaction transaction, long skeletonGroupId, JArray? paths)
+    {
+        var index = 0;
+        foreach (var token in paths ?? [])
+        {
+            var path = (string?)token;
+            if (string.IsNullOrWhiteSpace(path))
+                continue;
+
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_group_paths (skeleton_group_id, path_index, skeleton_path)
+                VALUES ($skeletonGroupId, $pathIndex, $skeletonPath);
+                """;
+            Add(command, "$skeletonGroupId", skeletonGroupId);
+            Add(command, "$pathIndex", index++);
+            Add(command, "$skeletonPath", path);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertSkeletonGroupSourceObjects(SqliteConnection connection, SqliteTransaction transaction, long skeletonGroupId, JArray? sources)
+    {
+        var index = 0;
+        foreach (var source in (sources ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_group_source_objects (
+                    skeleton_group_id, source_index, source_path, owner_object_path, owner_type, bone_count
+                )
+                VALUES (
+                    $skeletonGroupId, $sourceIndex, $sourcePath, $ownerObjectPath, $ownerType, $boneCount
+                );
+                """;
+            Add(command, "$skeletonGroupId", skeletonGroupId);
+            Add(command, "$sourceIndex", index++);
+            Add(command, "$sourcePath", (string?)source["sourcePath"]);
+            Add(command, "$ownerObjectPath", (string?)source["ownerObjectPath"]);
+            Add(command, "$ownerType", (string?)source["ownerType"]);
+            Add(command, "$boneCount", (int?)source["boneCount"] ?? 0);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertSkeletonGroupModels(SqliteConnection connection, SqliteTransaction transaction, long skeletonGroupId, JArray? models)
+    {
+        var index = 0;
+        foreach (var model in (models ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_group_models (
+                    skeleton_group_id, model_index, name, output, resource_kind,
+                    source, object_path, skeleton_path, skeleton_name
+                )
+                VALUES (
+                    $skeletonGroupId, $modelIndex, $name, $output, $resourceKind,
+                    $source, $objectPath, $skeletonPath, $skeletonName
+                );
+                """;
+            Add(command, "$skeletonGroupId", skeletonGroupId);
+            Add(command, "$modelIndex", index++);
+            Add(command, "$name", (string?)model["name"]);
+            Add(command, "$output", (string?)model["output"]);
+            Add(command, "$resourceKind", (string?)model["resourceKind"]);
+            Add(command, "$source", (string?)model["source"]);
+            Add(command, "$objectPath", (string?)model["objectPath"]);
+            Add(command, "$skeletonPath", (string?)model["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)model["skeletonName"]);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertSkeletonGroupAnimations(SqliteConnection connection, SqliteTransaction transaction, long skeletonGroupId, JArray? animations)
+    {
+        var index = 0;
+        foreach (var animation in (animations ?? []).OfType<JObject>())
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_group_animations (
+                    skeleton_group_id, animation_index, name, source, output,
+                    status, duration, frame_count, track_count
+                )
+                VALUES (
+                    $skeletonGroupId, $animationIndex, $name, $source, $output,
+                    $status, $duration, $frameCount, $trackCount
+                );
+                """;
+            Add(command, "$skeletonGroupId", skeletonGroupId);
+            Add(command, "$animationIndex", index++);
+            Add(command, "$name", (string?)animation["name"]);
+            Add(command, "$source", (string?)animation["source"]);
+            Add(command, "$output", (string?)animation["output"]);
+            Add(command, "$status", (string?)animation["status"]);
+            Add(command, "$duration", (double?)animation["duration"]);
+            Add(command, "$frameCount", (int?)animation["frameCount"]);
+            Add(command, "$trackCount", (int?)animation["trackCount"]);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertSkeletonGroupBoneNames(SqliteConnection connection, SqliteTransaction transaction, long skeletonGroupId, JArray? boneNames)
+    {
+        var index = 0;
+        foreach (var token in boneNames ?? [])
+        {
+            var boneName = (string?)token;
+            if (string.IsNullOrWhiteSpace(boneName))
+                continue;
+
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO skeleton_group_bone_names (skeleton_group_id, bone_index, bone_name)
+                VALUES ($skeletonGroupId, $boneIndex, $boneName);
+                """;
+            Add(command, "$skeletonGroupId", skeletonGroupId);
+            Add(command, "$boneIndex", index++);
+            Add(command, "$boneName", boneName);
             command.ExecuteNonQuery();
         }
     }
