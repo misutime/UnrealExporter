@@ -113,7 +113,6 @@ internal static class UeLibraryIndexReader
         var hasConfidenceTier = HasColumn(connection, "relation_animations", "confidence_tier");
         var hasRelationshipKind = HasColumn(connection, "relation_animations", "relationship_kind");
         var hasRecommendedUse = HasColumn(connection, "relation_animations", "recommended_use");
-        var hasEvidenceChain = HasColumn(connection, "relation_animations", "evidence_chain_json");
         var hasDeterministicUsage = HasColumn(connection, "relation_animations", "is_deterministic_usage");
         var hasCompatibilityCandidate = HasColumn(connection, "relation_animations", "is_compatibility_candidate");
         var usageEvidenceSelect = hasUsageEvidence
@@ -171,7 +170,6 @@ internal static class UeLibraryIndexReader
             END
             """;
         var recommendedUseSelect = hasRecommendedUse ? "ra.recommended_use" : recommendedUseFallback;
-        var evidenceChainSelect = hasEvidenceChain ? "ra.evidence_chain_json" : "''";
         var deterministicUsageSelect = hasDeterministicUsage
             ? "ra.is_deterministic_usage"
             : "CASE WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 1 ELSE 0 END";
@@ -193,7 +191,7 @@ internal static class UeLibraryIndexReader
                    {confidenceTierSelect},
                    {relationshipKindSelect},
                    {recommendedUseSelect},
-                   {evidenceChainSelect},
+                   COALESCE(ra.evidence_summary, ''),
                    {deterministicUsageSelect},
                    {compatibilityCandidateSelect},
                    ra.validation_status,
@@ -242,7 +240,7 @@ internal static class UeLibraryIndexReader
                 ConfidenceTier = ReadString(reader, 9) ?? "",
                 RelationshipKind = ReadString(reader, 10) ?? "",
                 RecommendedUse = ReadString(reader, 11) ?? "",
-                EvidenceChainJson = ReadString(reader, 12) ?? "",
+                EvidenceSummary = ReadString(reader, 12) ?? "",
                 IsDeterministicUsage = ReadBool(reader, 13),
                 IsCompatibilityCandidate = ReadBool(reader, 14),
                 ValidationStatus = ReadString(reader, 15) ?? "",

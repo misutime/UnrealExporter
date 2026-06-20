@@ -11,7 +11,7 @@ internal sealed class UeLibraryAnimation
     public string ConfidenceTier { get; init; } = "";
     public string RelationshipKind { get; init; } = "";
     public string RecommendedUse { get; init; } = "";
-    public string EvidenceChainJson { get; init; } = "";
+    public string EvidenceSummary { get; init; } = "";
     public bool IsExplicitUsage { get; init; }
     public bool IsSkeletonCompatible { get; init; }
     public bool IsDeterministicUsage { get; init; }

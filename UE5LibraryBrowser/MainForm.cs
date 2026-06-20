@@ -566,7 +566,7 @@ internal sealed class MainForm : Form
            Relationship kind: {animation.RelationshipKind}
            Confidence tier: {animation.ConfidenceTier}
            Evidence: {DisplayUsageEvidence(animation)} ({animation.UsageEvidence})
-           Evidence chain: {animation.EvidenceChainJson}
+           Evidence chain: {animation.EvidenceSummary}
            Deterministic usage: {animation.IsDeterministicUsage}
            Compatibility candidate: {animation.IsCompatibilityCandidate}
            Explicit usage: {animation.IsExplicitUsage}

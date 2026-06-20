@@ -6793,7 +6793,7 @@ internal static class UELibraryPostProcessor
                 confidence_tier TEXT,
                 relationship_kind TEXT,
                 recommended_use TEXT,
-                evidence_chain_json TEXT NOT NULL,
+                evidence_summary TEXT NOT NULL,
                 is_deterministic_usage INTEGER NOT NULL,
                 is_compatibility_candidate INTEGER NOT NULL,
                 segment_count INTEGER NOT NULL,
@@ -6803,6 +6803,15 @@ internal static class UELibraryPostProcessor
                 section_count INTEGER NOT NULL,
                 raw_json TEXT NOT NULL,
                 FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                step_index INTEGER NOT NULL,
+                evidence_step TEXT NOT NULL,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
             );
             """);
         Execute(connection, transaction, """
@@ -6944,6 +6953,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_usage ON relation_animations(usage_evidence, is_explicit_usage, is_skeleton_compatible);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_confidence ON relation_animations(confidence_tier, is_deterministic_usage, is_compatibility_candidate);");
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_recommended ON relation_animations(relationship_kind, recommended_use);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_evidence_animation ON relation_animation_evidence(relation_animation_id, step_index);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
         Execute(connection, transaction, "CREATE INDEX idx_library_reports_name ON library_reports(name, status);");
@@ -8002,7 +8012,7 @@ internal static class UELibraryPostProcessor
                 relation_id, name, source, output, status, duration, frame_count, track_count,
                 relation_source, usage_evidence, is_explicit_usage, is_skeleton_compatible,
                 validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
-                is_usable_candidate, confidence_tier, relationship_kind, recommended_use, evidence_chain_json, is_deterministic_usage, is_compatibility_candidate,
+                is_usable_candidate, confidence_tier, relationship_kind, recommended_use, evidence_summary, is_deterministic_usage, is_compatibility_candidate,
                 segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count, raw_json
             )
@@ -8010,7 +8020,7 @@ internal static class UELibraryPostProcessor
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
                 $relationSource, $usageEvidence, $isExplicitUsage, $isSkeletonCompatible,
                 $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
-                $isUsableCandidate, $confidenceTier, $relationshipKind, $recommendedUse, $evidenceChainJson, $isDeterministicUsage, $isCompatibilityCandidate,
+                $isUsableCandidate, $confidenceTier, $relationshipKind, $recommendedUse, $evidenceSummary, $isDeterministicUsage, $isCompatibilityCandidate,
                 $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount, $rawJson
             );
@@ -8037,7 +8047,8 @@ internal static class UELibraryPostProcessor
         Add(command, "$confidenceTier", (string?)animation["confidenceTier"]);
         Add(command, "$relationshipKind", (string?)animation["relationshipKind"]);
         Add(command, "$recommendedUse", (string?)animation["recommendedUse"]);
-        Add(command, "$evidenceChainJson", animation["evidenceChain"]?.ToString(Formatting.None) ?? "[]");
+        var evidenceSteps = ReadEvidenceSteps(animation["evidenceChain"]);
+        Add(command, "$evidenceSummary", BuildEvidenceSummary(evidenceSteps));
         Add(command, "$isDeterministicUsage", ((bool?)animation["isDeterministicUsage"] ?? false) ? 1 : 0);
         Add(command, "$isCompatibilityCandidate", ((bool?)animation["isCompatibilityCandidate"] ?? false) ? 1 : 0);
         Add(command, "$segmentCount", (int?)animation["segmentCount"] ?? 0);
@@ -8047,6 +8058,62 @@ internal static class UELibraryPostProcessor
         Add(command, "$sectionCount", (int?)animation["sectionCount"] ?? 0);
         Add(command, "$rawJson", animation.ToString(Formatting.None));
         command.ExecuteNonQuery();
+        var animationId = GetLastInsertRowId(connection, transaction);
+        InsertRelationAnimationEvidence(connection, transaction, animationId, evidenceSteps);
+    }
+
+    private static string[] ReadEvidenceSteps(JToken? evidenceChain)
+    {
+        if (evidenceChain is not JArray array)
+            return [];
+
+        return array
+            .Select(x => (string?)x)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToArray();
+    }
+
+    private static string BuildEvidenceSummary(string[] evidenceSteps)
+        => evidenceSteps.Length == 0 ? "" : string.Join(" -> ", evidenceSteps);
+
+    private static long GetLastInsertRowId(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT last_insert_rowid();";
+        return (long)(command.ExecuteScalar() ?? 0L);
+    }
+
+    private static void InsertRelationAnimationEvidence(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long relationAnimationId,
+        string[] evidenceSteps)
+    {
+        if (relationAnimationId <= 0 || evidenceSteps.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO relation_animation_evidence (
+                relation_animation_id, step_index, evidence_step
+            )
+            VALUES (
+                $relationAnimationId, $stepIndex, $evidenceStep
+            );
+            """;
+        var idParam = command.Parameters.Add("$relationAnimationId", SqliteType.Integer);
+        var indexParam = command.Parameters.Add("$stepIndex", SqliteType.Integer);
+        var stepParam = command.Parameters.Add("$evidenceStep", SqliteType.Text);
+        idParam.Value = relationAnimationId;
+        for (var i = 0; i < evidenceSteps.Length; i++)
+        {
+            indexParam.Value = i;
+            stepParam.Value = evidenceSteps[i];
+            command.ExecuteNonQuery();
+        }
     }
 
     private static void InsertAnimationValidation(
@@ -8633,7 +8700,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `confidence_tier` / `confidenceTier` | 关系最高置信层级，例如 `ExplicitComponent`、`AnimBlueprintDirect`、`CharacterDataSet`、`UniqueSkeletonCompatible`、`SharedSkeletonCompatible`。 |");
         sb.AppendLine("| `relationship_kind` / `relationshipKind` | 关系大类：`deterministicUsage`、`contextualUsage`、`compatibilityCandidate`、`unknown`。 |");
         sb.AppendLine("| `recommended_use` / `recommendedUse` | 默认推荐状态：`defaultTrusted`、`compatibleCandidate`、`manualReview`、`compatibleNeedsReview`、`notUsable`。 |");
-        sb.AppendLine("| `evidence_chain_json` / `evidenceChain` | 证据链，说明关系来自组件、AnimBP、DataAsset、同 Skeleton、track 验证等哪几步。 |");
+        sb.AppendLine("| `evidence_summary` | 证据链的简短文本摘要，供 UI 列表和详情直接显示。 |");
+        sb.AppendLine("| `relation_animation_evidence` | 证据链明细表，按 `step_index` 保存组件、AnimBP、DataAsset、同 Skeleton、track 验证等确定性步骤。 |");
         sb.AppendLine("| `usage_evidence` / `usageEvidence` | 兼容旧报告的粗粒度证据字段，新 UI 不应只靠它判断可信度。 |");
         sb.AppendLine("| `is_deterministic_usage` / `isDeterministicUsage` | 是否来自确定性使用或强上下文证据。 |");
         sb.AppendLine("| `is_compatibility_candidate` / `isCompatibilityCandidate` | 是否只是同 Skeleton/唯一 Skeleton 兼容候选。 |");

@@ -36,7 +36,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Task model quality | `library_index.db.model_coverage` columns `is_task_or_prop`, `needs_review`, `relation_needs_review`, `review_reasons_json` and `relation_review_reasons_json` | `task_model_quality.json` is a compatibility/debug view |
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
 | Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
-| Browser model/animation list | `library_index.db.model_animation_relations` and `library_index.db.relation_animations` | Browser must not depend on `model_animations.json` |
+| Browser model/animation list | `library_index.db.model_animation_relations`, `library_index.db.relation_animations` and `library_index.db.relation_animation_evidence` | Browser must not depend on `model_animations.json`; animation evidence lists use `evidence_summary` for display and `relation_animation_evidence` for ordered steps |
 | Animation preview validation | `preview_validation.db.preview_validation_reports` in the preview cache/output directory | `preview_validation.json` is only a manually requested debug view when `--report` is used |
 | Library health and acceptance reports | `library_index.db.library_reports` | `library_health.json` and `library_acceptance.json` are compatibility/human-inspection views |
 | Human reports | `library_index.db` for queries, JSON for readable summaries | JSON remains acceptable |
@@ -78,6 +78,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 
 - `UE5LibraryBrowser` already requires `library_index.db`.
 - `UE5LibraryBrowser` model list queries read explicit SQLite columns and validation tables; it no longer falls back to `json_extract(assets.raw_json, ...)` for model metadata.
+- `UE5LibraryBrowser` animation details read `relation_animations.evidence_summary`; ordered evidence steps live in `relation_animation_evidence`, so the UI/runtime path no longer parses an evidence-chain JSON blob.
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
 - `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.

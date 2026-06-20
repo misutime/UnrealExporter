@@ -153,11 +153,11 @@ CREATE TABLE asset_registry_dependencies (
 
 ## 推荐的置信度模型
 
-建议不要继续用单一 `explicitUsage` / `skeletonCompatibility` 表达全部关系，而是增加 `confidenceTier` 和 `evidenceChain`。
+建议不要继续用单一 `explicitUsage` / `skeletonCompatibility` 表达全部关系，而是增加 `confidence_tier`、`evidence_summary` 和 `relation_animation_evidence`。
 
 ### 字段语义
 
-`model_animations.json.relations[].animations[]` 和 `library_index.db.relation_animations` 会保留一组兼容旧报告、同时支持新置信度分层的字段。团队后续写 UI、过滤器、验收脚本时应优先使用新字段，旧字段只用于兼容和粗略统计。
+`library_index.db.relation_animations` 和 `library_index.db.relation_animation_evidence` 会保留一组支持新置信度分层的字段。团队后续写 UI、过滤器、验收脚本时应优先使用 SQLite 字段和子表；旧 JSON 报告只用于人工阅读或调试，不作为新工具的机器接口。
 
 #### 推荐优先使用字段
 
@@ -175,21 +175,19 @@ CREATE TABLE asset_registry_dependencies (
   - `SharedSkeletonCompatible`：多个模型共享同 Skeleton，同 Skeleton 动画通过验证；只能算兼容候选。
   - `Unknown` / `RelatedButNotUsable` / `NoMatchingAnimationExported`：证据不足或没有可用动画。
 
-`evidenceChain`
+`evidence_summary` / `relation_animation_evidence`
 
-- JSON 字段名：`evidenceChain`
-- SQLite 字段名：`evidence_chain_json`
-- 作用：列出该关系实际使用的证据链，便于团队和 UI 展示“为什么这条关系可信”。
-- 示例：
+- SQLite 摘要字段：`relation_animations.evidence_summary`
+- SQLite 明细表：`relation_animation_evidence(relation_animation_id, step_index, evidence_step)`
+- 作用：列出该关系实际使用的证据链，便于团队和 UI 展示“为什么这条关系可信”。UI 列表和详情可直接读 `evidence_summary`；验收脚本、调试工具需要完整顺序时应按 `step_index` 查询 `relation_animation_evidence`。
+- 示例证据步骤：
 
-```json
-[
-  "AnimBlueprintGeneratedClass.TargetSkeleton",
-  "matchedModelSkeleton",
-  "anim_blueprint_animation_refs",
-  "sameUSkeleton",
-  "trackValidation"
-]
+```text
+AnimBlueprintGeneratedClass.TargetSkeleton
+matchedModelSkeleton
+anim_blueprint_animation_refs
+sameUSkeleton
+trackValidation
 ```
 
 `isDeterministicUsage`
@@ -331,7 +329,8 @@ ORDER BY relationship_kind, recommended_use, confidence_tier;
 当前关键 SQLite 表：
 
 - `assets`：素材总目录，合并模型、贴图、材质、动画等导出资产。
-- `relation_animations`：模型与动画的逐条关系明细，包含 `confidence_tier`、`relationship_kind`、`recommended_use`、`evidence_chain_json`、验证状态和完整 `raw_json`。
+- `relation_animations`：模型与动画的逐条关系明细，包含 `confidence_tier`、`relationship_kind`、`recommended_use`、`evidence_summary`、验证状态和调试用 `raw_json`。
+- `relation_animation_evidence`：模型动画关系的有序证据链明细，按 `relation_animation_id` + `step_index` 保存，替代旧的证据链 JSON 数组机器读取路径。
 - `model_animation_relations`：模型维度的关系摘要和数量统计。
 - `animation_validation`：动画与模型配对的结构验证结果。
 - `export_manifest`：由 `export_manifest.jsonl` 导入，记录每个输出文件来自哪个 UE 包、对象和导出类型。
@@ -493,11 +492,12 @@ CREATE TABLE anim_blueprint_animation_refs (
 
 实现要点：
 
-1. `model_animations.json` 增加：
-   - `confidenceTier`
-   - `relationshipKind`
-   - `recommendedUse`
-   - `evidenceChain`
+1. `library_index.db` 增加：
+   - `relation_animations.confidence_tier`
+   - `relation_animations.relationship_kind`
+   - `relation_animations.recommended_use`
+   - `relation_animations.evidence_summary`
+   - `relation_animation_evidence`
    - `dependencyCategories`
    - `negativeEvidence`
    - `requiresManualReview`

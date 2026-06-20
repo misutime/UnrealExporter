@@ -37,10 +37,10 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 5. 模型动画关系
    - `model_animations.json` 按 UE Skeleton、组件引用、AnimBlueprint、DataAsset/AssetRegistry 等确定性或结构兼容证据建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section、子动画引用和子动画导出完整度，不能只报一个无 track 的 warning。
-   - 每条动画关系必须区分确定性使用关系和兼容候选：`confidenceTier` / `library_index.db.relation_animations.confidence_tier` 表示最高关系等级，`evidenceChain` / `evidence_chain_json` 记录证据链，`isDeterministicUsage` / `is_deterministic_usage` 表示是否来自确定性使用或强上下文证据，`isCompatibilityCandidate` / `is_compatibility_candidate` 表示只是同 Skeleton 可复用候选。
+   - 每条动画关系必须区分确定性使用关系和兼容候选：`confidenceTier` / `library_index.db.relation_animations.confidence_tier` 表示最高关系等级，`library_index.db.relation_animations.evidence_summary` 提供 UI 可读摘要，`library_index.db.relation_animation_evidence` 按步骤记录完整证据链，`isDeterministicUsage` / `is_deterministic_usage` 表示是否来自确定性使用或强上下文证据，`isCompatibilityCandidate` / `is_compatibility_candidate` 表示只是同 Skeleton 可复用候选。
    - `relationshipKind` / `relationship_kind` 是 UI 和查询脚本优先使用的关系大类，当前取值为 `deterministicUsage`、`contextualUsage`、`compatibilityCandidate`、`unknown`。
    - `recommendedUse` / `recommended_use` 是默认筛选推荐状态，当前取值为 `defaultTrusted`、`compatibleCandidate`、`manualReview`、`compatibleNeedsReview`、`notUsable`。浏览器默认可信动画列表应使用 `recommendedUse=defaultTrusted`，兼容候选应单独显示，不能和确定使用动画混成一个总数。
-   - 旧字段 `usageEvidence`、`isExplicitUsage`、`isSkeletonCompatible` 仅用于兼容和粗略统计。AnimBP/DataAsset 等新增强证据可能 `isExplicitUsage=false` 但 `isDeterministicUsage=true`；团队后续 UI 和验收脚本应优先看 `recommendedUse`、`relationshipKind`、`confidenceTier` 与 `evidenceChain`。
+   - 旧字段 `usageEvidence`、`isExplicitUsage`、`isSkeletonCompatible` 仅用于兼容和粗略统计。AnimBP/DataAsset 等新增强证据可能 `isExplicitUsage=false` 但 `isDeterministicUsage=true`；团队后续 UI 和验收脚本应优先看 `recommendedUse`、`relationshipKind`、`confidenceTier`、`evidence_summary` 与 `relation_animation_evidence`。
    - 未匹配时保留 `NoMatchingAnimationExported`，不硬猜。
    - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 
