@@ -154,14 +154,17 @@ public class UnrealExporter
         if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             Console.WriteLine("ERROR: --postprocess-library requires an exported library root path.");
-            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures]");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures] [--sqlite-only-index]");
             return true;
         }
 
         // 后处理只读取已导出的 GLB/JSON/PNG，不需要重新挂载 pak。
         var root = args[1];
         var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
-        UELibraryPostProcessor.Run(root, dedupeTextures);
+        var writeCompatibilityJson = !args.Any(x =>
+            x.Equals("--sqlite-only-index", StringComparison.OrdinalIgnoreCase) ||
+            x.Equals("--no-compat-json", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.Run(root, dedupeTextures, writeCompatibilityJson);
         return true;
     }
 

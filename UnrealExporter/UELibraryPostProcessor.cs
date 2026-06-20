@@ -17,7 +17,7 @@ internal static class UELibraryPostProcessor
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 
-    public static void Run(string libraryRoot, bool dedupeTextures)
+    public static void Run(string libraryRoot, bool dedupeTextures, bool writeCompatibilityJson = true)
     {
         if (string.IsNullOrWhiteSpace(libraryRoot))
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
@@ -27,6 +27,7 @@ internal static class UELibraryPostProcessor
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
         Console.WriteLine($"UE Library postprocess root: {root}");
+        Console.WriteLine($"Compatibility JSON/JSONL outputs: {(writeCompatibilityJson ? "enabled" : "disabled")}");
         var modelFiles = new[] { "*.glb", "*.gltf" }
             .SelectMany(pattern => Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
             .Where(x => !IsIgnoredLibraryPath(root, x))
@@ -79,7 +80,7 @@ internal static class UELibraryPostProcessor
         RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
         var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots));
         mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList()));
-        var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex));
+        var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
@@ -1843,14 +1844,15 @@ internal static class UELibraryPostProcessor
     private static ComponentAssetRelationLink[] WriteComponentAssetRelations(
         string root,
         List<JObject> catalogRows,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var totalRelations = sourceIndex.ComponentAssetRelationCount > 0
             ? sourceIndex.ComponentAssetRelationCount
             : sourceIndex.ComponentAssetRelations.Length;
         if (!sourceIndex.Available || totalRelations == 0)
         {
-            WriteEmptyComponentRelations(root);
+            WriteEmptyComponentRelations(root, writeCompatibilityJson);
             return [];
         }
 
@@ -1865,26 +1867,45 @@ internal static class UELibraryPostProcessor
             .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
         var retainedLinks = new List<ComponentAssetRelationLink>();
         var path = Path.Combine(root, "component_asset_relations.jsonl");
-        using (var writer = new StreamWriter(path, false, Encoding.UTF8))
+        if (!writeCompatibilityJson)
+            DeleteIfExists(path);
+
+        using var workConnection = writeCompatibilityJson ? null : OpenComponentRelationWorkDb(root);
+        using var workTransaction = workConnection?.BeginTransaction();
+        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
             foreach (var relation in EnumerateSourceComponentAssetRelations(sourceIndex))
             {
                 var link = BuildComponentAssetRelationLink(relation, assetLookup, packageObjectsByPath, sourceIndex);
-                writer.WriteLine(SerializeComponentAssetRelationLink(link));
+                if (writeCompatibilityJson)
+                    writer!.WriteLine(SerializeComponentAssetRelationLink(link));
+                else
+                    InsertComponentAssetRelation(workConnection!, workTransaction!, link);
+
                 if (ShouldRetainComponentAssetRelation(link))
                     retainedLinks.Add(link);
             }
         }
 
+        workTransaction?.Commit();
+        FinalizeWorkDb(workConnection);
         var links = retainedLinks.ToArray();
         Console.WriteLine($"Component relations streamed: total={totalRelations}, retainedInMemory={links.Length}.");
         WriteComponentGroups(root, links);
         return links;
     }
 
-    private static void WriteEmptyComponentRelations(string root)
+    private static void WriteEmptyComponentRelations(string root, bool writeCompatibilityJson)
     {
-        File.WriteAllText(Path.Combine(root, "component_asset_relations.jsonl"), "", Encoding.UTF8);
+        if (writeCompatibilityJson)
+            File.WriteAllText(Path.Combine(root, "component_asset_relations.jsonl"), "", Encoding.UTF8);
+        else
+        {
+            DeleteIfExists(Path.Combine(root, "component_asset_relations.jsonl"));
+            using var workConnection = OpenComponentRelationWorkDb(root);
+            FinalizeWorkDb(workConnection);
+        }
+
         File.WriteAllText(
             Path.Combine(root, "component_groups.json"),
             JsonConvert.SerializeObject(new
@@ -1895,6 +1916,70 @@ internal static class UELibraryPostProcessor
                 groups = Array.Empty<object>(),
             }, Formatting.Indented),
             Encoding.UTF8);
+    }
+
+    private static SqliteConnection OpenComponentRelationWorkDb(string root)
+    {
+        SQLitePCL.Batteries_V2.Init();
+        var dbPath = GetLibraryWorkDbPath(root);
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+        var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        Execute(connection, "PRAGMA busy_timeout = 10000;");
+        Execute(connection, "PRAGMA journal_mode = WAL;");
+        Execute(connection, "PRAGMA synchronous = NORMAL;");
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS component_asset_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_object_path TEXT,
+                owner_type TEXT,
+                component_object_path TEXT,
+                component_type TEXT,
+                component_name TEXT,
+                component_variable_name TEXT,
+                relation_source TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                target_path TEXT,
+                target_name TEXT,
+                target_asset_name TEXT,
+                target_asset_kind TEXT,
+                target_asset_output TEXT,
+                match_status TEXT NOT NULL,
+                match_reason TEXT,
+                socket_name TEXT,
+                parent_component_path TEXT,
+                transform_json TEXT,
+                source_path TEXT
+            );
+            """);
+        Execute(connection, "DELETE FROM component_asset_relations;");
+        Execute(connection, "DELETE FROM sqlite_sequence WHERE name = 'component_asset_relations';");
+        return connection;
+    }
+
+    private static void FinalizeWorkDb(SqliteConnection? connection)
+    {
+        if (connection == null)
+            return;
+
+        try
+        {
+            Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+            Execute(connection, "PRAGMA journal_mode = DELETE;");
+        }
+        finally
+        {
+            connection.Dispose();
+        }
+    }
+
+    private static string GetLibraryWorkDbPath(string root)
+        => Path.Combine(root, "library_work.db");
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+            File.Delete(path);
     }
 
     private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex)
@@ -6035,7 +6120,8 @@ internal static class UELibraryPostProcessor
         foreach (var link in sharedGltfTextureLinks)
             InsertSharedGltfTextureLink(connection, transaction, link);
 
-        if (!InsertComponentAssetRelationRowsFromJsonLines(connection, transaction, root))
+        if (!InsertComponentAssetRelationRowsFromWorkDb(connection, transaction, root) &&
+            !InsertComponentAssetRelationRowsFromJsonLines(connection, transaction, root))
         {
             foreach (var link in componentAssetRelations)
                 InsertComponentAssetRelation(connection, transaction, link);
@@ -6579,6 +6665,52 @@ internal static class UELibraryPostProcessor
         return true;
     }
 
+    private static bool InsertComponentAssetRelationRowsFromWorkDb(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string root)
+    {
+        var dbPath = GetLibraryWorkDbPath(root);
+        if (!File.Exists(dbPath))
+            return false;
+
+        using var workConnection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        workConnection.Open();
+        if (!TableExists(workConnection, "component_asset_relations"))
+            return false;
+
+        using (var countCommand = workConnection.CreateCommand())
+        {
+            countCommand.CommandText = "SELECT COUNT(*) FROM component_asset_relations;";
+            var count = Convert.ToInt64(countCommand.ExecuteScalar());
+            if (count == 0)
+            {
+                Console.WriteLine("SQLite component relations inserted from work DB: 0.");
+                return true;
+            }
+        }
+
+        using var command = workConnection.CreateCommand();
+        command.CommandText = """
+            SELECT owner_object_path, owner_type, component_object_path, component_type,
+                   component_name, component_variable_name, relation_source, relation_type,
+                   target_path, target_name, target_asset_name, target_asset_kind, target_asset_output,
+                   match_status, match_reason, socket_name, parent_component_path, transform_json, source_path
+            FROM component_asset_relations
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var inserted = 0;
+        while (reader.Read())
+        {
+            InsertComponentAssetRelation(connection, transaction, ReadComponentAssetRelationLink(reader));
+            inserted++;
+        }
+
+        Console.WriteLine($"SQLite component relations inserted from work DB: {inserted}.");
+        return true;
+    }
+
     private static ComponentAssetRelationLink ReadComponentAssetRelationLink(JObject row)
         => new()
         {
@@ -6601,6 +6733,30 @@ internal static class UELibraryPostProcessor
             SocketName = (string?)row["SocketName"] ?? (string?)row["socketName"],
             ParentComponentPath = (string?)row["ParentComponentPath"] ?? (string?)row["parentComponentPath"],
             Transform = row["transform"]?.ToObject<object>(),
+        };
+
+    private static ComponentAssetRelationLink ReadComponentAssetRelationLink(SqliteDataReader reader)
+        => new()
+        {
+            OwnerObjectPath = GetString(reader, 0),
+            OwnerType = GetString(reader, 1),
+            ComponentObjectPath = GetString(reader, 2),
+            ComponentType = GetString(reader, 3),
+            ComponentName = GetString(reader, 4),
+            ComponentVariableName = GetString(reader, 5),
+            RelationSource = GetString(reader, 6) ?? "",
+            RelationType = GetString(reader, 7) ?? "",
+            TargetPath = GetString(reader, 8),
+            TargetName = GetString(reader, 9),
+            TargetAssetName = GetString(reader, 10),
+            TargetAssetKind = GetString(reader, 11),
+            TargetAssetOutput = GetString(reader, 12),
+            MatchStatus = GetString(reader, 13) ?? "",
+            MatchReason = GetString(reader, 14),
+            SocketName = GetString(reader, 15),
+            ParentComponentPath = GetString(reader, 16),
+            Transform = TryParseJson(GetString(reader, 17)),
+            SourcePath = GetString(reader, 18),
         };
 
     private static void InsertComponentGroups(
@@ -7438,6 +7594,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
+        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 人读健康摘要；程序筛选应优先查 `library_index.db`。 |");
@@ -7460,6 +7617,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("## 模型动画关系字段");
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 保留同一份关系的 JSON 视图。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
+        sb.AppendLine();
+        sb.AppendLine("如果后处理使用 `--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
