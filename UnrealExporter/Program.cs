@@ -110,6 +110,7 @@ public class UnrealExporter
                 Console.WriteLine($"AES key: {config.Aes}");
                 Console.WriteLine($"Log outputs: {config.LogOutputs}");
                 Console.WriteLine($"Keep directory structure: {config.KeepDirectoryStructure}");
+                Console.WriteLine($"SQLite-only library index: {config.SqliteOnlyIndex || !config.WriteCompatibilityJson}");
                 Console.WriteLine($"Create new checkpoint: {config.CreateNewCheckpoint}");
 
                 // Load CUE4Parse and export files
@@ -1057,17 +1058,20 @@ public class UnrealExporter
                                     }
                                     else if (outputType == "json")
                                     {
-                                        // Serialize to JSON, then write to file
+                                        // Stream large package JSON directly to disk to avoid a second full-size string copy.
                                         if (config.LogOutputs)
                                             Console.WriteLine("=> " + outputPath + ".json");
-                                        var json = JsonConvert.SerializeObject(
-                                            allObjects,
-                                            Formatting.Indented
-                                        );
                                         if (!Directory.Exists(outputDir))
                                             Directory.CreateDirectory(outputDir);
                                         var jsonPath = outputPath + ".json";
-                                        File.WriteAllText(jsonPath, json);
+                                        using (var writer = File.CreateText(jsonPath))
+                                        using (var jsonWriter = new JsonTextWriter(writer)
+                                               {
+                                                   Formatting = Formatting.Indented
+                                               })
+                                        {
+                                            JsonSerializer.CreateDefault().Serialize(jsonWriter, allObjects);
+                                        }
                                         jobOutputs.Add(jsonPath);
                                         AppendExportManifest(config, file.Value.Path, null, jsonPath, "Json");
                                         foreach (var material in allObjects.OfType<UMaterialInterface>())
@@ -1429,7 +1433,8 @@ public class UnrealExporter
         );
         if (config.GenerateLibraryIndexes)
         {
-            UELibraryPostProcessor.Run(config.OutputDir, config.UseSharedTextures);
+            var writeCompatibilityJson = config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
+            UELibraryPostProcessor.Run(config.OutputDir, config.UseSharedTextures, writeCompatibilityJson);
         }
         else if (config.UseSharedTextures)
         {
@@ -3855,6 +3860,8 @@ public class ConfigObj
     public string? UseCheckpointFile { get; set; }
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
+    public bool SqliteOnlyIndex { get; set; }
+    public bool WriteCompatibilityJson { get; set; } = true;
     public bool GenerateSourceIndex { get; set; }
     public bool? AutoExportReferencedAssets { get; set; }
     public bool? AutoExportCompatibleAnimations { get; set; }

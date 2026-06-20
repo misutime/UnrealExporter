@@ -69,16 +69,16 @@ internal static class UELibraryPostProcessor
             catalogRows.Add(BuildMaterialCatalogRow(material));
 
         var textureLinks = dedupeTextures
-            ? RunStage("共享贴图去重/硬链接", () => DeduplicateTextureFilesCore(root))
+            ? RunStage("共享贴图去重/硬链接", () => DeduplicateTextureFilesCore(root, writeCompatibilityJson))
             : RunStage("读取已有共享贴图索引", () => LoadExistingTextureLinks(root));
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
         var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows));
         var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
-        var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex));
+        var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex, writeCompatibilityJson));
         RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
-        var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots));
+        var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots, writeCompatibilityJson));
         mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList()));
         var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
@@ -1542,38 +1542,55 @@ internal static class UELibraryPostProcessor
         string root,
         Dictionary<string, MaterialInfo> materialIndex,
         List<TextureLinkInfo> textureLinks,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var links = BuildMaterialTextureSlotLinks(materialIndex, textureLinks, sourceIndex);
         var path = Path.Combine(root, "material_texture_slots.jsonl");
-        using var writer = new StreamWriter(path, false, Encoding.UTF8);
-        foreach (var link in links.OrderBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(x => x.SlotName, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(x => x.TextureObjectPath, StringComparer.OrdinalIgnoreCase))
+        if (!writeCompatibilityJson)
+            DeleteIfExists(path);
+
+        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "material_texture_slots");
+        using var workTransaction = workConnection?.BeginTransaction();
+        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
-            writer.WriteLine(JsonConvert.SerializeObject(new
+            foreach (var link in links.OrderBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(x => x.SlotName, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(x => x.TextureObjectPath, StringComparer.OrdinalIgnoreCase))
             {
-                kind = "MaterialTextureSlot",
-                link.MaterialName,
-                link.MaterialPath,
-                link.MaterialObjectPath,
-                link.SlotName,
-                    link.TextureName,
-                    link.TextureObjectPath,
-                    link.TexturePath,
-                    link.TextureClassName,
-                    link.TextureClassPath,
-                    link.MissingCategory,
-                    link.ExportedTexture,
-                    link.SharedTexture,
-                    link.Sha256,
-                link.HardLinked,
-                link.MatchStatus,
-                link.MatchReason,
-                link.RelationSource,
-            }));
+                if (writeCompatibilityJson)
+                {
+                    writer!.WriteLine(JsonConvert.SerializeObject(new
+                    {
+                        kind = "MaterialTextureSlot",
+                        link.MaterialName,
+                        link.MaterialPath,
+                        link.MaterialObjectPath,
+                        link.SlotName,
+                        link.TextureName,
+                        link.TextureObjectPath,
+                        link.TexturePath,
+                        link.TextureClassName,
+                        link.TextureClassPath,
+                        link.MissingCategory,
+                        link.ExportedTexture,
+                        link.SharedTexture,
+                        link.Sha256,
+                        link.HardLinked,
+                        link.MatchStatus,
+                        link.MatchReason,
+                        link.RelationSource,
+                    }));
+                }
+                else
+                {
+                    InsertMaterialTextureSlot(workConnection!, workTransaction!, link);
+                }
+            }
         }
 
+        workTransaction?.Commit();
+        FinalizeWorkDb(workConnection);
         return links;
     }
 
@@ -1870,7 +1887,7 @@ internal static class UELibraryPostProcessor
         if (!writeCompatibilityJson)
             DeleteIfExists(path);
 
-        using var workConnection = writeCompatibilityJson ? null : OpenComponentRelationWorkDb(root);
+        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "component_asset_relations");
         using var workTransaction = workConnection?.BeginTransaction();
         using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
@@ -1902,7 +1919,7 @@ internal static class UELibraryPostProcessor
         else
         {
             DeleteIfExists(Path.Combine(root, "component_asset_relations.jsonl"));
-            using var workConnection = OpenComponentRelationWorkDb(root);
+            using var workConnection = OpenLibraryWorkDb(root, "component_asset_relations");
             FinalizeWorkDb(workConnection);
         }
 
@@ -1918,7 +1935,7 @@ internal static class UELibraryPostProcessor
             Encoding.UTF8);
     }
 
-    private static SqliteConnection OpenComponentRelationWorkDb(string root)
+    private static SqliteConnection OpenLibraryWorkDb(string root, params string[] resetTables)
     {
         SQLitePCL.Batteries_V2.Init();
         var dbPath = GetLibraryWorkDbPath(root);
@@ -1928,6 +1945,69 @@ internal static class UELibraryPostProcessor
         Execute(connection, "PRAGMA busy_timeout = 10000;");
         Execute(connection, "PRAGMA journal_mode = WAL;");
         Execute(connection, "PRAGMA synchronous = NORMAL;");
+        EnsureLibraryWorkDbSchema(connection);
+        foreach (var tableName in resetTables)
+        {
+            Execute(connection, $"DELETE FROM {ValidateLibraryWorkTableName(tableName)};");
+            Execute(connection, $"DELETE FROM sqlite_sequence WHERE name = '{ValidateLibraryWorkTableName(tableName)}';");
+        }
+
+        return connection;
+    }
+
+    private static void EnsureLibraryWorkDbSchema(SqliteConnection connection)
+    {
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS texture_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                shared TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                extension TEXT NOT NULL,
+                hard_linked INTEGER NOT NULL,
+                link_error TEXT
+            );
+            """);
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS material_texture_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_name TEXT NOT NULL,
+                material_path TEXT,
+                material_object_path TEXT,
+                slot_name TEXT NOT NULL,
+                texture_name TEXT,
+                texture_object_path TEXT,
+                texture_path TEXT,
+                texture_class_name TEXT,
+                texture_class_path TEXT,
+                missing_category TEXT,
+                exported_texture TEXT,
+                shared_texture TEXT,
+                sha256 TEXT,
+                hard_linked INTEGER,
+                match_status TEXT NOT NULL,
+                match_reason TEXT,
+                relation_source TEXT
+            );
+            """);
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS shared_gltf_texture_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                material_name TEXT,
+                semantic TEXT,
+                slot_name TEXT,
+                texture_name TEXT,
+                image_index INTEGER,
+                shared_texture TEXT,
+                sha256 TEXT,
+                uri TEXT,
+                removed_buffer_view INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT
+            );
+            """);
         Execute(connection, """
             CREATE TABLE IF NOT EXISTS component_asset_relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1952,10 +2032,12 @@ internal static class UELibraryPostProcessor
                 source_path TEXT
             );
             """);
-        Execute(connection, "DELETE FROM component_asset_relations;");
-        Execute(connection, "DELETE FROM sqlite_sequence WHERE name = 'component_asset_relations';");
-        return connection;
     }
+
+    private static string ValidateLibraryWorkTableName(string tableName)
+        => tableName is "texture_links" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations"
+            ? tableName
+            : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown library work table.");
 
     private static void FinalizeWorkDb(SqliteConnection? connection)
     {
@@ -2618,7 +2700,8 @@ internal static class UELibraryPostProcessor
     private static SharedGltfTextureLink[] RewriteGltfSharedTextureUris(
         string root,
         List<ModelValidationEntry> reports,
-        MaterialTextureSlotLink[] materialTextureSlots)
+        MaterialTextureSlotLink[] materialTextureSlots,
+        bool writeCompatibilityJson)
     {
         var rows = new List<SharedGltfTextureLink>();
         foreach (var report in reports.Where(x => x.RelativePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
@@ -2681,11 +2764,26 @@ internal static class UELibraryPostProcessor
         }
 
         var path = Path.Combine(root, "shared_texture_gltf_links.jsonl");
-        using var writer = new StreamWriter(path, false, Encoding.UTF8);
-        foreach (var row in rows.OrderBy(x => x.Model, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(x => x.Semantic, StringComparer.OrdinalIgnoreCase))
-            writer.WriteLine(JsonConvert.SerializeObject(row));
+        if (!writeCompatibilityJson)
+            DeleteIfExists(path);
+
+        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "shared_gltf_texture_links");
+        using var workTransaction = workConnection?.BeginTransaction();
+        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
+        {
+            foreach (var row in rows.OrderBy(x => x.Model, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(x => x.MaterialName, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(x => x.Semantic, StringComparer.OrdinalIgnoreCase))
+            {
+                if (writeCompatibilityJson)
+                    writer!.WriteLine(JsonConvert.SerializeObject(row));
+                else
+                    InsertSharedGltfTextureLink(workConnection!, workTransaction!, row);
+            }
+        }
+
+        workTransaction?.Commit();
+        FinalizeWorkDb(workConnection);
 
         return rows.ToArray();
     }
@@ -6102,8 +6200,11 @@ internal static class UELibraryPostProcessor
         foreach (var row in catalogRows)
             InsertAsset(connection, transaction, row);
 
-        foreach (var link in textureLinks)
-            InsertTextureLink(connection, transaction, link);
+        if (!InsertTextureLinksFromWorkDb(connection, transaction, root))
+        {
+            foreach (var link in textureLinks)
+                InsertTextureLink(connection, transaction, link);
+        }
 
         InsertExportManifestRows(connection, transaction, root);
         InsertAnimationBindingRows(connection, transaction, root);
@@ -6114,11 +6215,17 @@ internal static class UELibraryPostProcessor
 
         InsertModelCoverage(connection, transaction, modelCoverage);
 
-        foreach (var slot in materialTextureSlots)
-            InsertMaterialTextureSlot(connection, transaction, slot);
+        if (!InsertMaterialTextureSlotsFromWorkDb(connection, transaction, root))
+        {
+            foreach (var slot in materialTextureSlots)
+                InsertMaterialTextureSlot(connection, transaction, slot);
+        }
 
-        foreach (var link in sharedGltfTextureLinks)
-            InsertSharedGltfTextureLink(connection, transaction, link);
+        if (!InsertSharedGltfTextureLinksFromWorkDb(connection, transaction, root))
+        {
+            foreach (var link in sharedGltfTextureLinks)
+                InsertSharedGltfTextureLink(connection, transaction, link);
+        }
 
         if (!InsertComponentAssetRelationRowsFromWorkDb(connection, transaction, root) &&
             !InsertComponentAssetRelationRowsFromJsonLines(connection, transaction, root))
@@ -6254,6 +6361,54 @@ internal static class UELibraryPostProcessor
         Add(command, "$hardLinked", link.HardLinked ? 1 : 0);
         Add(command, "$linkError", link.LinkError);
         command.ExecuteNonQuery();
+    }
+
+    private static bool InsertTextureLinksFromWorkDb(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        using var workConnection = OpenLibraryWorkDbReadOnly(root);
+        if (workConnection == null || !TableExists(workConnection, "texture_links") || CountTableRows(workConnection, "texture_links") == 0)
+            return false;
+
+        using var command = workConnection.CreateCommand();
+        command.CommandText = """
+            SELECT source, shared, sha256, size_bytes, extension, hard_linked, link_error
+            FROM texture_links
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var inserted = 0;
+        while (reader.Read())
+        {
+            var source = GetString(reader, 0) ?? "";
+            var shared = GetString(reader, 1) ?? "";
+            InsertTextureLink(connection, transaction, new TextureLinkInfo
+            {
+                Path = Path.Combine(root, source.Replace('/', Path.DirectorySeparatorChar)),
+                RelativePath = source,
+                SharedPath = Path.Combine(root, shared.Replace('/', Path.DirectorySeparatorChar)),
+                SharedRelativePath = shared,
+                Hash = GetString(reader, 2) ?? "",
+                SizeBytes = reader.GetInt64(3),
+                Extension = GetString(reader, 4) ?? "",
+                HardLinked = !reader.IsDBNull(5) && reader.GetInt32(5) != 0,
+                LinkError = GetString(reader, 6),
+            });
+            inserted++;
+        }
+
+        Console.WriteLine($"SQLite texture links inserted from work DB: {inserted}.");
+        return true;
+    }
+
+    private static SqliteConnection? OpenLibraryWorkDbReadOnly(string root)
+    {
+        var dbPath = GetLibraryWorkDbPath(root);
+        if (!File.Exists(dbPath))
+            return null;
+
+        var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        connection.Open();
+        return connection;
     }
 
     private static void InsertExportManifestRows(SqliteConnection connection, SqliteTransaction transaction, string root)
@@ -6568,6 +6723,52 @@ internal static class UELibraryPostProcessor
         command.ExecuteNonQuery();
     }
 
+    private static bool InsertMaterialTextureSlotsFromWorkDb(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        using var workConnection = OpenLibraryWorkDbReadOnly(root);
+        if (workConnection == null || !TableExists(workConnection, "material_texture_slots") || CountTableRows(workConnection, "material_texture_slots") == 0)
+            return false;
+
+        using var command = workConnection.CreateCommand();
+        command.CommandText = """
+            SELECT material_name, material_path, material_object_path, slot_name,
+                   texture_name, texture_object_path, texture_path, texture_class_name, texture_class_path, missing_category,
+                   exported_texture, shared_texture, sha256, hard_linked,
+                   match_status, match_reason, relation_source
+            FROM material_texture_slots
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var inserted = 0;
+        while (reader.Read())
+        {
+            InsertMaterialTextureSlot(connection, transaction, new MaterialTextureSlotLink
+            {
+                MaterialName = GetString(reader, 0) ?? "",
+                MaterialPath = GetString(reader, 1),
+                MaterialObjectPath = GetString(reader, 2),
+                SlotName = GetString(reader, 3) ?? "",
+                TextureName = GetString(reader, 4),
+                TextureObjectPath = GetString(reader, 5),
+                TexturePath = GetString(reader, 6),
+                TextureClassName = GetString(reader, 7),
+                TextureClassPath = GetString(reader, 8),
+                MissingCategory = GetString(reader, 9),
+                ExportedTexture = GetString(reader, 10),
+                SharedTexture = GetString(reader, 11),
+                Sha256 = GetString(reader, 12),
+                HardLinked = reader.IsDBNull(13) ? null : reader.GetInt32(13) != 0,
+                MatchStatus = GetString(reader, 14) ?? "",
+                MatchReason = GetString(reader, 15),
+                RelationSource = GetString(reader, 16) ?? "",
+            });
+            inserted++;
+        }
+
+        Console.WriteLine($"SQLite material texture slots inserted from work DB: {inserted}.");
+        return true;
+    }
+
     private static void InsertSharedGltfTextureLink(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -6600,6 +6801,46 @@ internal static class UELibraryPostProcessor
         Add(command, "$status", link.Status);
         Add(command, "$reason", link.Reason);
         command.ExecuteNonQuery();
+    }
+
+    private static bool InsertSharedGltfTextureLinksFromWorkDb(SqliteConnection connection, SqliteTransaction transaction, string root)
+    {
+        using var workConnection = OpenLibraryWorkDbReadOnly(root);
+        if (workConnection == null || !TableExists(workConnection, "shared_gltf_texture_links") || CountTableRows(workConnection, "shared_gltf_texture_links") == 0)
+            return false;
+
+        using var command = workConnection.CreateCommand();
+        command.CommandText = """
+            SELECT model, material_name, semantic, slot_name, texture_name,
+                   image_index, shared_texture, sha256, uri,
+                   removed_buffer_view, status, reason
+            FROM shared_gltf_texture_links
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var inserted = 0;
+        while (reader.Read())
+        {
+            InsertSharedGltfTextureLink(connection, transaction, new SharedGltfTextureLink
+            {
+                Model = GetString(reader, 0) ?? "",
+                MaterialName = GetString(reader, 1) ?? "",
+                Semantic = GetString(reader, 2) ?? "",
+                SlotName = GetString(reader, 3) ?? "",
+                TextureName = GetString(reader, 4),
+                ImageIndex = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                SharedTexture = GetString(reader, 6),
+                Sha256 = GetString(reader, 7),
+                Uri = GetString(reader, 8),
+                RemovedBufferView = !reader.IsDBNull(9) && reader.GetInt32(9) != 0,
+                Status = GetString(reader, 10) ?? "",
+                Reason = GetString(reader, 11),
+            });
+            inserted++;
+        }
+
+        Console.WriteLine($"SQLite shared glTF texture links inserted from work DB: {inserted}.");
+        return true;
     }
 
     private static void InsertComponentAssetRelation(
@@ -7594,7 +7835,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
-        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的完整组件关系。 |");
+        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 人读健康摘要；程序筛选应优先查 `library_index.db`。 |");
@@ -7618,7 +7859,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 保留同一份关系的 JSON 视图。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果后处理使用 `--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果后处理使用 `--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图；例如 `texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 会由 `library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -7670,11 +7911,15 @@ internal static class UELibraryPostProcessor
 
     public static void DeduplicateTextureFiles(string root)
     {
-        DeduplicateTextureFilesCore(root);
+        DeduplicateTextureFilesCore(root, writeCompatibilityJson: true);
     }
 
     private static List<TextureLinkInfo> LoadExistingTextureLinks(string root)
     {
+        var workRows = LoadExistingTextureLinksFromWorkDb(root);
+        if (workRows.Count > 0)
+            return workRows;
+
         var path = Path.Combine(root, "texture_links.jsonl");
         if (!File.Exists(path))
             return [];
@@ -7715,7 +7960,42 @@ internal static class UELibraryPostProcessor
         return result;
     }
 
-    private static List<TextureLinkInfo> DeduplicateTextureFilesCore(string root)
+    private static List<TextureLinkInfo> LoadExistingTextureLinksFromWorkDb(string root)
+    {
+        using var workConnection = OpenLibraryWorkDbReadOnly(root);
+        if (workConnection == null || !TableExists(workConnection, "texture_links") || CountTableRows(workConnection, "texture_links") == 0)
+            return [];
+
+        var result = new List<TextureLinkInfo>();
+        using var command = workConnection.CreateCommand();
+        command.CommandText = """
+            SELECT source, shared, sha256, size_bytes, extension, hard_linked, link_error
+            FROM texture_links
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var source = GetString(reader, 0) ?? "";
+            var shared = GetString(reader, 1) ?? "";
+            result.Add(new TextureLinkInfo
+            {
+                Path = Path.Combine(root, source.Replace('/', Path.DirectorySeparatorChar)),
+                RelativePath = source,
+                SharedPath = Path.Combine(root, shared.Replace('/', Path.DirectorySeparatorChar)),
+                SharedRelativePath = shared,
+                Hash = GetString(reader, 2) ?? "",
+                SizeBytes = reader.GetInt64(3),
+                Extension = GetString(reader, 4) ?? "",
+                HardLinked = !reader.IsDBNull(5) && reader.GetInt32(5) != 0,
+                LinkError = GetString(reader, 6),
+            });
+        }
+
+        return result;
+    }
+
+    private static List<TextureLinkInfo> DeduplicateTextureFilesCore(string root, bool writeCompatibilityJson)
     {
         var textureFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
             .Where(x => TextureExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
@@ -7766,7 +8046,7 @@ internal static class UELibraryPostProcessor
             });
         }
 
-        WriteTextureLinks(root, links);
+        WriteTextureLinks(root, links, writeCompatibilityJson);
         var removedStaleSharedFiles = RemoveUnreferencedSharedTextures(root, sharedRoot, links);
         File.WriteAllText(
             Path.Combine(root, "texture_dedupe_summary.json"),
@@ -7840,24 +8120,41 @@ internal static class UELibraryPostProcessor
         return removed;
     }
 
-    private static void WriteTextureLinks(string root, List<TextureLinkInfo> links)
+    private static void WriteTextureLinks(string root, List<TextureLinkInfo> links, bool writeCompatibilityJson)
     {
         var path = Path.Combine(root, "texture_links.jsonl");
-        using var writer = new StreamWriter(path, false, Encoding.UTF8);
-        foreach (var link in links.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
+        if (!writeCompatibilityJson)
+            DeleteIfExists(path);
+
+        using var workConnection = writeCompatibilityJson ? null : OpenLibraryWorkDb(root, "texture_links");
+        using var workTransaction = workConnection?.BeginTransaction();
+        using (var writer = writeCompatibilityJson ? new StreamWriter(path, false, Encoding.UTF8) : null)
         {
-            writer.WriteLine(JsonConvert.SerializeObject(new
+            foreach (var link in links.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             {
-                kind = "TextureLink",
-                source = link.RelativePath,
-                shared = link.SharedRelativePath,
-                sha256 = link.Hash,
-                sizeBytes = link.SizeBytes,
-                extension = link.Extension,
-                hardLinked = link.HardLinked,
-                linkError = link.LinkError,
-            }));
+                if (writeCompatibilityJson)
+                {
+                    writer!.WriteLine(JsonConvert.SerializeObject(new
+                    {
+                        kind = "TextureLink",
+                        source = link.RelativePath,
+                        shared = link.SharedRelativePath,
+                        sha256 = link.Hash,
+                        sizeBytes = link.SizeBytes,
+                        extension = link.Extension,
+                        hardLinked = link.HardLinked,
+                        linkError = link.LinkError,
+                    }));
+                }
+                else
+                {
+                    InsertTextureLink(workConnection!, workTransaction!, link);
+                }
+            }
         }
+
+        workTransaction?.Commit();
+        FinalizeWorkDb(workConnection);
     }
 
     private static bool TryReplaceWithHardLink(string path, string canonical, out string linkError)
