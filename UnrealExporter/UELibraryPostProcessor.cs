@@ -470,49 +470,58 @@ internal static class UELibraryPostProcessor
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
 
         var root = Path.GetFullPath(libraryRoot);
-        var writeCompatibilityJson = File.Exists(Path.Combine(root, "model_coverage.json"));
-        var modelCoverage = LoadModelCoverageForTaskQuality(root);
-        WriteTaskModelQualityReport(root, modelCoverage, writeCompatibilityJson);
+        var rows = LoadModelCoverageRowsForTaskQuality(root);
+        WriteTaskModelQualityReport(root, rows, writeCompatibilityJson: false);
         Console.WriteLine($"UE task model quality report refreshed: {root}");
     }
 
-    private static JObject LoadModelCoverageForTaskQuality(string root)
+    private static ModelCoverageRow[] LoadModelCoverageRowsForTaskQuality(string root)
     {
-        var coveragePath = Path.Combine(root, "model_coverage.json");
-        if (File.Exists(coveragePath))
-            return JObject.Parse(File.ReadAllText(coveragePath));
-
         var dbPath = Path.Combine(root, "library_index.db");
         if (!File.Exists(dbPath))
-            throw new FileNotFoundException("model_coverage.json not found and library_index.db is unavailable.", coveragePath);
+            throw new FileNotFoundException("library_index.db is required to refresh task model quality.", dbPath);
 
         SQLitePCL.Batteries_V2.Init();
         using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         connection.Open();
-        if (!TableExists(connection, "model_coverage") || !TableColumnExists(connection, "model_coverage", "raw_json"))
-            throw new FileNotFoundException("model_coverage.json not found and library_index.db.model_coverage is unavailable.", coveragePath);
+        if (!TableExists(connection, "model_coverage"))
+            throw new FileNotFoundException("library_index.db.model_coverage is required to refresh task model quality.", dbPath);
 
-        var rows = new JArray();
+        var rows = new List<ModelCoverageRow>();
         using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT raw_json
+            SELECT name, output, source, object_path, resource_kind, source_type, validation_status,
+                   is_static, has_skin, has_skeleton_path, material_count, texture_count,
+                   component_reference_count, source_index_object_count, animation_candidate_count
             FROM model_coverage
             ORDER BY output COLLATE NOCASE;
             """;
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            var rawJson = GetString(reader, 0);
-            if (!string.IsNullOrWhiteSpace(rawJson) && JToken.Parse(rawJson) is JObject row)
-                rows.Add(row);
+            var source = GetString(reader, 2);
+            rows.Add(new ModelCoverageRow
+            {
+                Name = GetString(reader, 0) ?? "",
+                Output = GetString(reader, 1) ?? "",
+                Source = source ?? "",
+                ObjectPath = GetString(reader, 3),
+                ResourceKind = GetString(reader, 4) ?? "Unknown",
+                SourceType = GetString(reader, 5) ?? "",
+                ValidationStatus = GetString(reader, 6) ?? "unknown",
+                IsStatic = GetRequiredBool(reader, 7),
+                HasSkin = GetRequiredBool(reader, 8),
+                HasSkeletonPath = GetRequiredBool(reader, 9),
+                MaterialCount = GetRequiredInt32(reader, 10),
+                TextureCount = GetRequiredInt32(reader, 11),
+                ComponentReferenceCount = GetRequiredInt32(reader, 12),
+                SourceIndexObjectCount = GetRequiredInt32(reader, 13),
+                AnimationCandidateCount = GetRequiredInt32(reader, 14),
+                TaskSignals = FindTaskSignals(source ?? ""),
+            });
         }
 
-        return JObject.FromObject(new
-        {
-            generatedAt = DateTime.UtcNow.ToString("O"),
-            source = "library_index.db.model_coverage",
-            models = rows,
-        });
+        return rows.ToArray();
     }
 
     private static T RunStage<T>(string name, Func<T> action)
@@ -6161,6 +6170,13 @@ internal static class UELibraryPostProcessor
         var rows = ((JArray?)modelCoverage["models"] ?? [])
             .OfType<JObject>()
             .Select(ReadModelCoverageRow)
+            .ToArray();
+        WriteTaskModelQualityReport(root, rows, writeCompatibilityJson);
+    }
+
+    private static void WriteTaskModelQualityReport(string root, IEnumerable<ModelCoverageRow> modelCoverageRows, bool writeCompatibilityJson)
+    {
+        var rows = modelCoverageRows
             .Where(IsTaskOrPropCoverageRow)
             .OrderByDescending(x => BuildTaskQualityIssueReasons(x).Length)
             .ThenByDescending(x => x.AnimationCandidateCount)
@@ -8222,6 +8238,12 @@ internal static class UELibraryPostProcessor
 
     private static string? GetString(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+
+    private static int GetRequiredInt32(SqliteDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? 0 : Convert.ToInt32(reader.GetValue(ordinal));
+
+    private static bool GetRequiredBool(SqliteDataReader reader, int ordinal)
+        => GetRequiredInt32(reader, ordinal) != 0;
 
     private static bool? GetNullableBool(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal) != 0;

@@ -94,7 +94,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - Standalone shared-texture dedupe now honors the SQLite-first defaults from export configs instead of always writing JSONL/JSON.
 - Postprocess skips animation validation and model-animation JSON views by default; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
 - Postprocess skips model validation and skeleton JSON views by default; query `model_validation` and `skeleton_groups` in `library_index.db`.
-- Postprocess skips model coverage, task model quality and component group JSON views by default; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its Markdown report from `library_index.db.model_coverage` when `model_coverage.json` is absent without regenerating `task_model_quality.json`.
+- Postprocess skips model coverage, task model quality and component group JSON views by default; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` rebuilds its Markdown report directly from explicit `library_index.db.model_coverage` columns and no longer reads `model_coverage.json` or `model_coverage.raw_json`.
 - Postprocess stores library health and acceptance summaries in `library_index.db.library_reports` and skips `library_health.json` / `library_acceptance.json` by default.
 - Source-index resume metadata now lives in `ue_source_index.db.source_index_metadata`; `ue_source_index.metadata.json` is only written when compatibility JSON is explicitly enabled.
 - Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input and human-readable reports.
