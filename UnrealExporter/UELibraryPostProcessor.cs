@@ -6875,9 +6875,25 @@ internal static class UELibraryPostProcessor
                 track_coverage REAL NOT NULL,
                 hierarchy_compatible INTEGER NOT NULL,
                 is_container_animation INTEGER NOT NULL,
-                missing_track_bones_json TEXT NOT NULL,
-                hierarchy_mismatches_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation_missing_track_bones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                animation_validation_id INTEGER NOT NULL,
+                bone_index INTEGER NOT NULL,
+                bone_name TEXT NOT NULL,
+                FOREIGN KEY (animation_validation_id) REFERENCES animation_validation(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation_hierarchy_mismatches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                animation_validation_id INTEGER NOT NULL,
+                mismatch_index INTEGER NOT NULL,
+                mismatch TEXT NOT NULL,
+                FOREIGN KEY (animation_validation_id) REFERENCES animation_validation(id)
             );
             """);
         Execute(connection, transaction, """
@@ -7003,6 +7019,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_relation_animation_evidence_animation ON relation_animation_evidence(relation_animation_id, step_index);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_missing_bones ON animation_validation_missing_track_bones(bone_name, animation_validation_id);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_hierarchy_mismatches ON animation_validation_hierarchy_mismatches(mismatch, animation_validation_id);");
         Execute(connection, transaction, "CREATE INDEX idx_library_reports_name ON library_reports(name, status);");
     }
 
@@ -8269,14 +8287,14 @@ internal static class UELibraryPostProcessor
                     validation_category,
                     model_bone_count, animation_track_count, matched_track_bones,
                     track_coverage, hierarchy_compatible, is_container_animation,
-                    missing_track_bones_json, hierarchy_mismatches_json, raw_json
+                    raw_json
                 )
                 VALUES (
                     $model, $animation, $skeletonPath, $status, $candidateReason, $reason,
                     $validationCategory,
                     $modelBoneCount, $animationTrackCount, $matchedTrackBones,
                     $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
-                    $missingTrackBonesJson, $hierarchyMismatchesJson, $rawJson
+                    $rawJson
                 );
                 """;
             Add(command, "$model", validation.ModelOutput);
@@ -8292,9 +8310,72 @@ internal static class UELibraryPostProcessor
             Add(command, "$trackCoverage", validation.TrackCoverage);
             Add(command, "$hierarchyCompatible", validation.HierarchyCompatible ? 1 : 0);
             Add(command, "$isContainerAnimation", validation.IsContainerAnimation ? 1 : 0);
-            Add(command, "$missingTrackBonesJson", JsonConvert.SerializeObject(validation.MissingTrackBones));
-            Add(command, "$hierarchyMismatchesJson", JsonConvert.SerializeObject(validation.HierarchyMismatches));
             Add(command, "$rawJson", rawJson.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+            var validationId = GetLastInsertRowId(connection, transaction);
+            InsertAnimationValidationMissingTrackBones(connection, transaction, validationId, validation.MissingTrackBones);
+            InsertAnimationValidationHierarchyMismatches(connection, transaction, validationId, validation.HierarchyMismatches);
+        }
+    }
+
+    private static void InsertAnimationValidationMissingTrackBones(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long animationValidationId,
+        string[] missingTrackBones)
+    {
+        if (animationValidationId <= 0 || missingTrackBones.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO animation_validation_missing_track_bones (
+                animation_validation_id, bone_index, bone_name
+            )
+            VALUES (
+                $animationValidationId, $boneIndex, $boneName
+            );
+            """;
+        var idParam = command.Parameters.Add("$animationValidationId", SqliteType.Integer);
+        var indexParam = command.Parameters.Add("$boneIndex", SqliteType.Integer);
+        var nameParam = command.Parameters.Add("$boneName", SqliteType.Text);
+        idParam.Value = animationValidationId;
+        for (var i = 0; i < missingTrackBones.Length; i++)
+        {
+            indexParam.Value = i;
+            nameParam.Value = missingTrackBones[i];
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertAnimationValidationHierarchyMismatches(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long animationValidationId,
+        string[] hierarchyMismatches)
+    {
+        if (animationValidationId <= 0 || hierarchyMismatches.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO animation_validation_hierarchy_mismatches (
+                animation_validation_id, mismatch_index, mismatch
+            )
+            VALUES (
+                $animationValidationId, $mismatchIndex, $mismatch
+            );
+            """;
+        var idParam = command.Parameters.Add("$animationValidationId", SqliteType.Integer);
+        var indexParam = command.Parameters.Add("$mismatchIndex", SqliteType.Integer);
+        var mismatchParam = command.Parameters.Add("$mismatch", SqliteType.Text);
+        idParam.Value = animationValidationId;
+        for (var i = 0; i < hierarchyMismatches.Length; i++)
+        {
+            indexParam.Value = i;
+            mismatchParam.Value = hierarchyMismatches[i];
             command.ExecuteNonQuery();
         }
     }
