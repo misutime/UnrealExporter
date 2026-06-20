@@ -34,14 +34,8 @@ internal static class UELibraryPostProcessor
             .Where(IsSupportedGltfModel)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var materialJsonFiles = Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories)
-            .Where(x => !IsIgnoredLibraryPath(root, x))
-            .Where(IsLikelyMaterialJson)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        Console.WriteLine($"Scanning {modelFiles.Length} glTF model(s), {materialJsonFiles.Length} material JSON file(s).");
-        var materialIndex = RunStage("加载材质索引", () => LoadMaterialIndex(root, materialJsonFiles));
+        Console.WriteLine($"Scanning {modelFiles.Length} glTF model(s).");
+        var materialIndex = RunStage("加载材质索引", () => LoadMaterialIndex(root));
         var reports = new List<ModelValidationEntry>(modelFiles.Length);
         var catalogRows = new List<JObject>(modelFiles.Length + materialIndex.Count);
 
@@ -93,7 +87,7 @@ internal static class UELibraryPostProcessor
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
         var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
-        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance));
+        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, materialIndex.Values, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -561,35 +555,75 @@ internal static class UELibraryPostProcessor
         return relative.Split('/').Any(part => part.StartsWith(".", StringComparison.Ordinal));
     }
 
-    private static Dictionary<string, MaterialInfo> LoadMaterialIndex(string root, string[] materialJsonFiles)
+    private static Dictionary<string, MaterialInfo> LoadMaterialIndex(string root)
+    {
+        var materialJsonFiles = FindMaterialJsonFilesFromAssetCatalog(root);
+        var source = "asset catalog";
+        var cached = LoadMaterialIndexFromWorkDb(root, materialJsonFiles.Length > 0 ? materialJsonFiles : null);
+        if (cached.Count > 0)
+        {
+            Console.WriteLine($"Material sidecars loaded from library_work.db: {cached.Count}");
+            return cached;
+        }
+
+        if (materialJsonFiles.Length == 0)
+        {
+            materialJsonFiles = FindMaterialJsonFilesByScan(root);
+            source = "fallback JSON scan";
+        }
+
+        var result = LoadMaterialIndexFromJsonFiles(root, materialJsonFiles);
+        SaveMaterialIndexToWorkDb(root, result.Values);
+        Console.WriteLine($"Material sidecars loaded from {source}: candidates={materialJsonFiles.Length}, parsed={result.Count}");
+        return result;
+    }
+
+    private static string[] FindMaterialJsonFilesFromAssetCatalog(string root)
+    {
+        var catalogPath = Path.Combine(root, "asset_catalog.jsonl");
+        var files = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in ReadExportEventRows(root, "asset_catalog", catalogPath))
+        {
+            if (!string.Equals((string?)row["kind"], "Material", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var output = (string?)row["output"] ?? (string?)row["source"];
+            if (string.IsNullOrWhiteSpace(output))
+                continue;
+
+            var path = Path.IsPathRooted(output)
+                ? Path.GetFullPath(output)
+                : Path.GetFullPath(Path.Combine(root, output.Replace('/', Path.DirectorySeparatorChar)));
+            if (!File.Exists(path) ||
+                !Path.GetExtension(path).Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                IsIgnoredLibraryPath(root, path))
+            {
+                continue;
+            }
+
+            files.Add(path);
+        }
+
+        return files.ToArray();
+    }
+
+    private static string[] FindMaterialJsonFilesByScan(string root)
+        => Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories)
+            .Where(x => !IsIgnoredLibraryPath(root, x))
+            .Where(IsLikelyMaterialJson)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    private static Dictionary<string, MaterialInfo> LoadMaterialIndexFromJsonFiles(string root, string[] materialJsonFiles)
     {
         var result = new Dictionary<string, MaterialInfo>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in materialJsonFiles)
         {
             try
             {
-                var obj = JObject.Parse(File.ReadAllText(path));
-                var textures = obj["Textures"] as JObject;
-                var parameters = obj["Parameters"] as JObject;
-                var colors = parameters?["Colors"] as JObject;
-                var scalars = parameters?["Scalars"] as JObject;
-                var switches = parameters?["Switches"] as JObject;
-                var name = Path.GetFileNameWithoutExtension(path);
-                var info = new MaterialInfo
-                {
-                    Name = name,
-                    Path = path,
-                    RelativePath = MakeRelative(root, path),
-                    TextureSlotCount = textures?.Properties().Count() ?? 0,
-                    ColorCount = colors?.Properties().Count() ?? 0,
-                    ScalarCount = scalars?.Properties().Count() ?? 0,
-                    SwitchCount = switches?.Properties().Count() ?? 0,
-                    BlendMode = parameters?["BlendMode"]?.ToString(),
-                    ShadingModel = parameters?["ShadingModel"]?.ToString(),
-                    RawJson = obj,
-                };
-                if (!result.ContainsKey(name))
-                    result[name] = info;
+                var info = BuildMaterialInfo(root, path, JObject.Parse(File.ReadAllText(path)));
+                if (!result.ContainsKey(info.Name))
+                    result[info.Name] = info;
             }
             catch (Exception ex)
             {
@@ -598,6 +632,117 @@ internal static class UELibraryPostProcessor
         }
 
         return result;
+    }
+
+    private static MaterialInfo BuildMaterialInfo(string root, string path, JObject obj)
+    {
+        var textures = obj["Textures"] as JObject;
+        var parameters = obj["Parameters"] as JObject;
+        var colors = parameters?["Colors"] as JObject;
+        var scalars = parameters?["Scalars"] as JObject;
+        var switches = parameters?["Switches"] as JObject;
+        var fileInfo = new FileInfo(path);
+        return new MaterialInfo
+        {
+            Name = Path.GetFileNameWithoutExtension(path),
+            Path = path,
+            RelativePath = MakeRelative(root, path),
+            SizeBytes = fileInfo.Exists ? fileInfo.Length : 0,
+            LastWriteUtcTicks = fileInfo.Exists ? fileInfo.LastWriteTimeUtc.Ticks : 0,
+            TextureSlotCount = textures?.Properties().Count() ?? 0,
+            ColorCount = colors?.Properties().Count() ?? 0,
+            ScalarCount = scalars?.Properties().Count() ?? 0,
+            SwitchCount = switches?.Properties().Count() ?? 0,
+            BlendMode = parameters?["BlendMode"]?.ToString(),
+            ShadingModel = parameters?["ShadingModel"]?.ToString(),
+            RawJson = obj,
+        };
+    }
+
+    private static Dictionary<string, MaterialInfo> LoadMaterialIndexFromWorkDb(string root, string[]? expectedFiles)
+    {
+        using var connection = OpenLibraryWorkDbReadOnly(root);
+        if (connection == null ||
+            !TableExists(connection, "material_sidecars") ||
+            CountTableRows(connection, "material_sidecars") == 0)
+        {
+            return [];
+        }
+
+        var result = new Dictionary<string, MaterialInfo>(StringComparer.OrdinalIgnoreCase);
+        var cachedRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var expectedRelativePaths = expectedFiles?
+            .Select(path => MakeRelative(root, path).Replace('\\', '/'))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT name, relative_path, size_bytes, last_write_utc_ticks, texture_slot_count,
+                   color_count, scalar_count, switch_count, blend_mode, shading_model, raw_json
+            FROM material_sidecars
+            ORDER BY relative_path;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var relativePath = GetString(reader, 1) ?? "";
+            if (string.IsNullOrWhiteSpace(relativePath))
+                continue;
+            relativePath = relativePath.Replace('\\', '/');
+            cachedRelativePaths.Add(relativePath);
+
+            var path = Path.GetFullPath(Path.Combine(root, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+            var fileInfo = new FileInfo(path);
+            var sizeBytes = reader.GetInt64(2);
+            var lastWriteUtcTicks = reader.GetInt64(3);
+            if (!fileInfo.Exists ||
+                fileInfo.Length != sizeBytes ||
+                fileInfo.LastWriteTimeUtc.Ticks != lastWriteUtcTicks)
+            {
+                return [];
+            }
+
+            var name = GetString(reader, 0) ?? Path.GetFileNameWithoutExtension(path);
+            if (result.ContainsKey(name))
+                continue;
+
+            result[name] = new MaterialInfo
+            {
+                Name = name,
+                Path = path,
+                RelativePath = relativePath,
+                SizeBytes = sizeBytes,
+                LastWriteUtcTicks = lastWriteUtcTicks,
+                TextureSlotCount = reader.GetInt32(4),
+                ColorCount = reader.GetInt32(5),
+                ScalarCount = reader.GetInt32(6),
+                SwitchCount = reader.GetInt32(7),
+                BlendMode = GetString(reader, 8),
+                ShadingModel = GetString(reader, 9),
+                RawJson = JObject.Parse(GetString(reader, 10) ?? "{}"),
+            };
+        }
+
+        if (expectedRelativePaths != null && !cachedRelativePaths.SetEquals(expectedRelativePaths))
+            return [];
+
+        return result;
+    }
+
+    private static void SaveMaterialIndexToWorkDb(string root, IEnumerable<MaterialInfo> materials)
+    {
+        var connection = OpenLibraryWorkDb(root, "material_sidecars");
+        try
+        {
+            using var transaction = connection.BeginTransaction();
+            foreach (var material in materials.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
+                InsertMaterialSidecar(connection, transaction, material);
+
+            transaction.Commit();
+        }
+        finally
+        {
+            FinalizeWorkDb(connection);
+        }
     }
 
     private static ModelValidationEntry InspectModel(
@@ -2284,6 +2429,22 @@ internal static class UELibraryPostProcessor
             );
             """);
         Execute(connection, """
+            CREATE TABLE IF NOT EXISTS material_sidecars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                last_write_utc_ticks INTEGER NOT NULL,
+                texture_slot_count INTEGER NOT NULL,
+                color_count INTEGER NOT NULL,
+                scalar_count INTEGER NOT NULL,
+                switch_count INTEGER NOT NULL,
+                blend_mode TEXT,
+                shading_model TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, """
             CREATE TABLE IF NOT EXISTS material_texture_slots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 material_name TEXT NOT NULL,
@@ -2357,11 +2518,13 @@ internal static class UELibraryPostProcessor
                 updated_at TEXT NOT NULL
             );
             """);
+        Execute(connection, "CREATE INDEX IF NOT EXISTS idx_material_sidecars_name ON material_sidecars(name);");
+        Execute(connection, "CREATE UNIQUE INDEX IF NOT EXISTS idx_material_sidecars_path ON material_sidecars(relative_path);");
         Execute(connection, "CREATE INDEX IF NOT EXISTS idx_model_validation_cache_signature ON model_validation_cache(cache_version, material_index_signature);");
     }
 
     private static string ValidateLibraryWorkTableName(string tableName)
-        => tableName is "texture_links" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations" or "model_validation_cache"
+        => tableName is "texture_links" or "material_sidecars" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations" or "model_validation_cache"
             ? tableName
             : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown library work table.");
 
@@ -6217,6 +6380,7 @@ internal static class UELibraryPostProcessor
         string root,
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
+        IEnumerable<MaterialInfo> materials,
         List<TextureLinkInfo> textureLinks,
         MaterialTextureSlotLink[] materialTextureSlots,
         SharedGltfTextureLink[] sharedGltfTextureLinks,
@@ -6265,6 +6429,22 @@ internal static class UELibraryPostProcessor
                 extension TEXT NOT NULL,
                 hard_linked INTEGER NOT NULL,
                 link_error TEXT
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE material_sidecars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                last_write_utc_ticks INTEGER NOT NULL,
+                texture_slot_count INTEGER NOT NULL,
+                color_count INTEGER NOT NULL,
+                scalar_count INTEGER NOT NULL,
+                switch_count INTEGER NOT NULL,
+                blend_mode TEXT,
+                shading_model TEXT,
+                raw_json TEXT NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -6613,6 +6793,9 @@ internal static class UELibraryPostProcessor
         foreach (var row in catalogRows)
             InsertAsset(connection, transaction, row);
 
+        foreach (var material in materials.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
+            InsertMaterialSidecar(connection, transaction, material);
+
         if (!InsertTextureLinksFromWorkDb(connection, transaction, root))
         {
             foreach (var link in textureLinks)
@@ -6676,6 +6859,8 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_assets_kind ON assets(kind, resource_kind);");
         Execute(connection, transaction, "CREATE INDEX idx_assets_skeleton ON assets(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_texture_hash ON texture_links(sha256);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_sidecars_name ON material_sidecars(name);");
+        Execute(connection, transaction, "CREATE INDEX idx_material_sidecars_path ON material_sidecars(relative_path);");
         Execute(connection, transaction, "CREATE INDEX idx_export_manifest_source ON export_manifest(source, kind);");
         Execute(connection, transaction, "CREATE INDEX idx_export_manifest_object ON export_manifest(object_path);");
         Execute(connection, transaction, "CREATE INDEX idx_export_manifest_output ON export_manifest(output);");
@@ -6776,6 +6961,34 @@ internal static class UELibraryPostProcessor
         Add(command, "$extension", link.Extension);
         Add(command, "$hardLinked", link.HardLinked ? 1 : 0);
         Add(command, "$linkError", link.LinkError);
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertMaterialSidecar(SqliteConnection connection, SqliteTransaction transaction, MaterialInfo material)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO material_sidecars (
+                name, relative_path, size_bytes, last_write_utc_ticks, texture_slot_count,
+                color_count, scalar_count, switch_count, blend_mode, shading_model, raw_json
+            )
+            VALUES (
+                $name, $relativePath, $sizeBytes, $lastWriteUtcTicks, $textureSlotCount,
+                $colorCount, $scalarCount, $switchCount, $blendMode, $shadingModel, $rawJson
+            );
+            """;
+        Add(command, "$name", material.Name);
+        Add(command, "$relativePath", material.RelativePath);
+        Add(command, "$sizeBytes", material.SizeBytes);
+        Add(command, "$lastWriteUtcTicks", material.LastWriteUtcTicks);
+        Add(command, "$textureSlotCount", material.TextureSlotCount);
+        Add(command, "$colorCount", material.ColorCount);
+        Add(command, "$scalarCount", material.ScalarCount);
+        Add(command, "$switchCount", material.SwitchCount);
+        Add(command, "$blendMode", material.BlendMode);
+        Add(command, "$shadingModel", material.ShadingModel);
+        Add(command, "$rawJson", material.RawJson.ToString(Formatting.None));
         command.ExecuteNonQuery();
     }
 
@@ -8286,7 +8499,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系、健康报告和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
-        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
+        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的材质 sidecar 摘要、贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
@@ -8299,6 +8512,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `animation_validation.json` | 动画兼容验证兼容/人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证兼容/人工排查视图；主数据在 `library_index.db.model_validation`。 |");
         sb.AppendLine("| `skeletons.json` | 骨架分组兼容/人工排查视图；主数据在 `library_index.db.skeleton_groups`。 |");
+        sb.AppendLine("| `library_index.db.material_sidecars` | 材质 sidecar 摘要和原始参数缓存；新后处理优先通过 `export_events.db.asset_catalog` 定位材质 JSON，再缓存到 SQLite，避免全盘递归扫描 JSON。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
@@ -8311,7 +8525,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -8706,6 +8920,8 @@ internal static class UELibraryPostProcessor
         public string Name { get; set; } = string.Empty;
         public string Path { get; set; } = string.Empty;
         public string RelativePath { get; set; } = string.Empty;
+        public long SizeBytes { get; set; }
+        public long LastWriteUtcTicks { get; set; }
         public int TextureSlotCount { get; set; }
         public int ColorCount { get; set; }
         public int ScalarCount { get; set; }

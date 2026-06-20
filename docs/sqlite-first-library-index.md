@@ -20,6 +20,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Animation bindings | `export_events.db.animation_bindings`, then `library_index.db.animation_bindings` | `animation_bindings.jsonl` is a compatibility view |
 | Auto referenced export diagnostics | `export_events.db.auto_referenced_exports`, then `library_index.db.auto_referenced_exports` | `auto_referenced_exports.jsonl` is a compatibility view |
 | Texture dedupe links | `library_work.db.texture_links`, then `library_index.db.texture_links` | `texture_links.jsonl` is a compatibility/debug view |
+| Material sidecar summaries | `library_work.db.material_sidecars`, then `library_index.db.material_sidecars` | Material JSON files remain optional human/export sidecars; postprocess should prefer SQLite/cache when present |
 | Material texture slots | `ue_source_index.db.material_texture_slots`, optionally `library_work.db.material_texture_slots`, then `library_index.db.material_texture_slots` | `material_texture_slots.jsonl` is a compatibility/debug view |
 | Shared glTF texture rewrites | `library_work.db.shared_gltf_texture_links`, then `library_index.db.shared_gltf_texture_links` | `shared_texture_gltf_links.jsonl` is a compatibility/debug view |
 | UE source relations | `ue_source_index.db`, optionally `library_work.db.component_asset_relations`, then `library_index.db.component_asset_relations` | `component_asset_relations.jsonl` is a compatibility/debug view |
@@ -58,7 +59,7 @@ These controls are deliberately scheduling-only: they must not change exported m
 
 ## SQLite-only mode
 
-`--postprocess-library <root> --sqlite-only-index` disables compatibility JSONL for large machine indexes where SQLite has an equivalent path. It routes texture dedupe links, material texture slot links, shared glTF texture rewrite links and full component relations through `library_work.db`, then imports them into the matching `library_index.db` tables.
+`--postprocess-library <root> --sqlite-only-index` disables compatibility JSONL for large machine indexes where SQLite has an equivalent path. It routes material sidecar summaries, texture dedupe links, material texture slot links, shared glTF texture rewrite links and full component relations through `library_work.db`, then imports them into the matching `library_index.db` tables.
 
 The mode must preserve row counts and deterministic evidence. For example, when a source index contains one component relation, SQLite-only postprocess must produce:
 
@@ -68,7 +69,7 @@ The mode must preserve row counts and deterministic evidence. For example, when 
 
 `--no-compat-json` is an alias for the same behavior.
 
-Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, model validation, skeleton groups, animation validation, model coverage, health/acceptance reports and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl`, `model_animations.json`, `library_health.json` and `library_acceptance.json`.
+Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, material sidecar summaries, model validation, skeleton groups, animation validation, model coverage, health/acceptance reports and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl`, `model_animations.json`, `library_health.json` and `library_acceptance.json`.
 
 ## Migration state
 
@@ -77,6 +78,7 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - `--materialize-animation-metadata` now updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` first, and only updates `asset_catalog.jsonl` / `animation_bindings.jsonl` as compatibility views when they exist.
 - Model validation cache now writes to `library_work.db.model_validation_cache`. Old per-model `.ue_model_validation_cache.json` files are read once for compatibility and migrated into SQLite, then deleted when possible.
+- Material sidecar summaries now write to `library_work.db.material_sidecars` and synchronize to `library_index.db.material_sidecars`; new postprocess runs prefer export-event Material rows over recursive `*.json` scans.
 - Postprocess can now stream full component relations to `library_work.db` and skip `component_asset_relations.jsonl` in SQLite-only mode.
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
 - Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
