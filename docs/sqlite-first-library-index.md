@@ -33,7 +33,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Model validation cache | `library_work.db.model_validation_cache` | per-model `.ue_model_validation_cache.json` files are legacy read-only cache inputs |
 | Model validation | `library_index.db.model_validation` | `model_validation.json` is a compatibility/debug view |
 | Model coverage | `library_index.db.model_coverage` | `model_coverage.json` is a compatibility/debug view |
-| Task model quality | `library_index.db.model_coverage` columns `is_task_or_prop`, `needs_review`, `relation_needs_review`, `review_reasons_json` and `relation_review_reasons_json` | `task_model_quality.json` is a compatibility/debug view |
+| Task model quality | `library_index.db.model_coverage` columns `is_task_or_prop`, `needs_review`, `relation_needs_review`, `review_reasons_json` and `relation_review_reasons_json`, plus `library_index.db.model_coverage_task_signals` | `task_model_quality.json` is a compatibility/debug view |
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
 | Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
 | Browser model/animation list | `library_index.db.model_animation_relations`, `library_index.db.relation_animations` and `library_index.db.relation_animation_evidence` | Browser must not depend on `model_animations.json`; animation evidence lists use `evidence_summary` for display and `relation_animation_evidence` for ordered steps |
@@ -94,7 +94,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - Standalone shared-texture dedupe now honors the SQLite-first defaults from export configs instead of always writing JSONL/JSON.
 - Postprocess skips animation validation and model-animation JSON views by default; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
 - Postprocess skips model validation and skeleton JSON views by default; query `model_validation` and `skeleton_groups` in `library_index.db`.
-- Postprocess skips model coverage, task model quality and component group JSON views by default; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` rebuilds its Markdown report directly from explicit `library_index.db.model_coverage` columns and no longer reads `model_coverage.json` or `model_coverage.raw_json`.
+- Postprocess skips model coverage, task model quality and component group JSON views by default; query `model_coverage`, `model_coverage_task_signals` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` rebuilds its Markdown report directly from explicit `library_index.db.model_coverage` columns plus `model_coverage_task_signals`, and no longer reads `model_coverage.json`, `model_coverage.raw_json` or a task-signal JSON array.
 - Postprocess stores library health and acceptance summaries in `library_index.db.library_reports` and skips `library_health.json` / `library_acceptance.json` by default.
 - Source-index resume metadata now lives in `ue_source_index.db.source_index_metadata`; `ue_source_index.metadata.json` is only written when compatibility JSON is explicitly enabled.
 - Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input and human-readable reports.

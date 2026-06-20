@@ -486,15 +486,26 @@ internal static class UELibraryPostProcessor
         connection.Open();
         if (!TableExists(connection, "model_coverage"))
             throw new FileNotFoundException("library_index.db.model_coverage is required to refresh task model quality.", dbPath);
+        if (!TableExists(connection, "model_coverage_task_signals"))
+            throw new FileNotFoundException("library_index.db.model_coverage_task_signals is required to refresh task model quality.", dbPath);
 
         var rows = new List<ModelCoverageRow>();
         using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT name, output, source, object_path, resource_kind, source_type, validation_status,
+            SELECT mc.name, mc.output, mc.source, mc.object_path, mc.resource_kind, mc.source_type, mc.validation_status,
                    is_static, has_skin, has_skeleton_path, material_count, texture_count,
-                   component_reference_count, source_index_object_count, animation_candidate_count
-            FROM model_coverage
-            ORDER BY output COLLATE NOCASE;
+                   component_reference_count, source_index_object_count, animation_candidate_count,
+                   COALESCE((
+                       SELECT group_concat(signal, char(31))
+                       FROM (
+                           SELECT signal
+                           FROM model_coverage_task_signals signal_rows
+                           WHERE signal_rows.model_coverage_id = mc.id
+                           ORDER BY signal_index
+                       )
+                   ), '')
+            FROM model_coverage mc
+            ORDER BY mc.output COLLATE NOCASE;
             """;
         using var reader = command.ExecuteReader();
         while (reader.Read())
@@ -517,7 +528,7 @@ internal static class UELibraryPostProcessor
                 ComponentReferenceCount = GetRequiredInt32(reader, 12),
                 SourceIndexObjectCount = GetRequiredInt32(reader, 13),
                 AnimationCandidateCount = GetRequiredInt32(reader, 14),
-                TaskSignals = FindTaskSignals(source ?? ""),
+                TaskSignals = SplitSqliteList(GetString(reader, 15)),
             });
         }
 
@@ -6606,8 +6617,16 @@ internal static class UELibraryPostProcessor
                 review_reasons_json TEXT NOT NULL,
                 relation_needs_review INTEGER NOT NULL,
                 relation_review_reasons_json TEXT NOT NULL,
-                task_signals_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_coverage_task_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_coverage_id INTEGER NOT NULL,
+                signal_index INTEGER NOT NULL,
+                signal TEXT NOT NULL,
+                FOREIGN KEY (model_coverage_id) REFERENCES model_coverage(id)
             );
             """);
         Execute(connection, transaction, """
@@ -6944,6 +6963,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task_signals ON model_coverage_task_signals(signal, model_coverage_id);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
         Execute(connection, transaction, "CREATE INDEX idx_shared_gltf_texture_links_model ON shared_gltf_texture_links(model);");
@@ -7397,7 +7417,7 @@ internal static class UELibraryPostProcessor
                     component_reference_count, source_index_object_count, animation_candidate_count,
                     is_task_or_prop, is_path_only_task, missing_materials, no_external_texture_slots, needs_review,
                     review_reasons_json, relation_needs_review, relation_review_reasons_json,
-                    task_signals_json, raw_json
+                    raw_json
                 )
                 VALUES (
                     $name, $output, $source, $objectPath, $resourceKind, $sourceType, $validationStatus,
@@ -7405,7 +7425,7 @@ internal static class UELibraryPostProcessor
                     $componentReferenceCount, $sourceIndexObjectCount, $animationCandidateCount,
                     $isTaskOrProp, $isPathOnlyTask, $missingMaterials, $noExternalTextureSlots, $needsReview,
                     $reviewReasonsJson, $relationNeedsReview, $relationReviewReasonsJson,
-                    $taskSignalsJson, $rawJson
+                    $rawJson
                 );
                 """;
             Add(command, "$name", (string?)row["Name"]);
@@ -7431,8 +7451,45 @@ internal static class UELibraryPostProcessor
             Add(command, "$reviewReasonsJson", JsonConvert.SerializeObject(reviewReasons));
             Add(command, "$relationNeedsReview", relationNeedsReview ? 1 : 0);
             Add(command, "$relationReviewReasonsJson", JsonConvert.SerializeObject(relationReviewReasons));
-            Add(command, "$taskSignalsJson", taskSignals.ToString(Formatting.None));
             Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+            var coverageId = GetLastInsertRowId(connection, transaction);
+            InsertModelCoverageTaskSignals(connection, transaction, coverageId, taskSignals);
+        }
+    }
+
+    private static void InsertModelCoverageTaskSignals(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long modelCoverageId,
+        JArray taskSignals)
+    {
+        var signals = taskSignals
+            .Select(x => (string?)x)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToArray();
+        if (modelCoverageId <= 0 || signals.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO model_coverage_task_signals (
+                model_coverage_id, signal_index, signal
+            )
+            VALUES (
+                $modelCoverageId, $signalIndex, $signal
+            );
+            """;
+        var idParam = command.Parameters.Add("$modelCoverageId", SqliteType.Integer);
+        var indexParam = command.Parameters.Add("$signalIndex", SqliteType.Integer);
+        var signalParam = command.Parameters.Add("$signal", SqliteType.Text);
+        idParam.Value = modelCoverageId;
+        for (var i = 0; i < signals.Length; i++)
+        {
+            indexParam.Value = i;
+            signalParam.Value = signals[i];
             command.ExecuteNonQuery();
         }
     }
@@ -8238,6 +8295,11 @@ internal static class UELibraryPostProcessor
 
     private static string? GetString(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+
+    private static string[] SplitSqliteList(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? []
+            : value.Split((char)31, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     private static int GetRequiredInt32(SqliteDataReader reader, int ordinal)
         => reader.IsDBNull(ordinal) ? 0 : Convert.ToInt32(reader.GetValue(ordinal));
