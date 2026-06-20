@@ -25,6 +25,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | UE source relations | `ue_source_index.db`, optionally `library_work.db.component_asset_relations`, then `library_index.db.component_asset_relations` | `component_asset_relations.jsonl` is a compatibility/debug view |
 | Component groups | `library_index.db.component_groups`; full details in `library_index.db.component_asset_relations` | `component_groups.json` is a compatibility/debug view |
 | UE package object maps | `ue_source_index.db.package_object_maps`, then optional sampled rows in `library_index.db.package_object_maps` | `package_object_maps.jsonl` is a compatibility/debug view |
+| Model validation cache | `library_work.db.model_validation_cache` | per-model `.ue_model_validation_cache.json` files are legacy read-only cache inputs |
 | Model validation | `library_index.db.model_validation` | `model_validation.json` is a compatibility/debug view |
 | Model coverage | `library_index.db.model_coverage` | `model_coverage.json` is a compatibility/debug view |
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
@@ -66,6 +67,7 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - Main export now writes `export_events.db` alongside compatibility JSONL.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - `--materialize-animation-metadata` now updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` first, and only updates `asset_catalog.jsonl` / `animation_bindings.jsonl` as compatibility views when they exist.
+- Model validation cache now writes to `library_work.db.model_validation_cache`. Old per-model `.ue_model_validation_cache.json` files are read once for compatibility and migrated into SQLite, then deleted when possible.
 - Postprocess can now stream full component relations to `library_work.db` and skip `component_asset_relations.jsonl` in SQLite-only mode.
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
 - Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.

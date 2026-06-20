@@ -720,6 +720,9 @@ internal static class UELibraryPostProcessor
         out ModelValidationEntry report)
     {
         report = null!;
+        if (TryLoadModelValidationCacheSqlite(root, glbPath, materialIndexSignature, out report))
+            return true;
+
         var path = BuildModelValidationCachePath(glbPath);
         if (!File.Exists(path))
             return false;
@@ -741,6 +744,16 @@ internal static class UELibraryPostProcessor
                 return false;
 
             report = ReadModelValidationCacheReport(root, glbPath, data);
+            try
+            {
+                WriteModelValidationCacheSqlite(root, glbPath, materialIndexSignature, report);
+                TryDeleteLegacyModelValidationCache(glbPath);
+            }
+            catch
+            {
+                // 旧缓存已经命中，迁移失败只影响后续速度，不能让本次命中失效。
+            }
+
             return true;
         }
         catch
@@ -757,20 +770,116 @@ internal static class UELibraryPostProcessor
     {
         try
         {
-            var modelInfo = new FileInfo(glbPath);
-            var json = new JObject
-            {
-                ["cacheVersion"] = ModelValidationCacheVersion,
-                ["modelSizeBytes"] = modelInfo.Length,
-                ["modelLastWriteUtcTicks"] = modelInfo.LastWriteTimeUtc.Ticks,
-                ["materialIndexSignature"] = materialIndexSignature,
-                ["report"] = BuildModelValidationCacheReport(report),
-            };
-            File.WriteAllText(BuildModelValidationCachePath(glbPath), json.ToString(Formatting.None), Encoding.UTF8);
+            WriteModelValidationCacheSqlite(root, glbPath, materialIndexSignature, report);
+            TryDeleteLegacyModelValidationCache(glbPath);
         }
         catch
         {
             // 缓存只用于加速，写失败不能影响素材库后处理。
+        }
+    }
+
+    private static bool TryLoadModelValidationCacheSqlite(
+        string root,
+        string glbPath,
+        string materialIndexSignature,
+        out ModelValidationEntry report)
+    {
+        report = null!;
+        try
+        {
+            using var connection = OpenLibraryWorkDbReadOnly(root);
+            if (connection == null ||
+                !TableExists(connection, "model_validation_cache") ||
+                !TableColumnExists(connection, "model_validation_cache", "report_json"))
+            {
+                return false;
+            }
+
+            var modelInfo = new FileInfo(glbPath);
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT report_json
+                FROM model_validation_cache
+                WHERE relative_path = $relativePath
+                  AND cache_version = $cacheVersion
+                  AND model_size_bytes = $modelSizeBytes
+                  AND model_last_write_utc_ticks = $modelLastWriteUtcTicks
+                  AND material_index_signature = $materialIndexSignature
+                LIMIT 1;
+                """;
+            Add(command, "$relativePath", NormalizeCatalogOutput(root, glbPath));
+            Add(command, "$cacheVersion", ModelValidationCacheVersion);
+            Add(command, "$modelSizeBytes", modelInfo.Length);
+            Add(command, "$modelLastWriteUtcTicks", modelInfo.LastWriteTimeUtc.Ticks);
+            Add(command, "$materialIndexSignature", materialIndexSignature);
+            var rawJson = command.ExecuteScalar() as string;
+            if (string.IsNullOrWhiteSpace(rawJson))
+                return false;
+
+            report = ReadModelValidationCacheReport(root, glbPath, JObject.Parse(rawJson));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void WriteModelValidationCacheSqlite(
+        string root,
+        string glbPath,
+        string materialIndexSignature,
+        ModelValidationEntry report)
+    {
+        var connection = OpenLibraryWorkDb(root);
+        try
+        {
+            var modelInfo = new FileInfo(glbPath);
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO model_validation_cache (
+                    relative_path, cache_version, model_size_bytes, model_last_write_utc_ticks,
+                    material_index_signature, report_json, updated_at
+                )
+                VALUES (
+                    $relativePath, $cacheVersion, $modelSizeBytes, $modelLastWriteUtcTicks,
+                    $materialIndexSignature, $reportJson, $updatedAt
+                )
+                ON CONFLICT(relative_path) DO UPDATE SET
+                    cache_version = excluded.cache_version,
+                    model_size_bytes = excluded.model_size_bytes,
+                    model_last_write_utc_ticks = excluded.model_last_write_utc_ticks,
+                    material_index_signature = excluded.material_index_signature,
+                    report_json = excluded.report_json,
+                    updated_at = excluded.updated_at;
+                """;
+            Add(command, "$relativePath", NormalizeCatalogOutput(root, glbPath));
+            Add(command, "$cacheVersion", ModelValidationCacheVersion);
+            Add(command, "$modelSizeBytes", modelInfo.Length);
+            Add(command, "$modelLastWriteUtcTicks", modelInfo.LastWriteTimeUtc.Ticks);
+            Add(command, "$materialIndexSignature", materialIndexSignature);
+            Add(command, "$reportJson", BuildModelValidationCacheReport(report).ToString(Formatting.None));
+            Add(command, "$updatedAt", DateTime.UtcNow.ToString("O"));
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            FinalizeWorkDb(connection);
+        }
+    }
+
+    private static void TryDeleteLegacyModelValidationCache(string glbPath)
+    {
+        try
+        {
+            var cachePath = BuildModelValidationCachePath(glbPath);
+            if (File.Exists(cachePath))
+                File.Delete(cachePath);
+        }
+        catch
+        {
+            // 缓存删不掉只会影响下一次扫描速度，不影响当前报告。
         }
     }
 
@@ -2236,10 +2345,22 @@ internal static class UELibraryPostProcessor
                 source_path TEXT
             );
             """);
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS model_validation_cache (
+                relative_path TEXT PRIMARY KEY,
+                cache_version INTEGER NOT NULL,
+                model_size_bytes INTEGER NOT NULL,
+                model_last_write_utc_ticks INTEGER NOT NULL,
+                material_index_signature TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """);
+        Execute(connection, "CREATE INDEX IF NOT EXISTS idx_model_validation_cache_signature ON model_validation_cache(cache_version, material_index_signature);");
     }
 
     private static string ValidateLibraryWorkTableName(string tableName)
-        => tableName is "texture_links" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations"
+        => tableName is "texture_links" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations" or "model_validation_cache"
             ? tableName
             : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown library work table.");
 
@@ -3103,7 +3224,7 @@ internal static class UELibraryPostProcessor
             WriteGlb(glbPath, gltf, newBin);
             report.EmbeddedImageCount = ArrayOf(gltf, "images").Count(x => x["bufferView"] != null);
             report.ImageCount = ArrayOf(gltf, "images").Length;
-            TryDeleteModelValidationCache(glbPath);
+            TryDeleteModelValidationCache(root, glbPath);
         }
         catch (Exception ex)
         {
@@ -3302,13 +3423,31 @@ internal static class UELibraryPostProcessor
     private static string BuildSharedTexturePath(string root, string hash, string extension)
         => Path.Combine(root, "Textures", "_Shared", hash[..2], $"{hash}{extension.ToLowerInvariant()}");
 
-    private static void TryDeleteModelValidationCache(string glbPath)
+    private static void TryDeleteModelValidationCache(string root, string glbPath)
+    {
+        TryDeleteModelValidationCacheSqlite(root, glbPath);
+        TryDeleteLegacyModelValidationCache(glbPath);
+    }
+
+    private static void TryDeleteModelValidationCacheSqlite(string root, string glbPath)
     {
         try
         {
-            var cachePath = BuildModelValidationCachePath(glbPath);
-            if (File.Exists(cachePath))
-                File.Delete(cachePath);
+            if (!File.Exists(GetLibraryWorkDbPath(root)))
+                return;
+
+            var connection = OpenLibraryWorkDb(root);
+            try
+            {
+                using var command = connection.CreateCommand();
+                command.CommandText = "DELETE FROM model_validation_cache WHERE relative_path = $relativePath;";
+                Add(command, "$relativePath", NormalizeCatalogOutput(root, glbPath));
+                command.ExecuteNonQuery();
+            }
+            finally
+            {
+                FinalizeWorkDb(connection);
+            }
         }
         catch
         {
