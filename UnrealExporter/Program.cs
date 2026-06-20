@@ -157,16 +157,16 @@ public class UnrealExporter
         if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             Console.WriteLine("ERROR: --postprocess-library requires an exported library root path.");
-            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures] [--sqlite-only-index]");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --postprocess-library <outputDir> [--dedupe-textures] [--compat-json]");
             return true;
         }
 
         // 后处理只读取已导出的 GLB/JSON/PNG，不需要重新挂载 pak。
         var root = args[1];
         var dedupeTextures = args.Any(x => x.Equals("--dedupe-textures", StringComparison.OrdinalIgnoreCase));
-        var writeCompatibilityJson = !args.Any(x =>
-            x.Equals("--sqlite-only-index", StringComparison.OrdinalIgnoreCase) ||
-            x.Equals("--no-compat-json", StringComparison.OrdinalIgnoreCase));
+        var writeCompatibilityJson = args.Any(x =>
+            x.Equals("--compat-json", StringComparison.OrdinalIgnoreCase) ||
+            x.Equals("--write-compat-json", StringComparison.OrdinalIgnoreCase));
         UELibraryPostProcessor.Run(root, dedupeTextures, writeCompatibilityJson);
         return true;
     }
@@ -208,17 +208,18 @@ public class UnrealExporter
         var animation = GetCommandOption(args, "--animation");
         var output = GetCommandOption(args, "--output");
         var report = GetCommandOption(args, "--report");
+        var reportDb = GetCommandOption(args, "--report-db");
         var skipBoneRegex = GetCommandOption(args, "--skip-animation-bone-regex");
         if (string.IsNullOrWhiteSpace(model) ||
             string.IsNullOrWhiteSpace(animation) ||
             string.IsNullOrWhiteSpace(output))
         {
-            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb> [--report <preview_validation.json>].");
+            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb> [--report-db <preview_validation.db>] [--report <debug.json>].");
             Environment.ExitCode = 2;
             return true;
         }
 
-        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report, skipBoneRegex);
+        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report, reportDb, skipBoneRegex);
         return true;
     }
 
@@ -4030,8 +4031,8 @@ public class ConfigObj
     public string? UseCheckpointFile { get; set; }
     public bool GenerateLibraryIndexes { get; set; }
     public bool UseSharedTextures { get; set; }
-    public bool SqliteOnlyIndex { get; set; }
-    public bool WriteCompatibilityJson { get; set; } = true;
+    public bool SqliteOnlyIndex { get; set; } = true;
+    public bool WriteCompatibilityJson { get; set; }
     public bool GenerateSourceIndex { get; set; }
     public bool? AutoExportReferencedAssets { get; set; }
     public bool? AutoExportCompatibleAnimations { get; set; }

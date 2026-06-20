@@ -35,6 +35,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
 | Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
 | Browser model/animation list | `library_index.db.model_animation_relations` and `library_index.db.relation_animations` | Browser must not depend on `model_animations.json` |
+| Animation preview validation | `preview_validation.db.preview_validation_reports` in the preview cache/output directory | `preview_validation.json` is only a manually requested debug view when `--report` is used |
 | Library health and acceptance reports | `library_index.db.library_reports` | `library_health.json` and `library_acceptance.json` are compatibility/human-inspection views |
 | Human reports | `library_index.db` for queries, JSON for readable summaries | JSON remains acceptable |
 
@@ -59,36 +60,35 @@ Full UE5 exports should keep package work bounded with `maxHeavyExportDegreeOfPa
 
 These controls are deliberately scheduling-only: they must not change exported meshes, textures, materials, skeletons, animation files or deterministic relationship rows. `sourceIndexCommitInterval` also helps bound the source-index builder by committing smaller SQLite batches during very large scans.
 
-## SQLite-only mode
+## SQLite-first default
 
-`--postprocess-library <root> --sqlite-only-index` disables compatibility JSONL/JSON summaries for large machine indexes where SQLite has an equivalent path. It routes material sidecar summaries, texture dedupe links and dedupe summary, material texture slot links, shared glTF texture rewrite links and full component relations through `library_work.db`, then imports them into the matching `library_index.db` tables.
+Exports, standalone shared-texture dedupe, animation preview validation and `--postprocess-library <root>` default to SQLite-backed machine indexes. JSON/JSONL summaries are skipped where SQLite has an equivalent path. The postprocessor routes material sidecar summaries, texture dedupe links and dedupe summary, material texture slot links, shared glTF texture rewrite links and full component relations through `library_work.db`, then imports them into the matching `library_index.db` tables.
 
-The mode must preserve row counts and deterministic evidence. For example, when a source index contains one component relation, SQLite-only postprocess must produce:
+This default must preserve row counts and deterministic evidence. For example, when a source index contains one component relation, SQLite-first postprocess must produce:
 
-- no compatibility JSONL for the SQLite-backed machine indexes
+- no JSONL for SQLite-backed machine indexes unless a human/debug view was explicitly requested
 - matching rows in the relevant `library_work.db` tables
 - matching rows in the relevant `library_index.db` tables
 
-`--no-compat-json` is an alias for the same behavior.
-
-Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. The source-index builder writes resume/fingerprint state to `ue_source_index.db.source_index_metadata` and can skip `ue_source_index.metadata.json`. Standalone shared-texture dedupe also respects the same compatibility setting and stores its links/summary in `library_work.db`. Postprocess keeps the merged catalog, material sidecar summaries, texture dedupe summary, model validation, skeleton groups, animation validation, model coverage, health/acceptance reports and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `texture_dedupe_summary.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl`, `model_animations.json`, `library_health.json` and `library_acceptance.json`.
+`sqliteOnlyIndex` defaults to `true` and `writeCompatibilityJson` defaults to `false`. `--postprocess-library` accepts `--compat-json` only when a human-readable/debug JSON view is deliberately needed. In the default mode the main export pass writes `export_events.db`, but skips `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. The source-index builder writes resume/fingerprint state to `ue_source_index.db.source_index_metadata` and skips `ue_source_index.metadata.json`. Standalone shared-texture dedupe also respects the same compatibility setting and stores its links/summary in `library_work.db`. Postprocess keeps the merged catalog, material sidecar summaries, texture dedupe summary, model validation, skeleton groups, animation validation, model coverage, health/acceptance reports and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `texture_dedupe_summary.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl`, `model_animations.json`, `library_health.json` and `library_acceptance.json`.
 
 ## Migration state
 
 - `UE5LibraryBrowser` already requires `library_index.db`.
-- Main export now writes `export_events.db` alongside compatibility JSONL.
+- `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
+- Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
-- Auto referenced export diagnostics now stream to `export_events.db.auto_referenced_exports` in bounded batches during rule planning; compatibility `auto_referenced_exports.jsonl` is only written when compatibility JSON is enabled.
+- Auto referenced export diagnostics now stream to `export_events.db.auto_referenced_exports` in bounded batches during rule planning; `auto_referenced_exports.jsonl` is only written when compatibility JSON is explicitly enabled.
 - `--materialize-animation-metadata` now updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` first, and only updates `asset_catalog.jsonl` / `animation_bindings.jsonl` as compatibility views when they exist.
 - Model validation cache now writes to `library_work.db.model_validation_cache`. Old per-model `.ue_model_validation_cache.json` files are read once for compatibility and migrated into SQLite, then deleted when possible.
 - Material sidecar summaries now write to `library_work.db.material_sidecars` and synchronize to `library_index.db.material_sidecars`; new postprocess runs prefer export-event Material rows over recursive `*.json` scans.
-- Postprocess can now stream full component relations to `library_work.db` and skip `component_asset_relations.jsonl` in SQLite-only mode.
-- Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
-- Texture dedupe summary now writes to `library_work.db.library_reports(name='texture_dedupe')` and syncs to `library_index.db.library_reports`; `texture_dedupe_summary.json` is only a compatibility view.
-- Standalone shared-texture dedupe now honors `sqliteOnlyIndex` / `writeCompatibilityJson` from export configs instead of always writing compatibility JSONL/JSON.
-- Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
-- Postprocess can now skip model validation and skeleton compatibility JSON views in SQLite-only mode; query `model_validation` and `skeleton_groups` in `library_index.db`.
-- Postprocess can now skip model coverage, task model quality and component group compatibility JSON views in SQLite-only mode; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its Markdown report from `library_index.db.model_coverage` when `model_coverage.json` is absent without regenerating `task_model_quality.json`.
-- Postprocess can now store library health and acceptance summaries in `library_index.db.library_reports` and skip `library_health.json` / `library_acceptance.json` in SQLite-only mode.
-- Source-index resume metadata now lives in `ue_source_index.db.source_index_metadata`; `ue_source_index.metadata.json` is only written as a compatibility view when compatibility JSON is enabled.
+- Postprocess can now stream full component relations to `library_work.db` and skips `component_asset_relations.jsonl` by default.
+- Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skips their JSONL views by default.
+- Texture dedupe summary now writes to `library_work.db.library_reports(name='texture_dedupe')` and syncs to `library_index.db.library_reports`; `texture_dedupe_summary.json` is only an explicitly requested debug view.
+- Standalone shared-texture dedupe now honors the SQLite-first defaults from export configs instead of always writing JSONL/JSON.
+- Postprocess skips animation validation and model-animation JSON views by default; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
+- Postprocess skips model validation and skeleton JSON views by default; query `model_validation` and `skeleton_groups` in `library_index.db`.
+- Postprocess skips model coverage, task model quality and component group JSON views by default; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its Markdown report from `library_index.db.model_coverage` when `model_coverage.json` is absent without regenerating `task_model_quality.json`.
+- Postprocess stores library health and acceptance summaries in `library_index.db.library_reports` and skips `library_health.json` / `library_acceptance.json` by default.
+- Source-index resume metadata now lives in `ue_source_index.db.source_index_metadata`; `ue_source_index.metadata.json` is only written when compatibility JSON is explicitly enabled.
 - Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input and human-readable reports.

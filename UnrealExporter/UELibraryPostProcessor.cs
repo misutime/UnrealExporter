@@ -17,7 +17,7 @@ internal static class UELibraryPostProcessor
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 
-    public static void Run(string libraryRoot, bool dedupeTextures, bool writeCompatibilityJson = true)
+    public static void Run(string libraryRoot, bool dedupeTextures, bool writeCompatibilityJson = false)
     {
         if (string.IsNullOrWhiteSpace(libraryRoot))
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
@@ -5992,7 +5992,7 @@ internal static class UELibraryPostProcessor
             },
             notes = new[]
             {
-                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
+                "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，浏览器默认报告为预览缓存目录的 preview_validation.db。",
                 "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但源索引确认到对象时记录为 sourceIndexedPathEvidence。",
                 "动画 explicitUsage 来自 UE 组件/蓝图/AnimClass 等显式关系；skeletonCompatibility 来自同 USkeleton 且骨骼覆盖验证通过的可复用候选。验证 error 不进入可用动画。",
                 "贴图去重通过 Textures/_Shared、library_index.db.texture_links 和 library_index.db.library_reports 的 texture_dedupe 摘要验证，GLB 内嵌贴图不会被强行拆出。",
@@ -8574,7 +8574,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| --- | --- |");
         sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系、健康报告和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
-        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的材质 sidecar 摘要、贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
+        sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如材质 sidecar 摘要、贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录源索引 resume/fingerprint 状态、完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
@@ -8599,9 +8599,9 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("## 模型动画关系字段");
         sb.AppendLine();
-        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
+        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是显式请求兼容/调试 JSON 时才生成的人读视图，默认可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`，贴图去重摘要会进入 `library_index.db.library_reports`。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("默认导出和后处理采用 SQLite-first：大型机器索引进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`，贴图去重摘要会进入 `library_index.db.library_reports`。只有显式请求兼容/调试 JSON 时才写这些人读视图，完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -8651,7 +8651,7 @@ internal static class UELibraryPostProcessor
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }
 
-    public static void DeduplicateTextureFiles(string root, bool writeCompatibilityJson = true)
+    public static void DeduplicateTextureFiles(string root, bool writeCompatibilityJson = false)
     {
         DeduplicateTextureFilesCore(root, writeCompatibilityJson);
     }

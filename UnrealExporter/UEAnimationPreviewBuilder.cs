@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Text.RegularExpressions;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SharpGLTF.IO;
 using SharpGLTF.Schema2;
 
@@ -8,13 +10,25 @@ namespace UnrealExporter;
 
 internal static class UEAnimationPreviewBuilder
 {
-    public static int Run(string modelPath, string animationPath, string outputPath, string? reportPath = null, string? skipBoneRegex = null)
+    public static int Run(
+        string modelPath,
+        string animationPath,
+        string outputPath,
+        string? reportPath = null,
+        string? reportDbPath = null,
+        string? skipBoneRegex = null)
     {
-        reportPath = string.IsNullOrWhiteSpace(reportPath)
-            ? Path.ChangeExtension(Path.GetFullPath(outputPath), ".preview_validation.json")
-            : Path.GetFullPath(reportPath);
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
-        Directory.CreateDirectory(Path.GetDirectoryName(reportPath)!);
+        var fullOutputPath = Path.GetFullPath(outputPath);
+        reportPath = string.IsNullOrWhiteSpace(reportPath) ? null : Path.GetFullPath(reportPath);
+        reportDbPath = string.IsNullOrWhiteSpace(reportDbPath) ? null : Path.GetFullPath(reportDbPath);
+        if (reportPath == null && reportDbPath == null)
+            reportDbPath = Path.ChangeExtension(fullOutputPath, ".preview_validation.db");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(fullOutputPath)!);
+        if (reportPath != null)
+            Directory.CreateDirectory(Path.GetDirectoryName(reportPath)!);
+        if (reportDbPath != null)
+            Directory.CreateDirectory(Path.GetDirectoryName(reportDbPath)!);
 
         try
         {
@@ -116,11 +130,12 @@ internal static class UEAnimationPreviewBuilder
             var status = matchedTracks > 0 && writtenChannels > 0 && File.Exists(outputPath)
                 ? missingBones.Count == 0 && !anyAdjustedOrSkipped && !heavyTranslationRetarget ? "ok" : "warning"
                 : "error";
-            WriteReport(reportPath, new
+            WriteReport(reportPath, reportDbPath, new
             {
                 status,
-                gltf = Path.GetFullPath(outputPath),
+                gltf = fullOutputPath,
                 report = reportPath,
+                reportDb = reportDbPath,
                 model = Path.GetFullPath(modelPath),
                 animation = Path.GetFullPath(animationPath),
                 animationName = animation.Name,
@@ -159,11 +174,12 @@ internal static class UEAnimationPreviewBuilder
         }
         catch (Exception ex)
         {
-            WriteReport(reportPath, new
+            WriteReport(reportPath, reportDbPath, new
             {
                 status = "error",
                 gltf = (string?)null,
                 report = reportPath,
+                reportDb = reportDbPath,
                 model = Path.GetFullPath(modelPath),
                 animation = Path.GetFullPath(animationPath),
                 error = ex.Message,
@@ -252,11 +268,100 @@ internal static class UEAnimationPreviewBuilder
         return result;
     }
 
-    private static void WriteReport(string path, object report)
+    private static void WriteReport(string? path, string? dbPath, object report)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        File.WriteAllText(path, JsonConvert.SerializeObject(report, Formatting.Indented));
+        var rawJson = JsonConvert.SerializeObject(report, Formatting.Indented);
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+            File.WriteAllText(path, rawJson);
+        }
+
+        if (!string.IsNullOrWhiteSpace(dbPath))
+            WriteReportDb(dbPath, JObject.Parse(rawJson));
     }
+
+    private static void WriteReportDb(string dbPath, JObject report)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath))!);
+        SQLitePCL.Batteries_V2.Init();
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS preview_validation_reports (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                status TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                gltf TEXT,
+                model TEXT,
+                animation TEXT,
+                animation_name TEXT,
+                frame_count INTEGER,
+                frames_per_second REAL,
+                duration REAL,
+                track_count INTEGER,
+                matched_tracks INTEGER,
+                missing_track_count INTEGER,
+                written_channels INTEGER,
+                raw_json TEXT NOT NULL
+            );
+            """);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO preview_validation_reports (
+                id, status, generated_at, gltf, model, animation, animation_name,
+                frame_count, frames_per_second, duration, track_count,
+                matched_tracks, missing_track_count, written_channels, raw_json
+            )
+            VALUES (
+                1, $status, $generatedAt, $gltf, $model, $animation, $animationName,
+                $frameCount, $framesPerSecond, $duration, $trackCount,
+                $matchedTracks, $missingTrackCount, $writtenChannels, $rawJson
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                generated_at = excluded.generated_at,
+                gltf = excluded.gltf,
+                model = excluded.model,
+                animation = excluded.animation,
+                animation_name = excluded.animation_name,
+                frame_count = excluded.frame_count,
+                frames_per_second = excluded.frames_per_second,
+                duration = excluded.duration,
+                track_count = excluded.track_count,
+                matched_tracks = excluded.matched_tracks,
+                missing_track_count = excluded.missing_track_count,
+                written_channels = excluded.written_channels,
+                raw_json = excluded.raw_json;
+            """;
+        Add(command, "$status", (string?)report["status"] ?? "unknown");
+        Add(command, "$generatedAt", DateTime.UtcNow.ToString("O"));
+        Add(command, "$gltf", (string?)report["gltf"]);
+        Add(command, "$model", (string?)report["model"]);
+        Add(command, "$animation", (string?)report["animation"]);
+        Add(command, "$animationName", (string?)report["animationName"]);
+        Add(command, "$frameCount", (int?)report["frameCount"]);
+        Add(command, "$framesPerSecond", (double?)report["framesPerSecond"]);
+        Add(command, "$duration", (double?)report["duration"]);
+        Add(command, "$trackCount", (int?)report["trackCount"]);
+        Add(command, "$matchedTracks", (int?)report["matchedTracks"]);
+        Add(command, "$missingTrackCount", (int?)report["missingTrackCount"]);
+        Add(command, "$writtenChannels", (int?)report["writtenChannels"]);
+        Add(command, "$rawJson", report.ToString(Formatting.None));
+        command.ExecuteNonQuery();
+        Execute(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    private static void Execute(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static void Add(SqliteCommand command, string name, object? value)
+        => command.Parameters.AddWithValue(name, value ?? DBNull.Value);
 
 }
 

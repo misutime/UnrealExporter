@@ -33,7 +33,7 @@ internal sealed class PreviewComposer
         var directory = Path.Combine(_cacheRoot, Hash(modelPath + "|" + animation.Output));
         Directory.CreateDirectory(directory);
         var output = Path.Combine(directory, $"{SafeName(model.Name)}__{SafeName(animation.Name)}.preview.glb");
-        var report = Path.Combine(directory, "preview_validation.json");
+        var report = Path.Combine(directory, "preview_validation.db");
         if (File.Exists(output))
             return new PreviewResult(true, output, report, "使用缓存 preview。");
 
@@ -61,7 +61,7 @@ internal sealed class PreviewComposer
         start.ArgumentList.Add(animation.Output);
         start.ArgumentList.Add("--output");
         start.ArgumentList.Add(output);
-        start.ArgumentList.Add("--report");
+        start.ArgumentList.Add("--report-db");
         start.ArgumentList.Add(report);
 
         using var process = Process.Start(start);

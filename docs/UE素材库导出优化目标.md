@@ -45,9 +45,9 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 已增加骨架兼容验证：bone 覆盖率、父子关系、track bone index 覆盖；后续继续补 bbox/姿态采样验证。
 
 6. 索引与报告
-   - `library_index.db` 是已导出素材库的 SQLite 优先查询入口，浏览器、筛选器和验收脚本默认应读 SQLite；JSON/JSONL 保留为流式导出日志、人工 diff 和兼容旧工具的产物。
-   - 使用 `--sqlite-only-index` / `--no-compat-json` 后处理，或在全量导出配置里设置 `sqliteOnlyIndex: true` / `writeCompatibilityJson: false` 时，导出事件优先写入 `export_events.db`，源包对象映射和源索引 resume/fingerprint 状态保留在 `ue_source_index.db`，材质 sidecar 摘要、贴图去重关系和摘要、材质贴图槽、glTF 共享贴图改写关系、组件关系、组件聚合、模型验证缓存、模型覆盖、任务模型质量、模型验证、骨架分组、动画验证、模型动画关系、健康报告和验收报告优先写入 `library_work.db` / `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`ue_source_index.metadata.json`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`model_validation.json`、`skeletons.json`、`animation_validation.json`、`animation_validation.jsonl`、`model_animations.json`、`library_health.json`、`library_acceptance.json` 可不生成；旧版 `.ue_model_validation_cache.json` 只作为一次性兼容缓存读取，命中后会迁移到 `library_work.db.model_validation_cache`。
-   - 即使 `generateLibraryIndexes=false` 只运行共享贴图去重，`sqliteOnlyIndex` / `writeCompatibilityJson:false` 也必须生效：贴图链接和去重摘要写入 `library_work.db`，不额外生成 `texture_links.jsonl` / `texture_dedupe_summary.json`。
+   - `library_index.db` 是已导出素材库的 SQLite 优先查询入口，浏览器、筛选器和验收脚本默认应读 SQLite；JSON/JSONL 只在明确需要人工 diff/调试视图时生成。
+   - 默认 `sqliteOnlyIndex=true` / `writeCompatibilityJson=false`：导出事件优先写入 `export_events.db`，源包对象映射和源索引 resume/fingerprint 状态保留在 `ue_source_index.db`，材质 sidecar 摘要、贴图去重关系和摘要、材质贴图槽、glTF 共享贴图改写关系、组件关系、组件聚合、模型验证缓存、模型覆盖、任务模型质量、模型验证、骨架分组、动画验证、模型动画关系、健康报告和验收报告优先写入 `library_work.db` / `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`ue_source_index.metadata.json`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`model_validation.json`、`skeletons.json`、`animation_validation.json`、`animation_validation.jsonl`、`model_animations.json`、`library_health.json`、`library_acceptance.json` 默认不生成；旧版 `.ue_model_validation_cache.json` 只作为一次性缓存迁移读取，命中后会迁移到 `library_work.db.model_validation_cache`。
+   - 即使 `generateLibraryIndexes=false` 只运行共享贴图去重，SQLite-first 默认也必须生效：贴图链接和去重摘要写入 `library_work.db`，不额外生成 `texture_links.jsonl` / `texture_dedupe_summary.json`。
    - 大型 UE5 全量导出应配置 `maxHeavyExportDegreeOfParallelism` 和 `memorySoftLimitGb`。`maxDegreeOfParallelism` 控制整体扫描并发，`maxHeavyExportDegreeOfParallelism` 只限制 `uasset` / `umap` 包加载、贴图解码、模型/动画导出这类重活的同时数量；`memorySoftLimitGb` 按进程 Private Bytes 做软水位，超过后会暂停新重活、触发 GC，等内存回落后继续。它们只影响调度和稳定性，不改变 Mesh、贴图、材质、骨骼、动画导出内容。
    - `sourceIndexCommitInterval` 控制源索引事务提交批次。全量 NTE/Batman 这类 20 万级包索引建议保持在 100 左右，降低 SQLite WAL、事务和 CUE4Parse 临时对象叠加造成的峰值；需要极限吞吐时可以调大，但内存峰值也会更难控。
    - `library_index.db.assets` 是素材库资产查询总入口；`asset_catalog.jsonl` 仅作为兼容视图，导出主链路数据优先来自 `export_events.db.asset_catalog`，后处理再同步到 `library_index.db.assets`。
@@ -58,6 +58,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `model_validation.json` 验证 GLB/glTF mesh、material、image、skin、bbox，并结合材质 sidecar 与 `material_texture_slots` 判断外部材质贴图关系，避免把未内嵌贴图但关系完整的模型误报为异常。
    - `ue_source_index.db` 面向完整 UE 源目录，记录 source_index_metadata、source_files、source_objects、source_relations、material_texture_slots、skeleton_bones、mesh_sockets、component_asset_relations、animation_tracks、animation_notifies、animation_curves、animation_segments、animation_sections 和 source_index_errors。
    - `library_index.db` 面向已导出素材库，记录 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports 和 package_object_maps。常用筛选字段必须显式列化，完整细节可继续保留在 `raw_json`。
+   - 浏览器合成 `.ueanim` 预览时，验证报告默认写入预览缓存目录的 `preview_validation.db.preview_validation_reports`；`preview_validation.json` 仅作为命令行 `--report` 人工调试输出。
 
 ## 优化列表
 
@@ -116,5 +117,5 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 - `asset_catalog.jsonl` 同时包含模型、贴图、材质、动画，并保留 UE 源路径和对象路径。
 - 共享贴图库能减少重复 PNG/HDR 文件，原路径可继续被旧流程访问。
 - SQLite 重建前应清理旧 `.db-wal/.db-shm`，输出完成后应截断 WAL，避免 `ue_source_index.db-wal` / `library_index.db-wal` 长期重复占用磁盘空间。
-- 大库默认推荐使用 `--sqlite-only-index` / `--no-compat-json`，避免机器索引重复写成超大 JSONL 后再读回内存；验收脚本和浏览器必须以 SQLite 表为准。
+- 大库默认就是 SQLite-first，避免机器索引重复写成超大 JSONL 后再读回内存；验收脚本和浏览器必须以 SQLite 表为准。
 - 任何不能导出的动画或模型都有明确 blocked/error 原因，而不是静默缺失。
