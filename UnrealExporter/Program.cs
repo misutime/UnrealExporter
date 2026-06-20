@@ -185,11 +185,14 @@ public class UnrealExporter
         if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             Console.WriteLine("ERROR: --materialize-animation-metadata requires an exported library root path.");
-            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --materialize-animation-metadata <outputDir>");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --materialize-animation-metadata <outputDir> [--compat-json]");
             return true;
         }
 
-        UELibraryPostProcessor.MaterializeAnimationMetadataSidecars(args[1]);
+        var writeCompatibilityJson = args.Any(x =>
+            x.Equals("--compat-json", StringComparison.OrdinalIgnoreCase) ||
+            x.Equals("--write-compat-json", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.MaterializeAnimationMetadataSidecars(args[1], writeCompatibilityJson);
         return true;
     }
 
@@ -1232,10 +1235,14 @@ public class UnrealExporter
                                             if (NeedsAclNative(animationAsset) && !HasAclNativeExports())
                                             {
                                                 const string error = "missingNativeFeature: ACL. CUE4Parse-Natives 没有编入 ACL，无法解压 ACL 压缩动画。请补齐 CUE4Parse-Natives/ACL/external/acl 后重建。";
-                                                var diagnosticPath = objectOutputPath + "." + outputType + ".missing-acl.json";
                                                 Console.WriteLine($"WARN: Skipped animation {file.Value.Path} ({error})");
-                                                WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
-                                                AppendExportManifest(config, file.Value.Path, obj, diagnosticPath, "AnimationMetadata");
+                                                if (ShouldWriteCompatibilityJson(config))
+                                                {
+                                                    var diagnosticPath = objectOutputPath + "." + outputType + ".missing-acl.json";
+                                                    WriteAnimationDiagnostic(config, file.Value.Path, animationAsset, diagnosticPath, "blocked", error);
+                                                    AppendExportManifest(config, file.Value.Path, obj, diagnosticPath, "AnimationMetadata");
+                                                }
+
                                                 AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, objectOutputPath + "." + outputType, outputType, "blocked", error));
                                                 AppendAnimationBinding(config, file.Value.Path, animationAsset, null, "blocked", error);
                                                 break;
@@ -1273,12 +1280,12 @@ public class UnrealExporter
                                                     $"ERROR: Failed to export {file.Value.Path} as {outputType}{(string.IsNullOrWhiteSpace(label) ? "" : $" ({label})")}."
                                                 );
                                                 var error = label ?? "exporter returned false";
-                                                var metadataPath = objectOutputPath + "." + outputType + ".metadata.json";
-                                                if (TryWriteAnimationMetadataSidecar(config, file.Value.Path, animationAsset, metadataPath, "metadata", error))
+                                                if (TryPrepareAnimationMetadataOutput(config, file.Value.Path, animationAsset, objectOutputPath + "." + outputType, "metadata", error, out var metadataOutput, out var metadataFormat))
                                                 {
-                                                    AppendExportManifest(config, file.Value.Path, obj, metadataPath, "AnimationMetadata");
-                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataPath, "json", "metadata", error));
-                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataPath, "metadata", error);
+                                                    if (ShouldWriteCompatibilityJson(config))
+                                                        AppendExportManifest(config, file.Value.Path, obj, metadataOutput, "AnimationMetadata");
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataOutput, metadataFormat, "metadata", error));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataOutput, "metadata", error);
                                                 }
                                                 else
                                                 {
@@ -1291,12 +1298,12 @@ public class UnrealExporter
                                                 Console.WriteLine(
                                                     $"WARN: Skipped animation {file.Value.Path} ({ex.Message})"
                                                 );
-                                                var metadataPath = objectOutputPath + "." + outputType + ".metadata.json";
-                                                if (TryWriteAnimationMetadataSidecar(config, file.Value.Path, animationAsset, metadataPath, "metadata", ex.Message))
+                                                if (TryPrepareAnimationMetadataOutput(config, file.Value.Path, animationAsset, objectOutputPath + "." + outputType, "metadata", ex.Message, out var metadataOutput, out var metadataFormat))
                                                 {
-                                                    AppendExportManifest(config, file.Value.Path, obj, metadataPath, "AnimationMetadata");
-                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataPath, "json", "metadata", ex.Message));
-                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataPath, "metadata", ex.Message);
+                                                    if (ShouldWriteCompatibilityJson(config))
+                                                        AppendExportManifest(config, file.Value.Path, obj, metadataOutput, "AnimationMetadata");
+                                                    AppendAssetCatalog(config, BuildAnimationCatalogEntry(file.Value.Path, obj, metadataOutput, metadataFormat, "metadata", ex.Message));
+                                                    AppendAnimationBinding(config, file.Value.Path, animationAsset, metadataOutput, "metadata", ex.Message);
                                                 }
                                                 else
                                                 {
@@ -3290,7 +3297,49 @@ public class UnrealExporter
         File.WriteAllText(outputPath, JsonConvert.SerializeObject(diagnostic, Formatting.Indented));
     }
 
-    private static bool TryWriteAnimationMetadataSidecar(
+    private static bool TryPrepareAnimationMetadataOutput(
+        ConfigObj config,
+        string sourcePath,
+        UAnimationAsset asset,
+        string attemptedOutputPath,
+        string status,
+        string error,
+        out string metadataOutput,
+        out string metadataFormat)
+    {
+        metadataOutput = Path.GetFullPath(attemptedOutputPath);
+        metadataFormat = "sqlite";
+        if (!HasUsefulAnimationMetadata(asset))
+            return false;
+
+        if (!ShouldWriteCompatibilityJson(config))
+            return true;
+
+        var outputPath = attemptedOutputPath + ".metadata.json";
+        WriteAnimationMetadataSidecar(config, sourcePath, asset, outputPath, status, error);
+        metadataOutput = Path.GetFullPath(outputPath);
+        metadataFormat = "json";
+        return true;
+    }
+
+    private static bool HasUsefulAnimationMetadata(UAnimationAsset asset)
+    {
+        var sequence = asset as UAnimSequence;
+        var sequenceBase = asset as UAnimSequenceBase;
+        var curves = BuildAnimationCurveEntries(sequence);
+        var notifies = BuildAnimationNotifyEntries(sequenceBase);
+        var segments = BuildAnimationSegmentEntries(asset);
+        var sections = BuildAnimationSectionEntries(asset);
+        return curves.Length > 0
+            || notifies.Length > 0
+            || segments.Length > 0
+            || sections.Length > 0
+            || sequenceBase?.SequenceLength > 0
+            || !string.IsNullOrWhiteSpace(GetPackageIndexPath(asset.Skeleton))
+            || !string.IsNullOrWhiteSpace(asset.GetPathName());
+    }
+
+    private static void WriteAnimationMetadataSidecar(
         ConfigObj config,
         string sourcePath,
         UAnimationAsset asset,
@@ -3305,15 +3354,6 @@ public class UnrealExporter
         var notifies = BuildAnimationNotifyEntries(sequenceBase);
         var segments = BuildAnimationSegmentEntries(asset);
         var sections = BuildAnimationSectionEntries(asset);
-        var hasUsefulMetadata = curves.Length > 0
-            || notifies.Length > 0
-            || segments.Length > 0
-            || sections.Length > 0
-            || sequenceBase?.SequenceLength > 0
-            || !string.IsNullOrWhiteSpace(GetPackageIndexPath(asset.Skeleton))
-            || !string.IsNullOrWhiteSpace(asset.GetPathName());
-        if (!hasUsefulMetadata)
-            return false;
 
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         var sidecar = new
@@ -3348,7 +3388,6 @@ public class UnrealExporter
             note = "这是导出失败动画的可读元数据/诊断侧车，不是可直接播放的 .ueanim。曲线、通知、容器片段、时长和 Skeleton 等事实仍可用于素材库检索和后续动画支持。",
         };
         File.WriteAllText(outputPath, JsonConvert.SerializeObject(sidecar, Formatting.Indented));
-        return true;
     }
 
     private static bool NeedsAclNative(UAnimationAsset? asset)

@@ -103,7 +103,7 @@ internal static class UELibraryPostProcessor
         Console.WriteLine($"UE Library postprocess finished: {root}");
     }
 
-    public static void MaterializeAnimationMetadataSidecars(string libraryRoot)
+    public static void MaterializeAnimationMetadataSidecars(string libraryRoot, bool writeCompatibilityJson = false)
     {
         if (string.IsNullOrWhiteSpace(libraryRoot))
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
@@ -112,14 +112,16 @@ internal static class UELibraryPostProcessor
         if (!Directory.Exists(root))
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
-        var catalogSummary = MaterializeAnimationMetadataRows(root, "asset_catalog", Path.Combine(root, "asset_catalog.jsonl"), updateCatalogRow: true);
-        var bindingSummary = MaterializeAnimationMetadataRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl"), updateCatalogRow: false);
+        var catalogSummary = MaterializeAnimationMetadataRows(root, "asset_catalog", Path.Combine(root, "asset_catalog.jsonl"), true, writeCompatibilityJson);
+        var bindingSummary = MaterializeAnimationMetadataRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl"), false, writeCompatibilityJson);
         Console.WriteLine(JsonConvert.SerializeObject(new
         {
             root,
             assetCatalog = catalogSummary,
             animationBindings = bindingSummary,
-            note = "已把失败但含曲线、通知或容器片段的 UE 动画写成 .metadata.json；它们仍不会进入默认可播放动画候选。"
+            note = writeCompatibilityJson
+                ? "已把失败但含曲线、通知或容器片段的 UE 动画写成 .metadata.json 调试侧车，并同步 SQLite；它们仍不会进入默认可播放动画候选。"
+                : "已把失败但含曲线、通知或容器片段的 UE 动画标记为 SQLite metadata 行；默认不写 .metadata.json 侧车，它们仍不会进入默认可播放动画候选。"
         }, Formatting.Indented));
     }
 
@@ -127,11 +129,12 @@ internal static class UELibraryPostProcessor
         string root,
         string tableName,
         string legacyJsonLinesPath,
-        bool updateCatalogRow)
+        bool updateCatalogRow,
+        bool writeCompatibilityJson)
     {
-        var sqlite = MaterializeAnimationMetadataSqlite(root, tableName, updateCatalogRow);
+        var sqlite = MaterializeAnimationMetadataSqlite(root, tableName, updateCatalogRow, writeCompatibilityJson);
         AnimationMetadataMaterializeSummary? legacy = null;
-        if (File.Exists(legacyJsonLinesPath))
+        if (writeCompatibilityJson && File.Exists(legacyJsonLinesPath))
             legacy = MaterializeAnimationMetadataJsonLines(root, legacyJsonLinesPath, updateCatalogRow);
 
         if (sqlite != null || legacy != null)
@@ -156,7 +159,8 @@ internal static class UELibraryPostProcessor
     private static AnimationMetadataMaterializeSummary? MaterializeAnimationMetadataSqlite(
         string root,
         string tableName,
-        bool updateCatalogRow)
+        bool updateCatalogRow,
+        bool writeCompatibilityJson)
     {
         var dbPath = Path.Combine(root, "export_events.db");
         if (!File.Exists(dbPath))
@@ -203,16 +207,27 @@ internal static class UELibraryPostProcessor
                 if (!IsFailedAnimationRow(row) || !HasUsefulAnimationMetadata(row))
                     continue;
 
-                var metadataPath = BuildAnimationMetadataPath(root, row);
-                if (string.IsNullOrWhiteSpace(metadataPath))
+                string? metadataPath = null;
+                if (writeCompatibilityJson)
+                {
+                    metadataPath = BuildAnimationMetadataPath(root, row);
+                    if (string.IsNullOrWhiteSpace(metadataPath))
+                    {
+                        summary.MissingOutput++;
+                        continue;
+                    }
+
+                    WriteAnimationMetadataSidecar(row, metadataPath);
+                    summary.JsonSidecarsWritten++;
+                }
+
+                if (!TryApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow))
                 {
                     summary.MissingOutput++;
                     continue;
                 }
 
-                WriteAnimationMetadataSidecar(row, metadataPath);
                 summary.Materialized++;
-                ApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow);
                 updates.Add((reader.GetInt64(0), row));
             }
         }
@@ -325,8 +340,9 @@ internal static class UELibraryPostProcessor
                 }
 
                 WriteAnimationMetadataSidecar(row, metadataPath);
+                summary.JsonSidecarsWritten++;
                 summary.Materialized++;
-                ApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow);
+                TryApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow);
                 writer.WriteLine(row.ToString(Formatting.None));
             }
         }
@@ -335,15 +351,24 @@ internal static class UELibraryPostProcessor
         return summary;
     }
 
-    private static void ApplyAnimationMetadataRowUpdate(JObject row, string metadataPath, bool updateCatalogRow)
+    private static bool TryApplyAnimationMetadataRowUpdate(JObject row, string? metadataPath, bool updateCatalogRow)
     {
         row["status"] = "metadata";
-        row["format"] = "json";
-        row["output"] = metadataPath;
+        row["format"] = string.IsNullOrWhiteSpace(metadataPath) ? "sqlite" : "json";
+        if (!string.IsNullOrWhiteSpace(metadataPath))
+            row["output"] = metadataPath;
+        else if (string.IsNullOrWhiteSpace((string?)row["output"]))
+            return false;
+
         row["metadataOnly"] = true;
-        row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实，供素材库检索和后续动画支持使用。";
+        row["metadataStorage"] = string.IsNullOrWhiteSpace(metadataPath) ? "export_events.db.raw_json" : "jsonSidecar";
+        row["note"] = string.IsNullOrWhiteSpace(metadataPath)
+            ? "该动画未成功导出为可播放 .ueanim；UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实保留在 SQLite raw_json，供素材库检索和后续动画支持使用。"
+            : "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实，供素材库检索和后续动画支持使用。";
         if (updateCatalogRow)
             row["kind"] = "Animation";
+
+        return true;
     }
 
     private static bool IsFailedAnimationRow(JObject row)
@@ -9356,6 +9381,7 @@ internal static class UELibraryPostProcessor
         public string? SkippedReason { get; set; }
         public int Rows { get; set; }
         public int Materialized { get; set; }
+        public int JsonSidecarsWritten { get; set; }
         public int MissingOutput { get; set; }
         public int JsonErrors { get; set; }
     }

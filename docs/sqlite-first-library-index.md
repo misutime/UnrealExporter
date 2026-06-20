@@ -79,7 +79,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 - Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - Auto referenced export diagnostics now stream to `export_events.db.auto_referenced_exports` in bounded batches during rule planning; `auto_referenced_exports.jsonl` is only written when compatibility JSON is explicitly enabled.
-- `--materialize-animation-metadata` now updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` first, and only updates `asset_catalog.jsonl` / `animation_bindings.jsonl` as compatibility views when they exist.
+- `--materialize-animation-metadata` updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` by default; `.ueanim.metadata.json`, `asset_catalog.jsonl` and `animation_bindings.jsonl` are only written or updated when `--compat-json` is explicitly requested.
 - Model validation cache now writes to `library_work.db.model_validation_cache`. Old per-model `.ue_model_validation_cache.json` files are read once for compatibility and migrated into SQLite, then deleted when possible.
 - Material sidecar summaries now write to `library_work.db.material_sidecars` and synchronize to `library_index.db.material_sidecars`; new postprocess runs prefer export-event Material rows over recursive `*.json` scans.
 - Postprocess can now stream full component relations to `library_work.db` and skips `component_asset_relations.jsonl` by default.
