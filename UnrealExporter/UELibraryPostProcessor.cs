@@ -89,8 +89,8 @@ internal static class UELibraryPostProcessor
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeCompatibilityJson));
         var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex));
         RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
-        RunStage("写模型验证报告", () => WriteModelValidation(root, reports));
-        var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex));
+        RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeCompatibilityJson));
+        var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
         RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
         RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
@@ -4914,7 +4914,7 @@ internal static class UELibraryPostProcessor
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Count();
 
-    private static void WriteModelValidation(string root, List<ModelValidationEntry> reports)
+    private static void WriteModelValidation(string root, List<ModelValidationEntry> reports, bool writeCompatibilityJson)
     {
         var summary = new
         {
@@ -4957,10 +4957,18 @@ internal static class UELibraryPostProcessor
                 notes = x.Notes,
             }),
         };
-        File.WriteAllText(
-            Path.Combine(root, "model_validation.json"),
-            JsonConvert.SerializeObject(summary, Formatting.Indented),
-            Encoding.UTF8);
+        var path = Path.Combine(root, "model_validation.json");
+        if (writeCompatibilityJson)
+        {
+            File.WriteAllText(
+                path,
+                JsonConvert.SerializeObject(summary, Formatting.Indented),
+                Encoding.UTF8);
+        }
+        else
+        {
+            DeleteIfExists(path);
+        }
     }
 
     private static JObject WriteModelCoverage(
@@ -7465,7 +7473,8 @@ internal static class UELibraryPostProcessor
         string root,
         List<ModelValidationEntry> reports,
         List<JObject> catalogRows,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var modelsByOutput = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -7560,22 +7569,30 @@ internal static class UELibraryPostProcessor
             .ToArray();
         var skeletonArray = JArray.FromObject(skeletons);
 
-        File.WriteAllText(
-            Path.Combine(root, "skeletons.json"),
-            new JObject
-            {
-                ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-                ["rule"] = "骨架分组以已导出 GLB/glTF skin joints 为预览基准，同时合并 UE Skeleton 原始路径、源索引骨架对象和同 Skeleton 动画列表。",
-                ["sourceIndex"] = JObject.FromObject(new
+        var path = Path.Combine(root, "skeletons.json");
+        if (writeCompatibilityJson)
+        {
+            File.WriteAllText(
+                path,
+                new JObject
                 {
-                    available = sourceIndex.Available,
-                    path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
-                    error = sourceIndex.Error,
-                }),
-                ["skeletonCount"] = skeletons.Length,
-                ["skeletons"] = skeletonArray,
-            }.ToString(Formatting.Indented),
-            Encoding.UTF8);
+                    ["generatedAt"] = DateTime.UtcNow.ToString("O"),
+                    ["rule"] = "骨架分组以已导出 GLB/glTF skin joints 为预览基准，同时合并 UE Skeleton 原始路径、源索引骨架对象和同 Skeleton 动画列表。",
+                    ["sourceIndex"] = JObject.FromObject(new
+                    {
+                        available = sourceIndex.Available,
+                        path = sourceIndex.Available ? MakeRelative(root, sourceIndex.Path).Replace('\\', '/') : null,
+                        error = sourceIndex.Error,
+                    }),
+                    ["skeletonCount"] = skeletons.Length,
+                    ["skeletons"] = skeletonArray,
+                }.ToString(Formatting.Indented),
+                Encoding.UTF8);
+        }
+        else
+        {
+            DeleteIfExists(path);
+        }
 
         return skeletonArray;
     }
@@ -7877,8 +7894,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
         sb.AppendLine("| `model_animations.json` | 模型动画关系兼容/人工排查视图；主数据在 `library_index.db.model_animation_relations` 和 `library_index.db.relation_animations`。 |");
         sb.AppendLine("| `animation_validation.json` | 动画兼容验证兼容/人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
-        sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
-        sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组，并合并 UE Skeleton、源骨架对象和同 Skeleton 动画。 |");
+        sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证兼容/人工排查视图；主数据在 `library_index.db.model_validation`。 |");
+        sb.AppendLine("| `skeletons.json` | 骨架分组兼容/人工排查视图；主数据在 `library_index.db.skeleton_groups`。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
@@ -7891,7 +7908,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`animation_validation.jsonl` 和 `model_animations.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json` 和 `skeletons.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -7937,7 +7954,7 @@ internal static class UELibraryPostProcessor
         if (!string.IsNullOrWhiteSpace(report.SkeletonHash))
             sb.AppendLine("- SkeletonHash: `" + report.SkeletonHash + "`");
         sb.AppendLine();
-        sb.AppendLine("机器索引以素材库根目录的 `asset_catalog.jsonl`、`model_validation.json`、`skeletons.json` 为准。");
+        sb.AppendLine("机器索引以素材库根目录的 `library_index.db` 为准；JSON/JSONL 文件只是兼容或人工排查视图，SQLite-only 导出可不生成。");
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }
 
