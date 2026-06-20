@@ -108,8 +108,8 @@ internal static class UELibraryPostProcessor
         if (!Directory.Exists(root))
             throw new DirectoryNotFoundException($"Library root not found: {root}");
 
-        var catalogSummary = MaterializeAnimationMetadataJsonLines(root, Path.Combine(root, "asset_catalog.jsonl"), updateCatalogRow: true);
-        var bindingSummary = MaterializeAnimationMetadataJsonLines(root, Path.Combine(root, "animation_bindings.jsonl"), updateCatalogRow: false);
+        var catalogSummary = MaterializeAnimationMetadataRows(root, "asset_catalog", Path.Combine(root, "asset_catalog.jsonl"), updateCatalogRow: true);
+        var bindingSummary = MaterializeAnimationMetadataRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl"), updateCatalogRow: false);
         Console.WriteLine(JsonConvert.SerializeObject(new
         {
             root,
@@ -117,6 +117,156 @@ internal static class UELibraryPostProcessor
             animationBindings = bindingSummary,
             note = "已把失败但含曲线、通知或容器片段的 UE 动画写成 .metadata.json；它们仍不会进入默认可播放动画候选。"
         }, Formatting.Indented));
+    }
+
+    private static AnimationMetadataMaterializeResult MaterializeAnimationMetadataRows(
+        string root,
+        string tableName,
+        string legacyJsonLinesPath,
+        bool updateCatalogRow)
+    {
+        var sqlite = MaterializeAnimationMetadataSqlite(root, tableName, updateCatalogRow);
+        AnimationMetadataMaterializeSummary? legacy = null;
+        if (File.Exists(legacyJsonLinesPath))
+            legacy = MaterializeAnimationMetadataJsonLines(root, legacyJsonLinesPath, updateCatalogRow);
+
+        if (sqlite != null || legacy != null)
+            return new AnimationMetadataMaterializeResult
+            {
+                Primary = sqlite ?? legacy!,
+                CompatibilityJsonl = sqlite != null ? legacy : null,
+            };
+
+        return new AnimationMetadataMaterializeResult
+        {
+            Primary = new AnimationMetadataMaterializeSummary
+            {
+                Backend = "sqlite",
+                Table = tableName,
+                Path = Path.Combine(root, "export_events.db"),
+                SkippedReason = "exportEventsDbOrLegacyJsonlNotFound",
+            },
+        };
+    }
+
+    private static AnimationMetadataMaterializeSummary? MaterializeAnimationMetadataSqlite(
+        string root,
+        string tableName,
+        bool updateCatalogRow)
+    {
+        var dbPath = Path.Combine(root, "export_events.db");
+        if (!File.Exists(dbPath))
+            return null;
+
+        SQLitePCL.Batteries_V2.Init();
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        tableName = ValidateExportEventTableName(tableName);
+        if (!TableExists(connection, tableName) || !TableColumnExists(connection, tableName, "raw_json"))
+            return new AnimationMetadataMaterializeSummary
+            {
+                Backend = "sqlite",
+                Table = tableName,
+                Path = dbPath,
+                SkippedReason = "tableNotFound",
+            };
+
+        var summary = new AnimationMetadataMaterializeSummary
+        {
+            Backend = "sqlite",
+            Table = tableName,
+            Path = dbPath,
+        };
+        var updates = new List<(long Id, JObject Row)>();
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"SELECT id, raw_json FROM {tableName} ORDER BY id;";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                summary.Rows++;
+                JObject row;
+                try
+                {
+                    row = JObject.Parse(reader.GetString(1));
+                }
+                catch (JsonException)
+                {
+                    summary.JsonErrors++;
+                    continue;
+                }
+
+                if (!IsFailedAnimationRow(row) || !HasUsefulAnimationMetadata(row))
+                    continue;
+
+                var metadataPath = BuildAnimationMetadataPath(root, row);
+                if (string.IsNullOrWhiteSpace(metadataPath))
+                {
+                    summary.MissingOutput++;
+                    continue;
+                }
+
+                WriteAnimationMetadataSidecar(row, metadataPath);
+                summary.Materialized++;
+                ApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow);
+                updates.Add((reader.GetInt64(0), row));
+            }
+        }
+
+        if (updates.Count > 0)
+        {
+            using var transaction = connection.BeginTransaction();
+            foreach (var (id, row) in updates)
+                UpdateAnimationMetadataSqliteRow(connection, transaction, tableName, id, row);
+            transaction.Commit();
+        }
+
+        return summary;
+    }
+
+    private static void UpdateAnimationMetadataSqliteRow(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string tableName,
+        long id,
+        JObject row)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        if (string.Equals(tableName, "asset_catalog", StringComparison.OrdinalIgnoreCase))
+        {
+            command.CommandText = """
+                UPDATE asset_catalog
+                SET kind = $kind,
+                    output = $output,
+                    format = $format,
+                    status = $status,
+                    raw_json = $rawJson
+                WHERE id = $id;
+                """;
+            Add(command, "$kind", (string?)row["kind"]);
+            Add(command, "$format", (string?)row["format"]);
+        }
+        else if (string.Equals(tableName, "animation_bindings", StringComparison.OrdinalIgnoreCase))
+        {
+            command.CommandText = """
+                UPDATE animation_bindings
+                SET status = $status,
+                    output = $output,
+                    raw_json = $rawJson
+                WHERE id = $id;
+                """;
+        }
+        else
+        {
+            throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unsupported animation metadata table.");
+        }
+
+        Add(command, "$status", (string?)row["status"]);
+        Add(command, "$output", (string?)row["output"]);
+        Add(command, "$rawJson", row.ToString(Formatting.None));
+        Add(command, "$id", id);
+        command.ExecuteNonQuery();
     }
 
     private static AnimationMetadataMaterializeSummary MaterializeAnimationMetadataJsonLines(
@@ -172,21 +322,24 @@ internal static class UELibraryPostProcessor
 
                 WriteAnimationMetadataSidecar(row, metadataPath);
                 summary.Materialized++;
-
-                row["status"] = "metadata";
-                row["format"] = "json";
-                row["output"] = metadataPath;
-                row["metadataOnly"] = true;
-                row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实，供素材库检索和后续动画支持使用。";
-                if (updateCatalogRow)
-                    row["kind"] = "Animation";
-
+                ApplyAnimationMetadataRowUpdate(row, metadataPath, updateCatalogRow);
                 writer.WriteLine(row.ToString(Formatting.None));
             }
         }
 
         ReplaceJsonLinesFile(path, tempPath, backupPath);
         return summary;
+    }
+
+    private static void ApplyAnimationMetadataRowUpdate(JObject row, string metadataPath, bool updateCatalogRow)
+    {
+        row["status"] = "metadata";
+        row["format"] = "json";
+        row["output"] = metadataPath;
+        row["metadataOnly"] = true;
+        row["note"] = "该动画未成功导出为可播放 .ueanim；这里保留 UE 曲线、通知、Montage/Composite 片段、时长或 Skeleton 等事实，供素材库检索和后续动画支持使用。";
+        if (updateCatalogRow)
+            row["kind"] = "Animation";
     }
 
     private static bool IsFailedAnimationRow(JObject row)
@@ -8691,8 +8844,16 @@ internal static class UELibraryPostProcessor
 
     private sealed record ModelAnimationCandidate(JObject Model, JObject Animation, string Reason);
 
+    private sealed class AnimationMetadataMaterializeResult
+    {
+        public AnimationMetadataMaterializeSummary Primary { get; set; } = new();
+        public AnimationMetadataMaterializeSummary? CompatibilityJsonl { get; set; }
+    }
+
     private sealed class AnimationMetadataMaterializeSummary
     {
+        public string Backend { get; set; } = "jsonl";
+        public string? Table { get; set; }
         public string Path { get; set; } = string.Empty;
         public string? SkippedReason { get; set; }
         public int Rows { get; set; }

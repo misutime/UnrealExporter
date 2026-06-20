@@ -65,6 +65,7 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - `UE5LibraryBrowser` already requires `library_index.db`.
 - Main export now writes `export_events.db` alongside compatibility JSONL.
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
+- `--materialize-animation-metadata` now updates `export_events.db.asset_catalog` and `export_events.db.animation_bindings` first, and only updates `asset_catalog.jsonl` / `animation_bindings.jsonl` as compatibility views when they exist.
 - Postprocess can now stream full component relations to `library_work.db` and skip `component_asset_relations.jsonl` in SQLite-only mode.
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
 - Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
