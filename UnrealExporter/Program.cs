@@ -62,6 +62,8 @@ public class UnrealExporter
     private static readonly object CatalogWriteLock = new();
     private static readonly object AutoReferencedWriteLock = new();
     private static readonly object ResumeWriteLock = new();
+    private static readonly ConcurrentDictionary<string, ExportEventSqliteWriter> ExportEventWriters = new(
+        StringComparer.OrdinalIgnoreCase);
 
     public static void Main(string[] args)
     {
@@ -112,9 +114,16 @@ public class UnrealExporter
 
                 // Load CUE4Parse and export files
                 AbstractFileProvider provider = CreateProvider(config, selectedVersion);
-                if (config.GenerateSourceIndex)
-                    UESourceIndexBuilder.Build(provider, config);
-                Export(provider, config, start);
+                try
+                {
+                    if (config.GenerateSourceIndex)
+                        UESourceIndexBuilder.Build(provider, config);
+                    Export(provider, config, start);
+                }
+                finally
+                {
+                    FlushExportEventWriters();
+                }
             }
 
             Console.WriteLine(
@@ -1868,6 +1877,7 @@ public class UnrealExporter
 
     private static void WriteAutoReferencedExportDiagnostics(ConfigObj config, List<object> diagnostics)
     {
+        ReplaceExportEventSqliteRows(config, "auto_referenced_exports", diagnostics.Select(JObject.FromObject));
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var lines = diagnostics.Select(JsonConvert.SerializeObject).ToArray();
@@ -1876,6 +1886,7 @@ public class UnrealExporter
 
     private static void AppendAutoReferencedExportDiagnostic(ConfigObj config, object diagnostic)
     {
+        WriteExportEventSqlite(config, "auto_referenced_exports", JObject.FromObject(diagnostic));
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         lock (AutoReferencedWriteLock)
@@ -2194,6 +2205,7 @@ public class UnrealExporter
             objectPath = obj?.GetPathName(),
             output = Path.GetFullPath(outputPath),
         };
+        WriteExportEventSqlite(config, "export_manifest", JObject.FromObject(entry));
         lock (ManifestWriteLock)
         {
             File.AppendAllText(manifestPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
@@ -2202,11 +2214,342 @@ public class UnrealExporter
 
     private static void AppendAssetCatalog(ConfigObj config, object entry)
     {
+        WriteExportEventSqlite(config, "asset_catalog", JObject.FromObject(entry));
         var catalogPath = Path.Combine(Path.GetFullPath(config.OutputDir), "asset_catalog.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(catalogPath)!);
         lock (CatalogWriteLock)
         {
             File.AppendAllText(catalogPath, JsonConvert.SerializeObject(entry) + Environment.NewLine);
+        }
+    }
+
+    private static void WriteExportEventSqlite(ConfigObj config, string tableName, JObject row)
+    {
+        var writer = ExportEventWriters.GetOrAdd(
+            Path.GetFullPath(config.OutputDir),
+            outputDir => ExportEventSqliteWriter.Open(outputDir));
+        writer.Insert(tableName, row);
+    }
+
+    private static void ReplaceExportEventSqliteRows(ConfigObj config, string tableName, IEnumerable<JObject> rows)
+    {
+        var writer = ExportEventWriters.GetOrAdd(
+            Path.GetFullPath(config.OutputDir),
+            outputDir => ExportEventSqliteWriter.Open(outputDir));
+        writer.Replace(tableName, rows);
+    }
+
+    private static void FlushExportEventWriters()
+    {
+        foreach (var pair in ExportEventWriters.ToArray())
+        {
+            if (!ExportEventWriters.TryRemove(pair.Key, out var writer))
+                continue;
+
+            writer.Dispose();
+        }
+    }
+
+    private sealed class ExportEventSqliteWriter : IDisposable
+    {
+        private readonly object _lock = new();
+        private readonly SqliteConnection _connection;
+
+        private ExportEventSqliteWriter(SqliteConnection connection)
+        {
+            _connection = connection;
+        }
+
+        public static ExportEventSqliteWriter Open(string outputDir)
+        {
+            Directory.CreateDirectory(outputDir);
+            SQLitePCL.Batteries_V2.Init();
+            var dbPath = Path.Combine(outputDir, "export_events.db");
+            var connection = new SqliteConnection($"Data Source={dbPath}");
+            connection.Open();
+            ExecuteExportEventSql(connection, "PRAGMA busy_timeout = 10000;");
+            ExecuteExportEventSql(connection, "PRAGMA journal_mode = WAL;");
+            ExecuteExportEventSql(connection, "PRAGMA synchronous = NORMAL;");
+            EnsureSchema(connection);
+            return new ExportEventSqliteWriter(connection);
+        }
+
+        public void Insert(string tableName, JObject row)
+        {
+            lock (_lock)
+            {
+                InsertCore(tableName, row);
+            }
+        }
+
+        public void Replace(string tableName, IEnumerable<JObject> rows)
+        {
+            lock (_lock)
+            {
+                using var transaction = _connection.BeginTransaction();
+                using (var delete = _connection.CreateCommand())
+                {
+                    delete.Transaction = transaction;
+                    delete.CommandText = $"DELETE FROM {ValidateExportEventTableName(tableName)};";
+                    delete.ExecuteNonQuery();
+                }
+
+                foreach (var row in rows)
+                    InsertCore(tableName, row, transaction);
+
+                transaction.Commit();
+            }
+        }
+
+        private void InsertCore(string tableName, JObject row, SqliteTransaction? transaction = null)
+        {
+            switch (ValidateExportEventTableName(tableName))
+            {
+                case "export_manifest":
+                    InsertExportManifest(row, transaction);
+                    break;
+                case "asset_catalog":
+                    InsertAssetCatalog(row, transaction);
+                    break;
+                case "animation_bindings":
+                    InsertAnimationBinding(row, transaction);
+                    break;
+                case "auto_referenced_exports":
+                    InsertAutoReferencedExport(row, transaction);
+                    break;
+            }
+        }
+
+        private void InsertExportManifest(JObject row, SqliteTransaction? transaction)
+        {
+            using var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO export_manifest (
+                    exported_at, game_title, kind, source, object_type, name, object_path, output, raw_json
+                )
+                VALUES (
+                    $exportedAt, $gameTitle, $kind, $source, $objectType, $name, $objectPath, $output, $rawJson
+                );
+                """;
+            Add(command, "$exportedAt", (string?)row["exportedAt"]);
+            Add(command, "$gameTitle", (string?)row["gameTitle"]);
+            Add(command, "$kind", (string?)row["kind"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$objectType", (string?)row["objectType"]);
+            Add(command, "$name", (string?)row["name"]);
+            Add(command, "$objectPath", (string?)row["objectPath"]);
+            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+
+        private void InsertAssetCatalog(JObject row, SqliteTransaction? transaction)
+        {
+            using var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO asset_catalog (
+                    kind, resource_kind, name, source_type, source, object_path, output, format,
+                    skeleton_path, skeleton_name, validation_status, status, raw_json
+                )
+                VALUES (
+                    $kind, $resourceKind, $name, $sourceType, $source, $objectPath, $output, $format,
+                    $skeletonPath, $skeletonName, $validationStatus, $status, $rawJson
+                );
+                """;
+            Add(command, "$kind", (string?)row["kind"]);
+            Add(command, "$resourceKind", (string?)row["resourceKind"]);
+            Add(command, "$name", (string?)row["name"]);
+            Add(command, "$sourceType", (string?)row["sourceType"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$objectPath", (string?)row["objectPath"]);
+            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$format", (string?)row["format"]);
+            Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)row["skeletonName"]);
+            Add(command, "$validationStatus", (string?)row["validationStatus"]);
+            Add(command, "$status", (string?)row["status"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+
+        private void InsertAnimationBinding(JObject row, SqliteTransaction? transaction)
+        {
+            using var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO animation_bindings (
+                    indexed_at, game_title, status, error, source, source_type, name, object_path, output,
+                    skeleton_path, skeleton_name, skeleton_guid, duration, frame_count, track_count,
+                    notify_count, curve_count, segment_count, section_count, requires_acl, compression, raw_json
+                )
+                VALUES (
+                    $indexedAt, $gameTitle, $status, $error, $source, $sourceType, $name, $objectPath, $output,
+                    $skeletonPath, $skeletonName, $skeletonGuid, $duration, $frameCount, $trackCount,
+                    $notifyCount, $curveCount, $segmentCount, $sectionCount, $requiresAcl, $compression, $rawJson
+                );
+                """;
+            Add(command, "$indexedAt", (string?)row["indexedAt"]);
+            Add(command, "$gameTitle", (string?)row["gameTitle"]);
+            Add(command, "$status", (string?)row["status"]);
+            Add(command, "$error", (string?)row["error"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$sourceType", (string?)row["sourceType"]);
+            Add(command, "$name", (string?)row["name"]);
+            Add(command, "$objectPath", (string?)row["objectPath"]);
+            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
+            Add(command, "$skeletonName", (string?)row["skeletonName"]);
+            Add(command, "$skeletonGuid", (string?)row["skeletonGuid"]);
+            Add(command, "$duration", (double?)row["duration"]);
+            Add(command, "$frameCount", (int?)row["frameCount"]);
+            Add(command, "$trackCount", (int?)row["trackCount"]);
+            Add(command, "$notifyCount", (int?)row["notifyCount"] ?? 0);
+            Add(command, "$curveCount", (int?)row["curveCount"] ?? 0);
+            Add(command, "$segmentCount", row["segments"] is JArray segments ? segments.Count : 0);
+            Add(command, "$sectionCount", row["sections"] is JArray sections ? sections.Count : 0);
+            Add(command, "$requiresAcl", ((bool?)row["requiresAcl"] ?? false) ? 1 : 0);
+            Add(command, "$compression", (string?)row["compression"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+
+        private void InsertAutoReferencedExport(JObject row, SqliteTransaction? transaction)
+        {
+            using var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO auto_referenced_exports (
+                    stage, status, relation_type, target_path, source, output_type, reason, raw_json
+                )
+                VALUES (
+                    $stage, $status, $relationType, $targetPath, $source, $outputType, $reason, $rawJson
+                );
+                """;
+            Add(command, "$stage", (string?)row["stage"]);
+            Add(command, "$status", (string?)row["status"]);
+            Add(command, "$relationType", (string?)row["relationType"]);
+            Add(command, "$targetPath", (string?)row["targetPath"]);
+            Add(command, "$source", (string?)row["source"]);
+            Add(command, "$outputType", (string?)row["outputType"]);
+            Add(command, "$reason", (string?)row["reason"]);
+            Add(command, "$rawJson", row.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    ExecuteExportEventSql(_connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+                    ExecuteExportEventSql(_connection, "PRAGMA journal_mode = DELETE;");
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+                {
+                    Console.WriteLine($"WARN: export event checkpoint skipped because sqlite database is busy/locked ({ex.Message})");
+                }
+
+                _connection.Dispose();
+            }
+        }
+
+        private static void EnsureSchema(SqliteConnection connection)
+        {
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE IF NOT EXISTS export_manifest (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exported_at TEXT,
+                    game_title TEXT,
+                    kind TEXT,
+                    source TEXT,
+                    object_type TEXT,
+                    name TEXT,
+                    object_path TEXT,
+                    output TEXT,
+                    raw_json TEXT NOT NULL
+                );
+                """);
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE IF NOT EXISTS asset_catalog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT,
+                    resource_kind TEXT,
+                    name TEXT,
+                    source_type TEXT,
+                    source TEXT,
+                    object_path TEXT,
+                    output TEXT,
+                    format TEXT,
+                    skeleton_path TEXT,
+                    skeleton_name TEXT,
+                    validation_status TEXT,
+                    status TEXT,
+                    raw_json TEXT NOT NULL
+                );
+                """);
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE IF NOT EXISTS animation_bindings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    indexed_at TEXT,
+                    game_title TEXT,
+                    status TEXT,
+                    error TEXT,
+                    source TEXT,
+                    source_type TEXT,
+                    name TEXT,
+                    object_path TEXT,
+                    output TEXT,
+                    skeleton_path TEXT,
+                    skeleton_name TEXT,
+                    skeleton_guid TEXT,
+                    duration REAL,
+                    frame_count INTEGER,
+                    track_count INTEGER,
+                    notify_count INTEGER,
+                    curve_count INTEGER,
+                    segment_count INTEGER,
+                    section_count INTEGER,
+                    requires_acl INTEGER,
+                    compression TEXT,
+                    raw_json TEXT NOT NULL
+                );
+                """);
+            ExecuteExportEventSql(connection, """
+                CREATE TABLE IF NOT EXISTS auto_referenced_exports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stage TEXT,
+                    status TEXT,
+                    relation_type TEXT,
+                    target_path TEXT,
+                    source TEXT,
+                    output_type TEXT,
+                    reason TEXT,
+                    raw_json TEXT NOT NULL
+                );
+                """);
+            ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_manifest_output ON export_manifest(output, kind);");
+            ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_asset_output ON asset_catalog(output, kind);");
+            ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_asset_object ON asset_catalog(object_path);");
+            ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_animation_object ON animation_bindings(object_path, status);");
+            ExecuteExportEventSql(connection, "CREATE INDEX IF NOT EXISTS idx_export_events_auto_target ON auto_referenced_exports(target_path, relation_type);");
+        }
+
+        private static string ValidateExportEventTableName(string tableName)
+            => tableName is "export_manifest" or "asset_catalog" or "animation_bindings" or "auto_referenced_exports"
+                ? tableName
+                : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown export event table.");
+
+        private static void Add(SqliteCommand command, string name, object? value)
+            => command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+
+        private static void ExecuteExportEventSql(SqliteConnection connection, string sql)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.ExecuteNonQuery();
         }
     }
 
@@ -2617,6 +2960,7 @@ public class UnrealExporter
             retargetSource = sequence?.RetargetSource.Text,
         };
 
+        WriteExportEventSqlite(config, "animation_bindings", JObject.FromObject(entry));
         var path = Path.Combine(Path.GetFullPath(config.OutputDir), "animation_bindings.jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         lock (CatalogWriteLock)

@@ -926,25 +926,18 @@ internal static class UELibraryPostProcessor
     {
         var result = new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
 
-        if (File.Exists(catalogPath))
+        foreach (var row in ReadExportEventRows(root, "asset_catalog", catalogPath))
         {
-            foreach (var line in File.ReadLines(catalogPath))
+            try
             {
-                if (string.IsNullOrWhiteSpace(line))
+                if (IsCatalogCacheRow(root, row))
                     continue;
 
-                try
-                {
-                    var row = JObject.Parse(line);
-                    if (IsCatalogCacheRow(root, row))
-                        continue;
-
-                    result[BuildCatalogKey(root, row)] = row;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"WARN: old catalog row skipped ({ex.Message})");
-                }
+                result[BuildCatalogKey(root, row)] = row;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WARN: old catalog row skipped ({ex.Message})");
             }
         }
 
@@ -6179,7 +6172,7 @@ internal static class UELibraryPostProcessor
 
     private static void InsertExportManifestRows(SqliteConnection connection, SqliteTransaction transaction, string root)
     {
-        foreach (var row in ReadJsonLines(Path.Combine(root, "export_manifest.jsonl")))
+        foreach (var row in ReadExportEventRows(root, "export_manifest", Path.Combine(root, "export_manifest.jsonl")))
         {
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
@@ -6206,7 +6199,7 @@ internal static class UELibraryPostProcessor
 
     private static void InsertAnimationBindingRows(SqliteConnection connection, SqliteTransaction transaction, string root)
     {
-        foreach (var row in ReadJsonLines(Path.Combine(root, "animation_bindings.jsonl")))
+        foreach (var row in ReadExportEventRows(root, "animation_bindings", Path.Combine(root, "animation_bindings.jsonl")))
         {
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
@@ -6250,7 +6243,7 @@ internal static class UELibraryPostProcessor
 
     private static void InsertAutoReferencedExportRows(SqliteConnection connection, SqliteTransaction transaction, string root)
     {
-        foreach (var row in ReadJsonLines(Path.Combine(root, "auto_referenced_exports.jsonl")))
+        foreach (var row in ReadExportEventRows(root, "auto_referenced_exports", Path.Combine(root, "auto_referenced_exports.jsonl")))
         {
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
@@ -6298,6 +6291,54 @@ internal static class UELibraryPostProcessor
                 yield return row;
         }
     }
+
+    private static IEnumerable<JObject> ReadExportEventRows(string root, string tableName, string legacyJsonLinesPath)
+    {
+        var dbPath = Path.Combine(root, "export_events.db");
+        if (File.Exists(dbPath))
+        {
+            SQLitePCL.Batteries_V2.Init();
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            if (TableExists(connection, tableName))
+            {
+                using var countCommand = connection.CreateCommand();
+                countCommand.CommandText = $"SELECT COUNT(*) FROM {ValidateExportEventTableName(tableName)};";
+                var count = Convert.ToInt64(countCommand.ExecuteScalar());
+                if (count > 0)
+                {
+                    using var command = connection.CreateCommand();
+                    command.CommandText = $"SELECT raw_json FROM {ValidateExportEventTableName(tableName)} ORDER BY id;";
+                    using var reader = command.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        JObject? row = null;
+                        try
+                        {
+                            row = JObject.Parse(reader.GetString(0));
+                        }
+                        catch (JsonException)
+                        {
+                            // export_events.db stores raw JSON for forward compatibility; skip corrupted rows defensively.
+                        }
+
+                        if (row != null)
+                            yield return row;
+                    }
+
+                    yield break;
+                }
+            }
+        }
+
+        foreach (var row in ReadJsonLines(legacyJsonLinesPath))
+            yield return row;
+    }
+
+    private static string ValidateExportEventTableName(string tableName)
+        => tableName is "export_manifest" or "asset_catalog" or "animation_bindings" or "auto_referenced_exports"
+            ? tableName
+            : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown export event table.");
 
     private static void InsertModelValidation(SqliteConnection connection, SqliteTransaction transaction, ModelValidationEntry report)
     {
@@ -7395,13 +7436,14 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("| 文件 | 用途 |");
         sb.AppendLine("| --- | --- |");
-        sb.AppendLine("| `asset_catalog.jsonl` | 模型、材质、贴图、动画主索引，一行一个资产。 |");
-        sb.AppendLine("| `library_health.json` | 素材库健康汇总，集中统计模型、贴图、材质、组件关系、骨架和动画验证缺口。 |");
-        sb.AppendLine("| `library_index.db` | 已导出素材库的 SQLite 索引，便于筛选模型、动画、贴图和关系。 |");
+        sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系和验收状态。 |");
+        sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
-        sb.AppendLine("| `export_manifest.jsonl` | 实际导出文件与 UE 源包/对象的对应关系。 |");
-        sb.AppendLine("| `auto_referenced_exports.jsonl` | 自动补导计划和执行结果，记录关系来源、目标对象、源包、输出类型和失败原因。 |");
-        sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
+        sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
+        sb.AppendLine("| `library_health.json` | 人读健康摘要；程序筛选应优先查 `library_index.db`。 |");
+        sb.AppendLine("| `export_manifest.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
+        sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
+        sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
         sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
         sb.AppendLine("| `model_animations.json` | 输出显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 模型动画候选，并回填动画验证结果。 |");
         sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
