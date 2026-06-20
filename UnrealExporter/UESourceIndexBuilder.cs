@@ -33,7 +33,7 @@ namespace UnrealExporter;
 
 internal static class UESourceIndexBuilder
 {
-    private const int CommitInterval = 500;
+    private const int DefaultCommitInterval = 100;
 
     public static void Build(AbstractFileProvider provider, ConfigObj config)
     {
@@ -51,8 +51,13 @@ internal static class UESourceIndexBuilder
             .ToArray();
         if (config.SourceIndexLimit > 0)
             packageFiles = packageFiles.Take(config.SourceIndexLimit).ToArray();
+        var commitInterval = config.SourceIndexCommitInterval > 0
+            ? config.SourceIndexCommitInterval
+            : DefaultCommitInterval;
 
         Console.WriteLine($"UE source index: files={provider.Files.Count}, packagesToInspect={packageFiles.Length}");
+        Console.WriteLine($"UE source index commit interval: {commitInterval}");
+        MemoryPressureGuard.LogConfiguration(config);
         var fingerprint = BuildSourceIndexFingerprint(config, packageFiles);
         if (TryUseCompletedSourceIndex(dbPath, metadataPath, fingerprint, packageFiles.Length))
             return;
@@ -111,6 +116,7 @@ internal static class UESourceIndexBuilder
                 string? error = null;
                 try
                 {
+                    MemoryPressureGuard.WaitIfNeeded(config, "source index package", file.Path);
                     var package = provider.LoadPackage(file);
                     InsertPackageObjectMaps(connection, transaction, file.Path, package);
                     var exports = package.GetExports().ToArray();
@@ -127,7 +133,7 @@ internal static class UESourceIndexBuilder
                 UpsertSourceIndexPackage(connection, transaction, file.Path, status, error);
                 completedPackages.Add(file.Path);
 
-                if (completedPackages.Count % CommitInterval == 0)
+                if (completedPackages.Count % commitInterval == 0)
                 {
                     transaction.Commit();
                     transaction.Dispose();

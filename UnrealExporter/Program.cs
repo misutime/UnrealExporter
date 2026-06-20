@@ -867,6 +867,14 @@ public class UnrealExporter
                 ? config.MaxDegreeOfParallelism
                 : DefaultMaxDegreeOfParallelism;
         Console.WriteLine($"Max parallel exports: {maxDegreeOfParallelism}");
+        int maxHeavyExportDegreeOfParallelism =
+            config.MaxHeavyExportDegreeOfParallelism > 0
+                ? config.MaxHeavyExportDegreeOfParallelism
+                : maxDegreeOfParallelism;
+        maxHeavyExportDegreeOfParallelism = Math.Max(1, Math.Min(maxHeavyExportDegreeOfParallelism, maxDegreeOfParallelism));
+        Console.WriteLine($"Max heavy package exports: {maxHeavyExportDegreeOfParallelism}");
+        MemoryPressureGuard.LogConfiguration(config);
+        using var heavyExportGate = new SemaphoreSlim(maxHeavyExportDegreeOfParallelism);
         var autoReferencedExportRules = BuildAutoReferencedExportRules(provider, config);
         var resumeExports = ShouldResumeExports(config);
         using var exportResumeStore = resumeExports ? ExportResumeStore.Open(config) : null;
@@ -946,36 +954,56 @@ public class UnrealExporter
                 {
                     // "uasset"
                     var fileType = file.Value.Path.SubstringAfterLast('.').ToLower();
-
-                    foreach (var exportJob in activeExportJobs)
+                    UObject[]? allPackageObjects = null;
+                    UObject[] LoadAllPackageObjects()
                     {
-                        var exportedThisJob = false;
-                        var jobOutputs = new ConcurrentBag<string>();
+                        if (allPackageObjects != null)
+                            return allPackageObjects;
 
-                        // "json" etc.
-                        var outputType = exportJob.OutputType;
-                        var resumeKey = BuildExportResumeKey(file.Value.Path, outputType, exportJob.AutoReferencedRule);
-                        if (resumeExports && exportResumeStore!.ShouldSkip(resumeKey, file.Value.Size))
+                        MemoryPressureGuard.WaitIfNeeded(config, "package load", file.Value.Path);
+                        allPackageObjects = provider
+                            .LoadPackage(file.Value)
+                            .GetExports()
+                            .ToArray();
+                        return allPackageObjects;
+                    }
+
+                    var heavyGateHeld = false;
+                    try
+                    {
+                        if (IsHeavyPackageFile(fileType))
                         {
-                            if (config.LogOutputs)
-                                Console.WriteLine($"~~ resume skip {file.Value.Path}:{outputType}");
-                            Interlocked.Increment(ref totalResumedExportJobs);
-                            Interlocked.Increment(ref totalRegexMatches);
-                            continue;
+                            MemoryPressureGuard.WaitIfNeeded(config, "heavy package export", file.Value.Path);
+                            heavyExportGate.Wait();
+                            heavyGateHeld = true;
                         }
 
-                        try
+                        foreach (var exportJob in activeExportJobs)
                         {
-                            switch (fileType)
+                            var exportedThisJob = false;
+                            var jobOutputs = new ConcurrentBag<string>();
+
+                            // "json" etc.
+                            var outputType = exportJob.OutputType;
+                            var resumeKey = BuildExportResumeKey(file.Value.Path, outputType, exportJob.AutoReferencedRule);
+                            if (resumeExports && exportResumeStore!.ShouldSkip(resumeKey, file.Value.Size))
                             {
-                                // Referencing CUE4ParseViewModel.cs from Fmodel source code
-                                case "uasset":
-                                case "umap":
+                                if (config.LogOutputs)
+                                    Console.WriteLine($"~~ resume skip {file.Value.Path}:{outputType}");
+                                Interlocked.Increment(ref totalResumedExportJobs);
+                                Interlocked.Increment(ref totalRegexMatches);
+                                continue;
+                            }
+
+                            try
+                            {
+                                switch (fileType)
                                 {
-                                    var allObjects = provider
-                                        .LoadPackage(file.Value)
-                                        .GetExports()
-                                        .ToArray();
+                                    // Referencing CUE4ParseViewModel.cs from Fmodel source code
+                                    case "uasset":
+                                    case "umap":
+                                    {
+                                        var allObjects = LoadAllPackageObjects();
 
                                     if (outputType == "png")
                                     {
@@ -1294,121 +1322,127 @@ public class UnrealExporter
                                     //     Interlocked.Increment(ref totalExportedFiles);
                                     // }
 
-                                    break;
-                                }
-                                case "locres":
-                                {
-                                    if (
-                                        outputType == "json"
-                                        && provider.TryCreateReader(file.Value.Path, out var archive)
-                                    )
-                                    {
-                                        if (config.LogOutputs)
-                                            Console.WriteLine("=> " + outputPath + ".json");
-                                        var locres = new FTextLocalizationResource(archive);
-                                        var json = JsonConvert.SerializeObject(
-                                            locres,
-                                            Formatting.Indented
-                                        );
-                                        if (!Directory.Exists(outputDir))
-                                            Directory.CreateDirectory(outputDir);
-                                        var locresJsonPath = outputPath + ".json";
-                                        File.WriteAllText(locresJsonPath, json);
-                                        jobOutputs.Add(locresJsonPath);
-                                        AppendExportManifest(config, file.Value.Path, null, locresJsonPath, "Localization");
-                                        exportedThisJob = true;
-                                        Interlocked.Increment(ref totalExportedFiles);
+                                        break;
                                     }
-                                    break;
-                                }
-                                case "js":
-                                {
-                                    if (
-                                        outputType == fileType
-                                        && provider.TrySaveAsset(file.Value.Path, out var data)
-                                    )
+                                    case "locres":
                                     {
-                                        if (config.LogOutputs)
-                                            Console.WriteLine("=> " + outputPath + "." + outputType);
-                                        using var stream = new MemoryStream(data) { Position = 0 };
-                                        using var reader = new StreamReader(stream);
-                                        JSBeautifyOptions options = new() { };
-                                        JSBeautify beautifier = new(reader.ReadToEnd(), options);
-                                        if (!Directory.Exists(outputDir))
-                                            Directory.CreateDirectory(outputDir);
-                                        var jsPath = outputPath + ".js";
-                                        File.WriteAllText(jsPath, beautifier.GetResult());
-                                        jobOutputs.Add(jsPath);
-                                        AppendExportManifest(config, file.Value.Path, null, jsPath, "Js");
-                                        exportedThisJob = true;
-                                        Interlocked.Increment(ref totalExportedFiles);
+                                        if (
+                                            outputType == "json"
+                                            && provider.TryCreateReader(file.Value.Path, out var archive)
+                                        )
+                                        {
+                                            if (config.LogOutputs)
+                                                Console.WriteLine("=> " + outputPath + ".json");
+                                            var locres = new FTextLocalizationResource(archive);
+                                            var json = JsonConvert.SerializeObject(
+                                                locres,
+                                                Formatting.Indented
+                                            );
+                                            if (!Directory.Exists(outputDir))
+                                                Directory.CreateDirectory(outputDir);
+                                            var locresJsonPath = outputPath + ".json";
+                                            File.WriteAllText(locresJsonPath, json);
+                                            jobOutputs.Add(locresJsonPath);
+                                            AppendExportManifest(config, file.Value.Path, null, locresJsonPath, "Localization");
+                                            exportedThisJob = true;
+                                            Interlocked.Increment(ref totalExportedFiles);
+                                        }
+                                        break;
                                     }
-                                    break;
-                                }
-                                case "db":
-                                {
-                                    if (
-                                        outputType == fileType
-                                        && provider.TrySaveAsset(file.Value.Path, out var data)
-                                    )
+                                    case "js":
                                     {
-                                        if (config.LogOutputs)
-                                            Console.WriteLine("=> " + outputPath + "." + outputType);
-                                        using var stream = new MemoryStream(data) { Position = 0 };
-                                        using var reader = new StreamReader(stream);
-                                        if (!Directory.Exists(outputDir))
-                                            Directory.CreateDirectory(outputDir);
-                                        var dbPath = outputPath + ".db";
-                                        File.WriteAllBytes(dbPath, data);
-                                        jobOutputs.Add(dbPath);
-                                        AppendExportManifest(config, file.Value.Path, null, dbPath, "Database");
-                                        exportedThisJob = true;
-                                        Interlocked.Increment(ref totalExportedFiles);
+                                        if (
+                                            outputType == fileType
+                                            && provider.TrySaveAsset(file.Value.Path, out var data)
+                                        )
+                                        {
+                                            if (config.LogOutputs)
+                                                Console.WriteLine("=> " + outputPath + "." + outputType);
+                                            using var stream = new MemoryStream(data) { Position = 0 };
+                                            using var reader = new StreamReader(stream);
+                                            JSBeautifyOptions options = new() { };
+                                            JSBeautify beautifier = new(reader.ReadToEnd(), options);
+                                            if (!Directory.Exists(outputDir))
+                                                Directory.CreateDirectory(outputDir);
+                                            var jsPath = outputPath + ".js";
+                                            File.WriteAllText(jsPath, beautifier.GetResult());
+                                            jobOutputs.Add(jsPath);
+                                            AppendExportManifest(config, file.Value.Path, null, jsPath, "Js");
+                                            exportedThisJob = true;
+                                            Interlocked.Increment(ref totalExportedFiles);
+                                        }
+                                        break;
                                     }
-                                    break;
+                                    case "db":
+                                    {
+                                        if (
+                                            outputType == fileType
+                                            && provider.TrySaveAsset(file.Value.Path, out var data)
+                                        )
+                                        {
+                                            if (config.LogOutputs)
+                                                Console.WriteLine("=> " + outputPath + "." + outputType);
+                                            using var stream = new MemoryStream(data) { Position = 0 };
+                                            using var reader = new StreamReader(stream);
+                                            if (!Directory.Exists(outputDir))
+                                                Directory.CreateDirectory(outputDir);
+                                            var dbPath = outputPath + ".db";
+                                            File.WriteAllBytes(dbPath, data);
+                                            jobOutputs.Add(dbPath);
+                                            AppendExportManifest(config, file.Value.Path, null, dbPath, "Database");
+                                            exportedThisJob = true;
+                                            Interlocked.Increment(ref totalExportedFiles);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        catch (AggregateException ae)
-                        {
-                            Console.WriteLine(ae.Message);
-                            // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine(
-                                $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
-                            );
-                        }
+                            catch (AggregateException ae)
+                            {
+                                Console.WriteLine(ae.Message);
+                                // Console.WriteLine($"ERROR: File cannot be opened: {file.Value.Path}. Possible issues include incorrect UE version in config.json, missing mapping file, or this file type is not supported.");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine(
+                                    $"ERROR: Failed to export {file.Value.Path}: {ex.Message}"
+                                );
+                            }
 
-                        if (resumeExports && exportedThisJob)
-                        {
-                            exportResumeStore!.MarkExported(
-                                resumeKey,
-                                file.Value.Path,
-                                file.Value.Size,
-                                outputType,
-                                exportJob.AutoReferencedRule,
-                                jobOutputs.ToArray());
-                        }
+                            if (resumeExports && exportedThisJob)
+                            {
+                                exportResumeStore!.MarkExported(
+                                    resumeKey,
+                                    file.Value.Path,
+                                    file.Value.Size,
+                                    outputType,
+                                    exportJob.AutoReferencedRule,
+                                    jobOutputs.ToArray());
+                            }
 
-                        if (exportJob.AutoReferencedRule != null)
-                        {
-                            AppendAutoReferencedExportDiagnostic(
-                                config,
-                                BuildAutoReferencedExportDiagnostic(
-                                    "export",
-                                    exportedThisJob ? "exported" : "notExported",
-                                    exportJob.AutoReferencedRule.RelationType,
-                                    exportJob.AutoReferencedRule.TargetPath,
-                                    exportJob.AutoReferencedRule.SourcePath,
-                                    exportJob.AutoReferencedRule.OutputType,
-                                    exportedThisJob
-                                        ? (exportJob.MatchedByConfig ? "coveredByConfig" : null)
-                                        : "matchedPackageButNoExportedObject"));
-                        }
+                            if (exportJob.AutoReferencedRule != null)
+                            {
+                                AppendAutoReferencedExportDiagnostic(
+                                    config,
+                                    BuildAutoReferencedExportDiagnostic(
+                                        "export",
+                                        exportedThisJob ? "exported" : "notExported",
+                                        exportJob.AutoReferencedRule.RelationType,
+                                        exportJob.AutoReferencedRule.TargetPath,
+                                        exportJob.AutoReferencedRule.SourcePath,
+                                        exportJob.AutoReferencedRule.OutputType,
+                                        exportedThisJob
+                                            ? (exportJob.MatchedByConfig ? "coveredByConfig" : null)
+                                            : "matchedPackageButNoExportedObject"));
+                            }
 
-                        Interlocked.Increment(ref totalRegexMatches);
+                            Interlocked.Increment(ref totalRegexMatches);
+                        }
+                    }
+                    finally
+                    {
+                        if (heavyGateHeld)
+                            heavyExportGate.Release();
                     }
                 }
             }
@@ -1644,6 +1678,9 @@ public class UnrealExporter
         // 素材库导出需要从完整源索引补齐显式引用，避免组合模型、材质贴图或动画只导出一半。
         return config.GenerateLibraryIndexes && config.GenerateSourceIndex;
     }
+
+    private static bool IsHeavyPackageFile(string fileType)
+        => fileType is "uasset" or "umap";
 
     private static bool ShouldAutoExportCompatibleAnimations(ConfigObj config)
     {
@@ -3880,6 +3917,10 @@ public class ConfigObj
     public string? Lang { get; set; }
     public int MaxDegreeOfParallelism { get; set; } =
         UnrealExporter.DefaultMaxDegreeOfParallelism;
+    public int MaxHeavyExportDegreeOfParallelism { get; set; }
+    public double MemorySoftLimitGb { get; set; }
+    public int MemoryCheckIntervalMs { get; set; } = 1500;
+    public int MemoryWaitLogSeconds { get; set; } = 30;
     public bool FortniteMode { get; set; }
     public string? FortniteVersion { get; set; }
     public string? MappingsFile { get; set; }
@@ -3909,6 +3950,7 @@ public class ConfigObj
     public bool? ResumeExports { get; set; }
     public List<string>? SourceIndexRegex { get; set; }
     public int SourceIndexLimit { get; set; }
+    public int SourceIndexCommitInterval { get; set; }
     public required List<string> Export { get; set; }
     public required List<string> Exclude { get; set; }
 }

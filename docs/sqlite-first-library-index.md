@@ -32,6 +32,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
 | Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
 | Browser model/animation list | `library_index.db.model_animation_relations` and `library_index.db.relation_animations` | Browser must not depend on `model_animations.json` |
+| Library health and acceptance reports | `library_index.db.library_reports` | `library_health.json` and `library_acceptance.json` are compatibility/human-inspection views |
 | Human reports | `library_index.db` for queries, JSON for readable summaries | JSON remains acceptable |
 
 ## Accuracy rules
@@ -48,6 +49,13 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 - Full component relations must be streamed into SQLite; do not materialize millions of relation rows only to build convenience summaries.
 - Large nested JSON summaries are optional. If they would duplicate large SQLite tables, write a small human-readable summary and point to the SQLite table.
 
+## Large-library memory controls
+
+Full UE5 exports should keep package work bounded with `maxHeavyExportDegreeOfParallelism` and `memorySoftLimitGb`.
+`maxDegreeOfParallelism` still controls the outer file scan, while `maxHeavyExportDegreeOfParallelism` limits concurrent `uasset` / `umap` package loads and conversion work. `memorySoftLimitGb` watches process private bytes; when the soft limit is exceeded, the exporter pauses new heavy package work, compacts the managed heap and waits for memory to fall below the resume threshold.
+
+These controls are deliberately scheduling-only: they must not change exported meshes, textures, materials, skeletons, animation files or deterministic relationship rows. `sourceIndexCommitInterval` also helps bound the source-index builder by committing smaller SQLite batches during very large scans.
+
 ## SQLite-only mode
 
 `--postprocess-library <root> --sqlite-only-index` disables compatibility JSONL for large machine indexes where SQLite has an equivalent path. It routes texture dedupe links, material texture slot links, shared glTF texture rewrite links and full component relations through `library_work.db`, then imports them into the matching `library_index.db` tables.
@@ -60,7 +68,7 @@ The mode must preserve row counts and deterministic evidence. For example, when 
 
 `--no-compat-json` is an alias for the same behavior.
 
-Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, model validation, skeleton groups, animation validation, model coverage and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl` and `model_animations.json`.
+Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, model validation, skeleton groups, animation validation, model coverage, health/acceptance reports and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl`, `model_animations.json`, `library_health.json` and `library_acceptance.json`.
 
 ## Migration state
 
@@ -74,4 +82,5 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
 - Postprocess can now skip model validation and skeleton compatibility JSON views in SQLite-only mode; query `model_validation` and `skeleton_groups` in `library_index.db`.
 - Postprocess can now skip model coverage, task model quality and component group compatibility JSON views in SQLite-only mode; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its Markdown report from `library_index.db.model_coverage` when `model_coverage.json` is absent without regenerating `task_model_quality.json`.
+- Postprocess can now store library health and acceptance summaries in `library_index.db.library_reports` and skip `library_health.json` / `library_acceptance.json` in SQLite-only mode.
 - Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input and human-readable reports.

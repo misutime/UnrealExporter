@@ -91,9 +91,9 @@ internal static class UELibraryPostProcessor
         RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage, writeCompatibilityJson));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeCompatibilityJson));
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
-        RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
-        RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
-        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
+        var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
+        var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
+        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -5658,7 +5658,7 @@ internal static class UELibraryPostProcessor
             signals.Add(signal);
     }
 
-    private static void WriteLibraryAcceptance(
+    private static JObject WriteLibraryAcceptance(
         string root,
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
@@ -5669,7 +5669,8 @@ internal static class UELibraryPostProcessor
         JObject modelAnimationRelations,
         JObject modelCoverage,
         AnimationValidationSummary animationValidation,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var assets = catalogRows.ToArray();
         var models = assets.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -5816,7 +5817,13 @@ internal static class UELibraryPostProcessor
             },
         });
 
-        File.WriteAllText(Path.Combine(root, "library_acceptance.json"), acceptance.ToString(Formatting.Indented), Encoding.UTF8);
+        var path = Path.Combine(root, "library_acceptance.json");
+        if (writeCompatibilityJson)
+            File.WriteAllText(path, acceptance.ToString(Formatting.Indented), Encoding.UTF8);
+        else
+            DeleteIfExists(path);
+
+        return acceptance;
     }
 
     private static object BuildRelationAcceptance(ComponentAssetRelationLink[] links)
@@ -6219,7 +6226,9 @@ internal static class UELibraryPostProcessor
         JObject modelAnimationRelations,
         JObject modelCoverage,
         AnimationValidationSummary animationValidation,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        JObject libraryHealth,
+        JObject libraryAcceptance)
     {
         var dbPath = Path.Combine(root, "library_index.db");
         DeleteSqliteOutput(dbPath);
@@ -6592,6 +6601,15 @@ internal static class UELibraryPostProcessor
                 raw_json TEXT NOT NULL
             );
             """);
+        Execute(connection, transaction, """
+            CREATE TABLE library_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                status TEXT,
+                generated_at TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
         foreach (var row in catalogRows)
             InsertAsset(connection, transaction, row);
 
@@ -6643,6 +6661,8 @@ internal static class UELibraryPostProcessor
         InsertSkeletonGroups(connection, transaction, skeletonGroups);
         InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
         InsertAnimationValidation(connection, transaction, animationValidation);
+        InsertLibraryReport(connection, transaction, "library_health", libraryHealth);
+        InsertLibraryReport(connection, transaction, "library_acceptance", libraryAcceptance);
 
         CreateLibraryIndexDbIndexes(connection, transaction);
         transaction.Commit();
@@ -6694,6 +6714,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_relation_animations_recommended ON relation_animations(relationship_kind, recommended_use);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
+        Execute(connection, transaction, "CREATE INDEX idx_library_reports_name ON library_reports(name, status);");
     }
 
     private static void FinalizeSqliteOutput(SqliteConnection connection)
@@ -7780,6 +7801,25 @@ internal static class UELibraryPostProcessor
         }
     }
 
+    private static void InsertLibraryReport(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string name,
+        JObject report)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO library_reports (name, status, generated_at, raw_json)
+            VALUES ($name, $status, $generatedAt, $rawJson);
+            """;
+        Add(command, "$name", name);
+        Add(command, "$status", (string?)report["status"]);
+        Add(command, "$generatedAt", (string?)report["generatedAt"]);
+        Add(command, "$rawJson", report.ToString(Formatting.None));
+        command.ExecuteNonQuery();
+    }
+
     private static void Execute(SqliteConnection connection, SqliteTransaction transaction, string sql)
     {
         using var command = connection.CreateCommand();
@@ -7952,7 +7992,7 @@ internal static class UELibraryPostProcessor
         return skeletonArray;
     }
 
-    private static void WriteLibraryHealth(
+    private static JObject WriteLibraryHealth(
         string root,
         List<JObject> catalogRows,
         List<ModelValidationEntry> reports,
@@ -7965,7 +8005,8 @@ internal static class UELibraryPostProcessor
         JObject modelAnimationRelations,
         JObject modelCoverage,
         AnimationValidationSummary animationValidation,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var models = catalogRows.Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase)).ToArray();
         var materials = catalogRows.Where(x => string.Equals((string?)x["kind"], "Material", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -8181,7 +8222,13 @@ internal static class UELibraryPostProcessor
             ["issues"] = issues,
         };
 
-        File.WriteAllText(Path.Combine(root, "library_health.json"), health.ToString(Formatting.Indented), Encoding.UTF8);
+        var path = Path.Combine(root, "library_health.json");
+        if (writeCompatibilityJson)
+            File.WriteAllText(path, health.ToString(Formatting.Indented), Encoding.UTF8);
+        else
+            DeleteIfExists(path);
+
+        return health;
     }
 
     private static object[] BuildComponentRelationStatusSummary(
@@ -8237,12 +8284,13 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("| 文件 | 用途 |");
         sb.AppendLine("| --- | --- |");
-        sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系和验收状态。 |");
+        sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系、健康报告和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
         sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
         sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
-        sb.AppendLine("| `library_health.json` | 人读健康摘要；程序筛选应优先查 `library_index.db`。 |");
+        sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
+        sb.AppendLine("| `library_acceptance.json` | 验收摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
@@ -8263,7 +8311,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json` 和 `skeletons.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
