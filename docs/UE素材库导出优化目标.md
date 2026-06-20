@@ -46,7 +46,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
 
 6. 索引与报告
    - `library_index.db` 是已导出素材库的 SQLite 优先查询入口，浏览器、筛选器和验收脚本默认应读 SQLite；JSON/JSONL 保留为流式导出日志、人工 diff 和兼容旧工具的产物。
-   - 使用 `--sqlite-only-index` / `--no-compat-json` 后处理，或在全量导出配置里设置 `sqliteOnlyIndex: true` / `writeCompatibilityJson: false` 时，导出事件优先写入 `export_events.db`，贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和组件关系优先写入 `library_work.db`，再导入 `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 可不生成。
+   - 使用 `--sqlite-only-index` / `--no-compat-json` 后处理，或在全量导出配置里设置 `sqliteOnlyIndex: true` / `writeCompatibilityJson: false` 时，导出事件优先写入 `export_events.db`，源包对象映射保留在 `ue_source_index.db`，贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和组件关系优先写入 `library_work.db`，再导入 `library_index.db`；对应 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`、`auto_referenced_exports.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 可不生成。
    - `asset_catalog.jsonl` 是素材库 JSONL 总入口，必须合并导出主链路数据和验证数据，并同步到 `library_index.db.assets`。
    - `library_index.db` 必须包含 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、package_object_maps 等常用查询表。
    - `export_manifest.jsonl` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`。

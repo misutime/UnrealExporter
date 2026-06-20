@@ -74,14 +74,17 @@ internal static class UELibraryPostProcessor
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
-        var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows));
+        var mergedCatalogRows = RunStage("写资产目录", () => WriteAssetCatalog(root, catalogRows, writeCompatibilityJson));
         var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
         var materialTextureSlots = RunStage("写材质贴图槽关系", () => WriteMaterialTextureSlotLinks(root, materialIndex, textureLinks, sourceIndex, writeCompatibilityJson));
         RunStage("应用外部材质验证", () => ApplyExternalMaterialValidation(root, reports, mergedCatalogRows, materialTextureSlots));
         var sharedGltfTextureLinks = RunStage("外置GLB/改写glTF共享贴图引用", () => RewriteGltfSharedTextureUris(root, reports, materialTextureSlots, writeCompatibilityJson));
-        mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(root, reports.Select(BuildModelCatalogRow).ToList()));
+        mergedCatalogRows = RunStage("重写资产目录", () => WriteAssetCatalog(
+            root,
+            mergedCatalogRows.Concat(reports.Select(BuildModelCatalogRow)).ToList(),
+            writeCompatibilityJson));
         var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
-        var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex));
+        var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex, writeCompatibilityJson));
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
         var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex));
@@ -913,10 +916,16 @@ internal static class UELibraryPostProcessor
         });
     }
 
-    private static List<JObject> WriteAssetCatalog(string root, List<JObject> rows)
+    private static List<JObject> WriteAssetCatalog(string root, List<JObject> rows, bool writeCompatibilityJson)
     {
         var path = Path.Combine(root, "asset_catalog.jsonl");
         var mergedRows = MergeExistingCatalogRows(root, path, rows);
+        if (!writeCompatibilityJson)
+        {
+            DeleteIfExists(path);
+            return mergedRows;
+        }
+
         using var writer = new StreamWriter(path, false, Encoding.UTF8);
         foreach (var row in mergedRows)
             writer.WriteLine(row.ToString(Formatting.None));
@@ -2064,10 +2073,16 @@ internal static class UELibraryPostProcessor
             File.Delete(path);
     }
 
-    private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex)
+    private static SourcePackageObjectMap[] WritePackageObjectMaps(string root, SourceIndexSnapshot sourceIndex, bool writeCompatibilityJson)
     {
         var rows = sourceIndex.Available ? sourceIndex.PackageObjectMaps : [];
         var path = Path.Combine(root, "package_object_maps.jsonl");
+        if (!writeCompatibilityJson)
+        {
+            DeleteIfExists(path);
+            return rows;
+        }
+
         using var writer = new StreamWriter(path, false, Encoding.UTF8);
         if (rows.Length == 0 && sourceIndex.PackageObjectMapCount > 0)
         {
@@ -7859,7 +7874,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 保留同一份关系的 JSON 视图。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图；例如导出事件 JSONL、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 会由 `export_events.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
