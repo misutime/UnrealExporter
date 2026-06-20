@@ -1,0 +1,28 @@
+[
+  {
+    "gameTitle": "LEGOBatmanLotDK",
+    "version": "5.6",
+    "paksDir": "D:\\BaiduNetdiskDownload\\ue5-LEGO Batman Legacy of the Dark Knight\\LEGOBatmanLotDK\\Content\\Paks",
+    "outputDir": "F:\\UE-Assets\\batman-all-assets",
+    "aes": "0x2AC1CF37605D2132EAB22D51CBA5F96AD5AB7F7AE708E3E3D5FEFBDFE249D5D6",
+    "logOutputs": true,
+    "keepDirectoryStructure": true,
+    "lang": "English",
+    "generateLibraryIndexes": true,
+    "useSharedTextures": true,
+    "generateSourceIndex": true,
+    "createNewCheckpoint": false,
+    "useCheckpointFile": "",
+    "export": [
+      "LEGOBatmanLotDK/Content/.*\\.uasset:glb",
+      "LEGOBatmanLotDK/Content/.*\\.uasset:png"
+    ],
+    "exclude": [
+      "LEGOBatmanLotDK/Content/.*Maps/.*",
+      "LEGOBatmanLotDK/Content/Blueprints/.*",
+      "LEGOBatmanLotDK/Content/Data/.*",
+      "LEGOBatmanLotDK/Content/Dialogue/.*",
+      "LEGOBatmanLotDK/Content/Movies/.*"
+    ]
+  }
+]
