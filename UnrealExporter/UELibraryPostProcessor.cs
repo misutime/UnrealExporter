@@ -3069,9 +3069,7 @@ internal static class UELibraryPostProcessor
             return;
         }
 
-        var groups = BuildComponentGroupRows(links)
-            .Select(x => JObject.Parse(x.RawJson))
-            .ToArray();
+        var groups = BuildComponentGroupDebugRows(links);
 
         File.WriteAllText(
             Path.Combine(root, "component_groups.json"),
@@ -3118,16 +3116,14 @@ internal static class UELibraryPostProcessor
             Encoding.UTF8);
     }
 
-    private static ComponentGroupRow[] BuildComponentGroupRows(ComponentAssetRelationLink[] links)
+    private static JObject[] BuildComponentGroupDebugRows(ComponentAssetRelationLink[] links)
     {
         return links
             .Where(x => !string.IsNullOrWhiteSpace(x.OwnerObjectPath))
             .GroupBy(x => x.OwnerObjectPath!, StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(x => x.Count(y => IsModelRelation(y.RelationType)))
             .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(group =>
-            {
-                var json = JObject.FromObject(new
+            .Select(group => JObject.FromObject(new
                 {
                     ownerObjectPath = group.Key,
                     ownerType = group.Select(x => x.OwnerType).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
@@ -3256,27 +3252,38 @@ internal static class UELibraryPostProcessor
                             x.ComponentVariableName,
                         })
                         .ToArray(),
-                });
+                }))
+            .ToArray();
+    }
 
-                return new ComponentGroupRow
-                {
-                    OwnerObjectPath = (string)json["ownerObjectPath"]!,
-                    OwnerType = (string?)json["ownerType"],
-                    SourcePath = (string?)json["sourcePath"],
-                    RelationCount = (int)json["relationCount"]!,
-                    ComponentCount = (int)json["componentCount"]!,
-                    ModelReferenceCount = (int)json["modelReferenceCount"]!,
-                    ExportedModelReferenceCount = (int)json["exportedModelReferenceCount"]!,
-                    MissingModelReferenceCount = (int)json["missingModelReferenceCount"]!,
-                    AnimationReferenceCount = (int)json["animationReferenceCount"]!,
-                    ExportedAnimationReferenceCount = (int)json["exportedAnimationReferenceCount"]!,
-                    MissingAnimationReferenceCount = (int)json["missingAnimationReferenceCount"]!,
-                    MaterialReferenceCount = (int)json["materialReferenceCount"]!,
-                    ExportedMaterialReferenceCount = (int)json["exportedMaterialReferenceCount"]!,
-                    MissingMaterialReferenceCount = (int)json["missingMaterialReferenceCount"]!,
-                    MissingReferenceCount = (int)json["missingReferenceCount"]!,
-                    RawJson = json.ToString(Formatting.None),
-                };
+    private static ComponentGroupRow[] BuildComponentGroupRows(ComponentAssetRelationLink[] links)
+    {
+        return links
+            .Where(x => !string.IsNullOrWhiteSpace(x.OwnerObjectPath))
+            .GroupBy(x => x.OwnerObjectPath!, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count(y => IsModelRelation(y.RelationType)))
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new ComponentGroupRow
+            {
+                OwnerObjectPath = group.Key,
+                OwnerType = group.Select(x => x.OwnerType).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
+                SourcePath = group.Select(x => x.SourcePath).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
+                RelationCount = group.Count(),
+                ComponentCount = group
+                    .Where(x => !string.IsNullOrWhiteSpace(x.ComponentObjectPath))
+                    .Select(x => x.ComponentObjectPath)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Count(),
+                ModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType)),
+                ExportedModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && x.MatchStatus == "matched"),
+                MissingModelReferenceCount = group.Count(x => IsModelRelation(x.RelationType) && IsMissingAssetRelation(x)),
+                AnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType)),
+                ExportedAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && x.MatchStatus == "matched"),
+                MissingAnimationReferenceCount = group.Count(x => IsAnimationRelation(x.RelationType) && IsMissingAssetRelation(x)),
+                MaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase)),
+                ExportedMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && x.MatchStatus == "matched"),
+                MissingMaterialReferenceCount = group.Count(x => string.Equals(x.RelationType, "Material", StringComparison.OrdinalIgnoreCase) && IsMissingAssetRelation(x)),
+                MissingReferenceCount = group.Count(IsMissingAssetRelation),
             })
             .ToArray();
     }
@@ -6793,8 +6800,7 @@ internal static class UELibraryPostProcessor
                 material_reference_count INTEGER NOT NULL,
                 exported_material_reference_count INTEGER NOT NULL,
                 missing_material_reference_count INTEGER NOT NULL,
-                missing_reference_count INTEGER NOT NULL,
-                raw_json TEXT NOT NULL
+                missing_reference_count INTEGER NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -8068,14 +8074,14 @@ internal static class UELibraryPostProcessor
                     model_reference_count, exported_model_reference_count, animation_reference_count,
                     missing_model_reference_count, exported_animation_reference_count, missing_animation_reference_count,
                     material_reference_count, exported_material_reference_count, missing_material_reference_count,
-                    missing_reference_count, raw_json
+                    missing_reference_count
                 )
                 VALUES (
                     $ownerObjectPath, $ownerType, $sourcePath, $relationCount, $componentCount,
                     $modelReferenceCount, $exportedModelReferenceCount, $animationReferenceCount,
                     $missingModelReferenceCount, $exportedAnimationReferenceCount, $missingAnimationReferenceCount,
                     $materialReferenceCount, $exportedMaterialReferenceCount, $missingMaterialReferenceCount,
-                    $missingReferenceCount, $rawJson
+                    $missingReferenceCount
                 );
                 """;
             Add(command, "$ownerObjectPath", group.OwnerObjectPath);
@@ -8093,7 +8099,6 @@ internal static class UELibraryPostProcessor
             Add(command, "$exportedMaterialReferenceCount", group.ExportedMaterialReferenceCount);
             Add(command, "$missingMaterialReferenceCount", group.MissingMaterialReferenceCount);
             Add(command, "$missingReferenceCount", group.MissingReferenceCount);
-            Add(command, "$rawJson", group.RawJson);
             command.ExecuteNonQuery();
         }
     }
@@ -9786,7 +9791,6 @@ internal static class UELibraryPostProcessor
         public int ExportedMaterialReferenceCount { get; set; }
         public int MissingMaterialReferenceCount { get; set; }
         public int MissingReferenceCount { get; set; }
-        public string RawJson { get; set; } = string.Empty;
     }
 
     private sealed class ModelBoneLookup
