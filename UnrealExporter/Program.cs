@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Animations;
@@ -1499,9 +1500,9 @@ public class UnrealExporter
         var providerFilesByPath = BuildProviderPathLookup(provider);
         Console.WriteLine($"Auto referenced lookup prepared: packages={packageFiles.Count}, providerPaths={providerFilesByPath.Count}, elapsed={Elapsed(autoRuleStart, Now(), 1000)}s");
         var rules = new Dictionary<string, List<AutoReferencedExportRule>>(StringComparer.OrdinalIgnoreCase);
-        var diagnostics = new List<object>();
         var unresolved = 0;
         var ambiguous = 0;
+        using var diagnostics = AutoReferencedDiagnosticSink.Open(config);
 
         using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         connection.Open();
@@ -1583,7 +1584,7 @@ public class UnrealExporter
         Console.WriteLine($"Auto referenced animation segments done: rules={rules.Sum(x => x.Value.Count)}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
 
         stageStart = Now();
-        WriteAutoReferencedExportDiagnostics(config, diagnostics);
+        diagnostics.Flush();
         Console.WriteLine($"Auto referenced diagnostics written: rows={diagnostics.Count}, elapsed={Elapsed(stageStart, Now(), 1000)}s");
 
         Console.WriteLine(
@@ -1601,7 +1602,7 @@ public class UnrealExporter
         Dictionary<string, string[]> packageFiles,
         Dictionary<string, string> providerFilesByPath,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics)
+        AutoReferencedDiagnosticSink diagnostics)
     {
         if (!TableExists(connection, "source_relations"))
             return (0, 0);
@@ -1642,7 +1643,7 @@ public class UnrealExporter
     private static (int Unresolved, int Ambiguous) TryAddPackageBackedAutoRule(
         Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics,
+        AutoReferencedDiagnosticSink diagnostics,
         string relationType,
         string targetPath,
         string outputType)
@@ -1693,7 +1694,7 @@ public class UnrealExporter
         Dictionary<string, string> providerFilesByPath,
         string skeletonPath,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics)
+        AutoReferencedDiagnosticSink diagnostics)
     {
         var unresolved = 0;
         using var command = connection.CreateCommand();
@@ -1730,7 +1731,7 @@ public class UnrealExporter
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics)
+        AutoReferencedDiagnosticSink diagnostics)
     {
         if (!TableExists(connection, "material_texture_slots"))
             return (0, 0);
@@ -1781,7 +1782,7 @@ public class UnrealExporter
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics)
+        AutoReferencedDiagnosticSink diagnostics)
     {
         if (!TableExists(connection, "animation_segments"))
             return 0;
@@ -1820,7 +1821,7 @@ public class UnrealExporter
         SqliteConnection connection,
         Dictionary<string, string[]> packageFiles,
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics)
+        AutoReferencedDiagnosticSink diagnostics)
     {
         if (!TableExists(connection, "source_objects"))
             return 0;
@@ -1868,7 +1869,7 @@ public class UnrealExporter
 
     private static void AddAutoReferencedExportRule(
         Dictionary<string, List<AutoReferencedExportRule>> rules,
-        List<object> diagnostics,
+        AutoReferencedDiagnosticSink diagnostics,
         string relationType,
         string targetPath,
         string sourcePath,
@@ -1922,21 +1923,6 @@ public class UnrealExporter
             reason,
         };
 
-    private static void WriteAutoReferencedExportDiagnostics(ConfigObj config, List<object> diagnostics)
-    {
-        ReplaceExportEventSqliteRows(config, "auto_referenced_exports", diagnostics.Select(JObject.FromObject));
-        var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
-        if (!ShouldWriteCompatibilityJson(config))
-        {
-            DeleteIfExists(path);
-            return;
-        }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var lines = diagnostics.Select(JsonConvert.SerializeObject).ToArray();
-        File.WriteAllLines(path, lines);
-    }
-
     private static void AppendAutoReferencedExportDiagnostic(ConfigObj config, object diagnostic)
     {
         WriteExportEventSqlite(config, "auto_referenced_exports", JObject.FromObject(diagnostic));
@@ -1948,6 +1934,65 @@ public class UnrealExporter
         lock (AutoReferencedWriteLock)
         {
             File.AppendAllText(path, JsonConvert.SerializeObject(diagnostic) + Environment.NewLine);
+        }
+    }
+
+    private sealed class AutoReferencedDiagnosticSink : IDisposable
+    {
+        private const int BatchSize = 1000;
+        private readonly ConfigObj _config;
+        private readonly List<JObject> _batch = new(BatchSize);
+        private readonly StreamWriter? _compatWriter;
+
+        private AutoReferencedDiagnosticSink(ConfigObj config, StreamWriter? compatWriter)
+        {
+            _config = config;
+            _compatWriter = compatWriter;
+        }
+
+        public int Count { get; private set; }
+
+        public static AutoReferencedDiagnosticSink Open(ConfigObj config)
+        {
+            ClearExportEventSqliteRows(config, "auto_referenced_exports");
+            var path = Path.Combine(Path.GetFullPath(config.OutputDir), "auto_referenced_exports.jsonl");
+            if (!ShouldWriteCompatibilityJson(config))
+            {
+                DeleteIfExists(path);
+                return new AutoReferencedDiagnosticSink(config, null);
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            return new AutoReferencedDiagnosticSink(config, new StreamWriter(path, false, Encoding.UTF8));
+        }
+
+        public void Add(object diagnostic)
+        {
+            var row = JObject.FromObject(diagnostic);
+            _batch.Add(row);
+            Count++;
+            if (_compatWriter != null)
+                _compatWriter.WriteLine(row.ToString(Formatting.None));
+
+            if (_batch.Count >= BatchSize)
+                Flush();
+        }
+
+        public void Flush()
+        {
+            if (_batch.Count > 0)
+            {
+                WriteExportEventSqliteBatch(_config, "auto_referenced_exports", _batch);
+                _batch.Clear();
+            }
+
+            _compatWriter?.Flush();
+        }
+
+        public void Dispose()
+        {
+            Flush();
+            _compatWriter?.Dispose();
         }
     }
 
@@ -2314,6 +2359,25 @@ public class UnrealExporter
         writer.Insert(tableName, row);
     }
 
+    private static void WriteExportEventSqliteBatch(ConfigObj config, string tableName, IReadOnlyList<JObject> rows)
+    {
+        if (rows.Count == 0)
+            return;
+
+        var writer = ExportEventWriters.GetOrAdd(
+            Path.GetFullPath(config.OutputDir),
+            outputDir => ExportEventSqliteWriter.Open(outputDir));
+        writer.InsertMany(tableName, rows);
+    }
+
+    private static void ClearExportEventSqliteRows(ConfigObj config, string tableName)
+    {
+        var writer = ExportEventWriters.GetOrAdd(
+            Path.GetFullPath(config.OutputDir),
+            outputDir => ExportEventSqliteWriter.Open(outputDir));
+        writer.Clear(tableName);
+    }
+
     private static void ReplaceExportEventSqliteRows(ConfigObj config, string tableName, IEnumerable<JObject> rows)
     {
         var writer = ExportEventWriters.GetOrAdd(
@@ -2362,6 +2426,28 @@ public class UnrealExporter
             lock (_lock)
             {
                 InsertCore(tableName, row);
+            }
+        }
+
+        public void InsertMany(string tableName, IEnumerable<JObject> rows)
+        {
+            lock (_lock)
+            {
+                using var transaction = _connection.BeginTransaction();
+                foreach (var row in rows)
+                    InsertCore(tableName, row, transaction);
+
+                transaction.Commit();
+            }
+        }
+
+        public void Clear(string tableName)
+        {
+            lock (_lock)
+            {
+                using var command = _connection.CreateCommand();
+                command.CommandText = $"DELETE FROM {ValidateExportEventTableName(tableName)};";
+                command.ExecuteNonQuery();
             }
         }
 
