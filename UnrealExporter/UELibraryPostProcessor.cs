@@ -85,8 +85,8 @@ internal static class UELibraryPostProcessor
             writeCompatibilityJson));
         var componentAssetRelations = RunStage("写组件素材关系", () => WriteComponentAssetRelations(root, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex, writeCompatibilityJson));
-        var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations));
-        var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation));
+        var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations, writeCompatibilityJson));
+        var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeCompatibilityJson));
         var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex));
         RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports));
@@ -3395,7 +3395,8 @@ internal static class UELibraryPostProcessor
         string root,
         List<JObject> catalogRows,
         SourceIndexSnapshot sourceIndex,
-        ComponentAssetRelationLink[] componentAssetRelations)
+        ComponentAssetRelationLink[] componentAssetRelations,
+        bool writeCompatibilityJson)
     {
         var validations = BuildAnimationValidations(root, catalogRows, sourceIndex, componentAssetRelations);
         var summary = new AnimationValidationSummary
@@ -3427,14 +3428,24 @@ internal static class UELibraryPostProcessor
             ["detailFile"] = "animation_validation.jsonl",
         };
 
-        File.WriteAllText(Path.Combine(root, "animation_validation.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
-        WriteAnimationValidationJsonLines(root, validations);
+        var summaryPath = Path.Combine(root, "animation_validation.json");
+        var detailPath = Path.Combine(root, "animation_validation.jsonl");
+        if (writeCompatibilityJson)
+        {
+            File.WriteAllText(summaryPath, json.ToString(Formatting.Indented), Encoding.UTF8);
+            WriteAnimationValidationJsonLines(detailPath, validations);
+        }
+        else
+        {
+            DeleteIfExists(summaryPath);
+            DeleteIfExists(detailPath);
+        }
+
         return summary;
     }
 
-    private static void WriteAnimationValidationJsonLines(string root, AnimationValidationEntry[] validations)
+    private static void WriteAnimationValidationJsonLines(string path, AnimationValidationEntry[] validations)
     {
-        var path = Path.Combine(root, "animation_validation.jsonl");
         using var writer = new StreamWriter(path, false, Encoding.UTF8);
         foreach (var validation in validations)
             writer.WriteLine(BuildAnimationValidationJson(validation).ToString(Formatting.None));
@@ -4647,7 +4658,8 @@ internal static class UELibraryPostProcessor
     private static JObject WriteModelAnimationRelations(
         string root,
         List<JObject> catalogRows,
-        AnimationValidationSummary animationValidation)
+        AnimationValidationSummary animationValidation,
+        bool writeCompatibilityJson)
     {
         var models = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -4777,7 +4789,12 @@ internal static class UELibraryPostProcessor
             ["relations"] = relations,
         };
 
-        File.WriteAllText(Path.Combine(root, "model_animations.json"), summary.ToString(Formatting.Indented));
+        var path = Path.Combine(root, "model_animations.json");
+        if (writeCompatibilityJson)
+            File.WriteAllText(path, summary.ToString(Formatting.Indented));
+        else
+            DeleteIfExists(path);
+
         return summary;
     }
 
@@ -7257,7 +7274,7 @@ internal static class UELibraryPostProcessor
 
     private static string BuildModelAnimationRelationDbRawJson(JObject relationObj, JArray animations)
     {
-        // 完整动画数组已经逐条写入 relation_animations，也会保留在 model_animations.json。
+        // 完整动画数组已经逐条写入 relation_animations。
         // SQLite 这一列只保留模型级摘要，避免大库里把同一批动画 JSON 重复写两遍。
         var summary = new JObject();
         foreach (var property in relationObj.Properties())
@@ -7271,7 +7288,7 @@ internal static class UELibraryPostProcessor
             .OfType<JObject>()
             .Count(x => (bool?)x["isUsableCandidate"] ?? false);
         summary["sqliteRawJsonMode"] = "summaryOnly";
-        summary["sqliteRawJsonNote"] = "动画明细存放在 relation_animations；完整模型动画关系仍保留在 model_animations.json。";
+        summary["sqliteRawJsonNote"] = "动画明细存放在 relation_animations；SQLite-only 模式下不会重复写 model_animations.json 兼容视图。";
         return summary.ToString(Formatting.None);
     }
 
@@ -7858,8 +7875,8 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
         sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
-        sb.AppendLine("| `model_animations.json` | 输出显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 模型动画候选，并回填动画验证结果。 |");
-        sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
+        sb.AppendLine("| `model_animations.json` | 模型动画关系兼容/人工排查视图；主数据在 `library_index.db.model_animation_relations` 和 `library_index.db.relation_animations`。 |");
+        sb.AppendLine("| `animation_validation.json` | 动画兼容验证兼容/人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
         sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组，并合并 UE Skeleton、源骨架对象和同 Skeleton 动画。 |");
         sb.AppendLine("| `texture_links.jsonl` | 原贴图文件、共享贴图、sha256 和硬链接状态。 |");
@@ -7872,9 +7889,9 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("## 模型动画关系字段");
         sb.AppendLine();
-        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 保留同一份关系的 JSON 视图。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
+        sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`animation_validation.jsonl` 和 `model_animations.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");

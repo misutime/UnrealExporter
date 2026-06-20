@@ -24,7 +24,8 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Shared glTF texture rewrites | `library_work.db.shared_gltf_texture_links`, then `library_index.db.shared_gltf_texture_links` | `shared_texture_gltf_links.jsonl` is a compatibility/debug view |
 | UE source relations | `ue_source_index.db`, optionally `library_work.db.component_asset_relations`, then `library_index.db.component_asset_relations` | `component_asset_relations.jsonl` is a compatibility/debug view |
 | UE package object maps | `ue_source_index.db.package_object_maps`, then optional sampled rows in `library_index.db.package_object_maps` | `package_object_maps.jsonl` is a compatibility/debug view |
-| Browser model/animation list | `library_index.db` | Browser must not depend on `model_animations.json` |
+| Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
+| Browser model/animation list | `library_index.db.model_animation_relations` and `library_index.db.relation_animations` | Browser must not depend on `model_animations.json` |
 | Human reports | `library_index.db` for queries, JSON for readable summaries | JSON remains acceptable |
 
 ## Accuracy rules
@@ -53,7 +54,7 @@ The mode must preserve row counts and deterministic evidence. For example, when 
 
 `--no-compat-json` is an alias for the same behavior.
 
-Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog in memory for validation and writes it to `library_index.db`, but skips `asset_catalog.jsonl` and `package_object_maps.jsonl`.
+Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, animation validation and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `animation_validation.json`, `animation_validation.jsonl` and `model_animations.json`.
 
 ## Migration state
 
@@ -62,4 +63,5 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - Postprocess now reads `export_events.db` first for export manifest, asset catalog, animation bindings and auto referenced export diagnostics, then falls back to JSONL.
 - Postprocess can now stream full component relations to `library_work.db` and skip `component_asset_relations.jsonl` in SQLite-only mode.
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
+- Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
 - Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input, validation caches and human-readable reports.
