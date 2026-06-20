@@ -62,9 +62,19 @@ internal static class UELibraryPostProcessor
         foreach (var material in materialIndex.Values.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildMaterialCatalogRow(material));
 
+        JObject? textureDedupeSummary = null;
         var textureLinks = dedupeTextures
-            ? RunStage("共享贴图去重/硬链接", () => DeduplicateTextureFilesCore(root, writeCompatibilityJson))
-            : RunStage("读取已有共享贴图索引", () => LoadExistingTextureLinks(root));
+            ? RunStage("共享贴图去重/硬链接", () =>
+            {
+                var result = DeduplicateTextureFilesCore(root, writeCompatibilityJson);
+                textureDedupeSummary = result.Summary;
+                return result.Links;
+            })
+            : RunStage("读取已有共享贴图索引", () =>
+            {
+                textureDedupeSummary = LoadLibraryWorkReport(root, "texture_dedupe");
+                return LoadExistingTextureLinks(root);
+            });
         foreach (var texture in textureLinks.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             catalogRows.Add(BuildTextureCatalogRow(texture));
 
@@ -87,7 +97,7 @@ internal static class UELibraryPostProcessor
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
         var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeCompatibilityJson));
-        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, materialIndex.Values, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance));
+        RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, materialIndex.Values, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance, textureDedupeSummary));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
@@ -2518,13 +2528,22 @@ internal static class UELibraryPostProcessor
                 updated_at TEXT NOT NULL
             );
             """);
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS library_reports (
+                name TEXT PRIMARY KEY,
+                status TEXT,
+                generated_at TEXT,
+                raw_json TEXT NOT NULL
+            );
+            """);
         Execute(connection, "CREATE INDEX IF NOT EXISTS idx_material_sidecars_name ON material_sidecars(name);");
         Execute(connection, "CREATE UNIQUE INDEX IF NOT EXISTS idx_material_sidecars_path ON material_sidecars(relative_path);");
         Execute(connection, "CREATE INDEX IF NOT EXISTS idx_model_validation_cache_signature ON model_validation_cache(cache_version, material_index_signature);");
+        Execute(connection, "CREATE INDEX IF NOT EXISTS idx_library_work_reports_status ON library_reports(name, status);");
     }
 
     private static string ValidateLibraryWorkTableName(string tableName)
-        => tableName is "texture_links" or "material_sidecars" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations" or "model_validation_cache"
+        => tableName is "texture_links" or "material_sidecars" or "material_texture_slots" or "shared_gltf_texture_links" or "component_asset_relations" or "model_validation_cache" or "library_reports"
             ? tableName
             : throw new ArgumentOutOfRangeException(nameof(tableName), tableName, "Unknown library work table.");
 
@@ -5976,7 +5995,7 @@ internal static class UELibraryPostProcessor
                 "GLB 是当前模型/骨骼/材质预览主格式；UE .ueanim 可通过 --preview-ue-animation 与模型 GLB 离线合并成可播放动画预览，默认报告为 <输出文件名>.preview_validation.json。",
                 "任务/道具模型优先看 taskAndPropModels.quality、bySignal 和 highReferenceExamples；有组件引用表示来自 UE 蓝图/组件显式关系，无组件引用但源索引确认到对象时记录为 sourceIndexedPathEvidence。",
                 "动画 explicitUsage 来自 UE 组件/蓝图/AnimClass 等显式关系；skeletonCompatibility 来自同 USkeleton 且骨骼覆盖验证通过的可复用候选。验证 error 不进入可用动画。",
-                "贴图去重通过 Textures/_Shared 和 texture_links.jsonl 验证，GLB 内嵌贴图不会被强行拆出。",
+                "贴图去重通过 Textures/_Shared、library_index.db.texture_links 和 library_index.db.library_reports 的 texture_dedupe 摘要验证，GLB 内嵌贴图不会被强行拆出。",
             },
         });
 
@@ -6392,7 +6411,8 @@ internal static class UELibraryPostProcessor
         AnimationValidationSummary animationValidation,
         SourceIndexSnapshot sourceIndex,
         JObject libraryHealth,
-        JObject libraryAcceptance)
+        JObject libraryAcceptance,
+        JObject? textureDedupeSummary)
     {
         var dbPath = Path.Combine(root, "library_index.db");
         DeleteSqliteOutput(dbPath);
@@ -6846,6 +6866,8 @@ internal static class UELibraryPostProcessor
         InsertAnimationValidation(connection, transaction, animationValidation);
         InsertLibraryReport(connection, transaction, "library_health", libraryHealth);
         InsertLibraryReport(connection, transaction, "library_acceptance", libraryAcceptance);
+        if (textureDedupeSummary != null)
+            InsertLibraryReport(connection, transaction, "texture_dedupe", textureDedupeSummary);
 
         CreateLibraryIndexDbIndexes(connection, transaction);
         transaction.Commit();
@@ -7038,6 +7060,59 @@ internal static class UELibraryPostProcessor
         var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         connection.Open();
         return connection;
+    }
+
+    private static void WriteLibraryWorkReport(string root, string name, JObject report)
+    {
+        var connection = OpenLibraryWorkDb(root);
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO library_reports (name, status, generated_at, raw_json)
+                VALUES ($name, $status, $generatedAt, $rawJson)
+                ON CONFLICT(name) DO UPDATE SET
+                    status = excluded.status,
+                    generated_at = excluded.generated_at,
+                    raw_json = excluded.raw_json;
+                """;
+            Add(command, "$name", name);
+            Add(command, "$status", (string?)report["status"]);
+            Add(command, "$generatedAt", (string?)report["generatedAt"]);
+            Add(command, "$rawJson", report.ToString(Formatting.None));
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            FinalizeWorkDb(connection);
+        }
+    }
+
+    private static JObject? LoadLibraryWorkReport(string root, string name)
+    {
+        using var connection = OpenLibraryWorkDbReadOnly(root);
+        if (connection == null || !TableExists(connection, "library_reports"))
+            return null;
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT raw_json
+            FROM library_reports
+            WHERE name = $name;
+            """;
+        Add(command, "$name", name);
+        var raw = command.ExecuteScalar() as string;
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        try
+        {
+            return JObject.Parse(raw);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static void InsertExportManifestRows(SqliteConnection connection, SqliteTransaction transaction, string root)
@@ -8504,6 +8579,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
         sb.AppendLine("| `library_acceptance.json` | 验收摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
+        sb.AppendLine("| `texture_dedupe_summary.json` | 贴图去重摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports` 的 `texture_dedupe` 记录。 |");
         sb.AppendLine("| `export_manifest.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
@@ -8525,7 +8601,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`texture_dedupe_summary.json`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`task_model_quality.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json`、`skeletons.json`、`library_health.json` 和 `library_acceptance.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载；材质 sidecar 摘要会进入 `library_index.db.material_sidecars`，贴图去重摘要会进入 `library_index.db.library_reports`。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
@@ -8661,7 +8737,7 @@ internal static class UELibraryPostProcessor
         return result;
     }
 
-    private static List<TextureLinkInfo> DeduplicateTextureFilesCore(string root, bool writeCompatibilityJson)
+    private static TextureDedupeResult DeduplicateTextureFilesCore(string root, bool writeCompatibilityJson)
     {
         var textureFiles = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
             .Where(x => TextureExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
@@ -8714,23 +8790,31 @@ internal static class UELibraryPostProcessor
 
         WriteTextureLinks(root, links, writeCompatibilityJson);
         var removedStaleSharedFiles = RemoveUnreferencedSharedTextures(root, sharedRoot, links);
-        File.WriteAllText(
-            Path.Combine(root, "texture_dedupe_summary.json"),
-            JsonConvert.SerializeObject(new
-            {
-                generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "素材 PNG/HDR 统一复制到 Textures/_Shared，再把原素材文件替换为硬链接；缓存缩略图和浏览器临时目录不会进入素材贴图索引。",
-                scanned = textureFiles.Length,
-                unique = byHash.Count,
-                copiedToShared = copied,
-                hardLinkedFiles = linked,
-                sharedTextureFiles = links.Select(x => x.SharedRelativePath).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
-                removedStaleSharedFiles,
-                note = "所有素材 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 保持独立预览，文本 glTF 可通过 shared_texture_gltf_links.jsonl 追踪共享贴图改写。",
-            }, Formatting.Indented),
-            Encoding.UTF8);
+        var summary = JObject.FromObject(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            status = "ok",
+            rule = "素材 PNG/HDR 统一复制到 Textures/_Shared，再把原素材文件替换为硬链接；缓存缩略图和浏览器临时目录不会进入素材贴图索引。",
+            scanned = textureFiles.Length,
+            unique = byHash.Count,
+            copiedToShared = copied,
+            hardLinkedFiles = linked,
+            sharedTextureFiles = links.Select(x => x.SharedRelativePath).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+            removedStaleSharedFiles,
+            note = "所有素材 PNG/HDR 文件都会尽量替换为指向 Textures/_Shared 的硬链接；GLB 保持独立预览，文本 glTF 可通过 library_index.db.shared_gltf_texture_links 追踪共享贴图改写。",
+        });
+        WriteLibraryWorkReport(root, "texture_dedupe", summary);
+        var summaryPath = Path.Combine(root, "texture_dedupe_summary.json");
+        if (writeCompatibilityJson)
+        {
+            File.WriteAllText(summaryPath, summary.ToString(Formatting.Indented), Encoding.UTF8);
+        }
+        else
+        {
+            DeleteIfExists(summaryPath);
+        }
         Console.WriteLine($"Texture dedupe finished: scanned={textureFiles.Length}, unique={byHash.Count}, linked={linked}");
-        return links;
+        return new TextureDedupeResult(links, summary);
     }
 
     private static bool IsAssetTextureFile(string root, string path)
@@ -8943,6 +9027,8 @@ internal static class UELibraryPostProcessor
         public bool HardLinked { get; set; }
         public string? LinkError { get; set; }
     }
+
+    private sealed record TextureDedupeResult(List<TextureLinkInfo> Links, JObject Summary);
 
     private sealed record TextureLinkLookup(
         Dictionary<string, TextureLinkInfo[]> ByPackageSuffix,
