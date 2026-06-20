@@ -488,6 +488,8 @@ internal static class UELibraryPostProcessor
             throw new FileNotFoundException("library_index.db.model_coverage is required to refresh task model quality.", dbPath);
         if (!TableExists(connection, "model_coverage_task_signals"))
             throw new FileNotFoundException("library_index.db.model_coverage_task_signals is required to refresh task model quality.", dbPath);
+        if (!TableExists(connection, "model_coverage_review_reasons"))
+            throw new FileNotFoundException("library_index.db.model_coverage_review_reasons is required to refresh task model quality.", dbPath);
 
         var rows = new List<ModelCoverageRow>();
         using var command = connection.CreateCommand();
@@ -6383,7 +6385,7 @@ internal static class UELibraryPostProcessor
             "",
             writeCompatibilityJson
                 ? "详细机器报告: `task_model_quality.json`"
-                : "详细机器索引: `library_index.db.model_coverage`（筛选 `is_task_or_prop`、`needs_review`、`relation_needs_review`、`review_reasons_json`）",
+                : "详细机器索引: `library_index.db.model_coverage`（筛选 `is_task_or_prop`、`needs_review`、`relation_needs_review`），复查原因见 `model_coverage_review_reasons`。",
             "",
             "## 复查原因",
             "",
@@ -6614,10 +6616,18 @@ internal static class UELibraryPostProcessor
                 missing_materials INTEGER NOT NULL,
                 no_external_texture_slots INTEGER NOT NULL,
                 needs_review INTEGER NOT NULL,
-                review_reasons_json TEXT NOT NULL,
                 relation_needs_review INTEGER NOT NULL,
-                relation_review_reasons_json TEXT NOT NULL,
                 raw_json TEXT NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_coverage_review_reasons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_coverage_id INTEGER NOT NULL,
+                reason_kind TEXT NOT NULL,
+                reason_index INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                FOREIGN KEY (model_coverage_id) REFERENCES model_coverage(id)
             );
             """);
         Execute(connection, transaction, """
@@ -6963,6 +6973,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_quality ON model_coverage(is_path_only_task, missing_materials, no_external_texture_slots, validation_status);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_coverage_review_reasons ON model_coverage_review_reasons(reason_kind, reason, model_coverage_id);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task_signals ON model_coverage_task_signals(signal, model_coverage_id);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_material ON material_texture_slots(material_name);");
         Execute(connection, transaction, "CREATE INDEX idx_material_texture_slots_texture ON material_texture_slots(texture_name, shared_texture);");
@@ -7416,7 +7427,7 @@ internal static class UELibraryPostProcessor
                     is_static, has_skin, has_skeleton_path, material_count, texture_count,
                     component_reference_count, source_index_object_count, animation_candidate_count,
                     is_task_or_prop, is_path_only_task, missing_materials, no_external_texture_slots, needs_review,
-                    review_reasons_json, relation_needs_review, relation_review_reasons_json,
+                    relation_needs_review,
                     raw_json
                 )
                 VALUES (
@@ -7424,7 +7435,7 @@ internal static class UELibraryPostProcessor
                     $isStatic, $hasSkin, $hasSkeletonPath, $materialCount, $textureCount,
                     $componentReferenceCount, $sourceIndexObjectCount, $animationCandidateCount,
                     $isTaskOrProp, $isPathOnlyTask, $missingMaterials, $noExternalTextureSlots, $needsReview,
-                    $reviewReasonsJson, $relationNeedsReview, $relationReviewReasonsJson,
+                    $relationNeedsReview,
                     $rawJson
                 );
                 """;
@@ -7448,13 +7459,47 @@ internal static class UELibraryPostProcessor
             Add(command, "$missingMaterials", missingMaterials ? 1 : 0);
             Add(command, "$noExternalTextureSlots", noExternalTextureSlots ? 1 : 0);
             Add(command, "$needsReview", needsReview ? 1 : 0);
-            Add(command, "$reviewReasonsJson", JsonConvert.SerializeObject(reviewReasons));
             Add(command, "$relationNeedsReview", relationNeedsReview ? 1 : 0);
-            Add(command, "$relationReviewReasonsJson", JsonConvert.SerializeObject(relationReviewReasons));
             Add(command, "$rawJson", row.ToString(Formatting.None));
             command.ExecuteNonQuery();
             var coverageId = GetLastInsertRowId(connection, transaction);
             InsertModelCoverageTaskSignals(connection, transaction, coverageId, taskSignals);
+            InsertModelCoverageReviewReasons(connection, transaction, coverageId, "quality", reviewReasons);
+            InsertModelCoverageReviewReasons(connection, transaction, coverageId, "relation", relationReviewReasons);
+        }
+    }
+
+    private static void InsertModelCoverageReviewReasons(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long modelCoverageId,
+        string reasonKind,
+        string[] reasons)
+    {
+        if (modelCoverageId <= 0 || reasons.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO model_coverage_review_reasons (
+                model_coverage_id, reason_kind, reason_index, reason
+            )
+            VALUES (
+                $modelCoverageId, $reasonKind, $reasonIndex, $reason
+            );
+            """;
+        var idParam = command.Parameters.Add("$modelCoverageId", SqliteType.Integer);
+        var kindParam = command.Parameters.Add("$reasonKind", SqliteType.Text);
+        var indexParam = command.Parameters.Add("$reasonIndex", SqliteType.Integer);
+        var reasonParam = command.Parameters.Add("$reason", SqliteType.Text);
+        idParam.Value = modelCoverageId;
+        kindParam.Value = reasonKind;
+        for (var i = 0; i < reasons.Length; i++)
+        {
+            indexParam.Value = i;
+            reasonParam.Value = reasons[i];
+            command.ExecuteNonQuery();
         }
     }
 
