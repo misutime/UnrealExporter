@@ -12,7 +12,6 @@ internal static class UELibraryPostProcessor
 {
     private static readonly string[] TextureExtensions = [".png", ".hdr"];
     private const int ModelValidationCacheVersion = 2;
-    private const int MaxSharedSkeletonAnimationsPerModel = 16;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
@@ -3293,16 +3292,12 @@ internal static class UELibraryPostProcessor
 
     private static JObject[] PickSharedSkeletonAnimations(JObject model, JObject[] skeletonAnimations)
     {
-        if (skeletonAnimations.Length <= MaxSharedSkeletonAnimationsPerModel)
-            return skeletonAnimations;
-
         var modelSource = NormalizeCatalogOutput((string?)model["source"] ?? (string?)model["output"]);
         return skeletonAnimations
             .OrderByDescending(x => CountCommonPathPrefixSegments(
                 modelSource,
                 NormalizeCatalogOutput((string?)x["source"] ?? (string?)x["output"])))
             .ThenBy(x => (string?)x["source"] ?? (string?)x["output"], StringComparer.OrdinalIgnoreCase)
-            .Take(MaxSharedSkeletonAnimationsPerModel)
             .ToArray();
     }
 
@@ -4046,7 +4041,9 @@ internal static class UELibraryPostProcessor
                     ? "ExplicitComponent"
                     : relationAnimations.Any(x => string.Equals(x.relationSource, "uniqueSkeleton", StringComparison.OrdinalIgnoreCase))
                         ? "UniqueSkeleton"
-                        : "RelatedButNotUsable";
+                        : relationAnimations.Any(x => string.Equals(x.relationSource, "sharedSkeleton", StringComparison.OrdinalIgnoreCase))
+                            ? "SharedSkeletonCompatible"
+                            : "RelatedButNotUsable";
 
             relations.Add(JObject.FromObject(new
             {
@@ -4065,7 +4062,7 @@ internal static class UELibraryPostProcessor
         var summary = new JObject
         {
             ["generatedAt"] = DateTime.UtcNow.ToString("O"),
-            ["rule"] = "默认可用动画只来自显式组件关系和唯一 Skeleton 关系；共享 Skeleton 仅作为诊断/人工预览候选，不按目录名、角色名或文件名前缀硬猜。",
+            ["rule"] = "默认可用动画来自显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 关系；不按目录名、角色名或文件名前缀硬猜。",
             ["totals"] = JObject.FromObject(new
             {
                 models = models.Length,
@@ -4086,9 +4083,6 @@ internal static class UELibraryPostProcessor
     {
         if (!string.IsNullOrWhiteSpace(exportStatus) &&
             !string.Equals(exportStatus, "ok", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (string.Equals(candidateReason, "sharedSkeleton", StringComparison.OrdinalIgnoreCase))
             return false;
 
         return !string.Equals(validationStatus, "error", StringComparison.OrdinalIgnoreCase);
@@ -6399,7 +6393,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 自动补导计划和执行结果，记录关系来源、目标对象、源包、输出类型和失败原因。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 动画源对象、Skeleton、帧数、track 和导出状态。 |");
         sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
-        sb.AppendLine("| `model_animations.json` | 默认只输出显式组件关系或唯一 Skeleton 模型关系形成的模型动画候选，并回填动画验证结果。 |");
+        sb.AppendLine("| `model_animations.json` | 输出显式组件关系、唯一 Skeleton 关系，以及通过骨骼覆盖验证的共享 Skeleton 模型动画候选，并回填动画验证结果。 |");
         sb.AppendLine("| `animation_validation.json` | 基于源索引检查模型动画候选的 track 覆盖率和骨骼层级兼容性。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证报告。 |");
         sb.AppendLine("| `skeletons.json` | 按 GLB/glTF skin joints 生成的骨架分组，并合并 UE Skeleton、源骨架对象和同 Skeleton 动画。 |");

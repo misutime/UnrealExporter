@@ -14,8 +14,11 @@ internal sealed class MainForm : Form
     private readonly ToolStripLabel _statusLabel = new("请选择 UE5 素材库");
     private readonly TextBox _modelFilter = new();
     private readonly TextBox _animationFilter = new();
-    private readonly DataGridView _modelGrid = new();
+    private readonly ListView _modelList = new();
+    private readonly ImageList _modelImages = new();
     private readonly DataGridView _animationGrid = new();
+    private readonly ContextMenuStrip _modelMenu = new();
+    private readonly ContextMenuStrip _animationMenu = new();
     private readonly Label _modelHeader = new();
     private readonly Label _animationHeader = new();
     private readonly TextBox _details = new();
@@ -24,6 +27,7 @@ internal sealed class MainForm : Form
     private UeLibraryIndex? _index;
     private ThumbnailService? _thumbnails;
     private PreviewComposer? _previewComposer;
+    private ViewerSafeGltfCache? _viewerSafeCache;
     private CancellationTokenSource? _thumbnailCts;
     private string _root = "";
     private string? _initialRoot;
@@ -97,8 +101,8 @@ internal sealed class MainForm : Form
         _modelFilter.PlaceholderText = "筛选模型、路径、Skeleton...";
         left.Controls.Add(_modelFilter, 0, 1);
 
-        ConfigureModelGrid();
-        left.Controls.Add(_modelGrid, 0, 2);
+        ConfigureModelList();
+        left.Controls.Add(_modelList, 0, 2);
 
         var right = new TableLayoutPanel
         {
@@ -133,33 +137,29 @@ internal sealed class MainForm : Form
         right.Controls.Add(_details, 0, 3);
     }
 
-    private void ConfigureModelGrid()
+    private void ConfigureModelList()
     {
-        _modelGrid.Dock = DockStyle.Fill;
-        _modelGrid.AllowUserToAddRows = false;
-        _modelGrid.AllowUserToDeleteRows = false;
-        _modelGrid.AllowUserToResizeRows = false;
-        _modelGrid.MultiSelect = false;
-        _modelGrid.ReadOnly = true;
-        _modelGrid.RowHeadersVisible = false;
-        _modelGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _modelGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-        _modelGrid.RowTemplate.Height = 92;
-        _modelGrid.BackgroundColor = SystemColors.Window;
+        _modelImages.ImageSize = new Size(168, 118);
+        _modelImages.ColorDepth = ColorDepth.Depth32Bit;
+        _modelImages.Images.Add("__placeholder", _placeholder);
 
-        _modelGrid.Columns.Add(new DataGridViewImageColumn
-        {
-            Name = "Preview",
-            HeaderText = "",
-            Width = 128,
-            FillWeight = 18,
-            ImageLayout = DataGridViewImageCellLayout.Zoom
-        });
-        _modelGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "模型", FillWeight = 32 });
-        _modelGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Animations", HeaderText = "动画", FillWeight = 10 });
-        _modelGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Kind", HeaderText = "类型", FillWeight = 12 });
-        _modelGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Skeleton", HeaderText = "Skeleton", FillWeight = 20 });
-        _modelGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 8 });
+        _modelList.Dock = DockStyle.Fill;
+        _modelList.View = View.LargeIcon;
+        _modelList.LargeImageList = _modelImages;
+        _modelList.MultiSelect = false;
+        _modelList.HideSelection = false;
+        _modelList.ShowItemToolTips = true;
+        _modelList.Sorting = SortOrder.None;
+        _modelList.BackColor = SystemColors.Window;
+        _modelList.BorderStyle = BorderStyle.FixedSingle;
+
+        _modelMenu.Items.Add("复制模型路径", null, (_, _) => CopySelectedModelPath());
+        _modelMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedModelSource());
+        _modelMenu.Items.Add("复制 Skeleton 路径", null, (_, _) => CopySelectedModelSkeleton());
+        _modelMenu.Items.Add(new ToolStripSeparator());
+        _modelMenu.Items.Add("用 F3D 打开", null, (_, _) => OpenSelectedModel());
+        _modelMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedModelFolder());
+        _modelList.ContextMenuStrip = _modelMenu;
     }
 
     private void ConfigureAnimationGrid()
@@ -182,6 +182,12 @@ internal sealed class MainForm : Form
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时长", FillWeight = 8 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 8 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", FillWeight = 21 });
+
+        _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
+        _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
+        _animationMenu.Items.Add(new ToolStripSeparator());
+        _animationMenu.Items.Add("生成并打开 preview", null, async (_, _) => await GenerateAndOpenSelectedAnimationAsync());
+        _animationGrid.ContextMenuStrip = _animationMenu;
     }
 
     private void WireEvents()
@@ -196,10 +202,12 @@ internal sealed class MainForm : Form
         _openFolderButton.Click += (_, _) => OpenSelectedModelFolder();
         _modelFilter.TextChanged += (_, _) => RebuildModelGrid();
         _animationFilter.TextChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
-        _modelGrid.SelectionChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
-        _modelGrid.CellDoubleClick += (_, _) => OpenSelectedModel();
+        _modelList.SelectedIndexChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
+        _modelList.DoubleClick += (_, _) => OpenSelectedModel();
+        _modelList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_modelList, e);
         _animationGrid.SelectionChanged += (_, _) => ShowSelectedAnimationDetails();
         _animationGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedAnimationAsync();
+        _animationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_animationGrid, e);
     }
 
     private async Task ChooseAndOpenLibraryAsync()
@@ -219,7 +227,7 @@ internal sealed class MainForm : Form
         {
             UseWaitCursor = true;
             _statusLabel.Text = "正在读取 library_index.db...";
-            _modelGrid.Rows.Clear();
+            _modelList.Items.Clear();
             _animationGrid.Rows.Clear();
             _details.Clear();
             _thumbnailCts?.Cancel();
@@ -228,8 +236,9 @@ internal sealed class MainForm : Form
             var index = await Task.Run(() => UeLibraryIndexReader.Load(root));
             _root = index.Root;
             _index = index;
-            _thumbnails = new ThumbnailService(_root);
-            _previewComposer = new PreviewComposer(_root);
+            _viewerSafeCache = new ViewerSafeGltfCache(_root);
+            _thumbnails = new ThumbnailService(_root, _viewerSafeCache);
+            _previewComposer = new PreviewComposer(_root, _viewerSafeCache);
 
             RebuildModelGrid();
             _statusLabel.Text = $"已打开: {_root}";
@@ -258,25 +267,22 @@ internal sealed class MainForm : Form
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        _modelGrid.Rows.Clear();
+        _modelList.BeginUpdate();
+        _modelList.Items.Clear();
         foreach (var model in models)
         {
-            var rowIndex = _modelGrid.Rows.Add(
-                _placeholder,
-                model.Name,
-                $"{model.UsableAnimationCount}/{model.AnimationCount}",
-                model.DisplayKind,
-                ShortSkeleton(model),
-                string.IsNullOrWhiteSpace(model.ValidationStatus) ? model.Confidence : model.ValidationStatus);
-            var row = _modelGrid.Rows[rowIndex];
-            row.Tag = model;
-            SetRowTooltip(row, $"{model.Output}{Environment.NewLine}{model.Source}{Environment.NewLine}{model.SkeletonPath}");
+            _modelList.Items.Add(new ListViewItem(BuildModelCardText(model), "__placeholder")
+            {
+                Tag = model,
+                ToolTipText = BuildModelDetails(model)
+            });
         }
+        _modelList.EndUpdate();
 
         _modelHeader.Text = $"模型 {models.Count}/{_index.Models.Count}";
         _animationHeader.Text = "动画";
-        if (_modelGrid.Rows.Count > 0)
-            _modelGrid.Rows[0].Selected = true;
+        if (_modelList.Items.Count > 0)
+            _modelList.Items[0].Selected = true;
 
         _ = LoadVisibleThumbnailsAsync(_thumbnailCts?.Token ?? CancellationToken.None);
     }
@@ -319,7 +325,7 @@ internal sealed class MainForm : Form
                 row.DefaultCellStyle.ForeColor = Color.DimGray;
         }
 
-        _animationHeader.Text = $"动画: {model.Name} ({model.UsableAnimationCount}/{model.AnimationCount})";
+        _animationHeader.Text = $"动画: {model.Name}  总数 {model.AnimationCount} / 可预览 {model.UsableAnimationCount}";
         if (_animationGrid.Rows.Count > 0)
             _animationGrid.Rows[0].Selected = true;
         ShowSelectedAnimationDetails();
@@ -330,18 +336,23 @@ internal sealed class MainForm : Form
         if (_thumbnails == null)
             return;
 
-        foreach (DataGridViewRow row in _modelGrid.Rows)
+        foreach (ListViewItem item in _modelList.Items)
         {
             if (cancellationToken.IsCancellationRequested)
                 break;
-            if (row.Tag is not UeLibraryModel model)
+            if (item.Tag is not UeLibraryModel model)
                 continue;
 
             try
             {
                 var image = await _thumbnails.GetThumbnailAsync(model, cancellationToken);
-                if (!row.IsNewRow && !cancellationToken.IsCancellationRequested)
-                    row.Cells["Preview"].Value = image;
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    var key = model.Output;
+                    if (!_modelImages.Images.ContainsKey(key))
+                        _modelImages.Images.Add(key, image);
+                    item.ImageKey = key;
+                }
             }
             catch
             {
@@ -396,7 +407,7 @@ internal sealed class MainForm : Form
     }
 
     private UeLibraryModel? GetSelectedModel()
-        => _modelGrid.SelectedRows.Count == 0 ? null : _modelGrid.SelectedRows[0].Tag as UeLibraryModel;
+        => _modelList.SelectedItems.Count == 0 ? null : _modelList.SelectedItems[0].Tag as UeLibraryModel;
 
     private UeLibraryAnimation? GetSelectedAnimation()
         => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as UeLibraryAnimation;
@@ -405,7 +416,7 @@ internal sealed class MainForm : Form
     {
         var model = GetSelectedModel();
         if (model?.Output is { Length: > 0 } path && File.Exists(path))
-            PreviewComposer.OpenWithF3d(path);
+            PreviewComposer.OpenWithF3d(_viewerSafeCache?.GetViewerSafeModelPath(path) ?? path);
     }
 
     private void OpenSelectedModelFolder()
@@ -416,6 +427,60 @@ internal sealed class MainForm : Form
         var directory = Path.GetDirectoryName(model.Output);
         if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
             Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
+    }
+
+    private void CopySelectedModelPath()
+        => CopyText(GetSelectedModel()?.Output);
+
+    private void CopySelectedModelSource()
+        => CopyText(GetSelectedModel()?.Source);
+
+    private void CopySelectedModelSkeleton()
+        => CopyText(GetSelectedModel()?.SkeletonPath);
+
+    private void CopySelectedAnimationPath()
+        => CopyText(GetSelectedAnimation()?.Output);
+
+    private void CopySelectedAnimationSource()
+        => CopyText(GetSelectedAnimation()?.Source);
+
+    private static void CopyText(string? text)
+    {
+        if (!string.IsNullOrWhiteSpace(text))
+            Clipboard.SetText(text);
+    }
+
+    private static void SelectListViewItemOnRightClick(ListView list, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right)
+            return;
+
+        var item = list.GetItemAt(e.X, e.Y);
+        if (item == null)
+            return;
+
+        list.SelectedItems.Clear();
+        item.Selected = true;
+        item.Focused = true;
+    }
+
+    private static void SelectGridRowOnRightClick(DataGridView grid, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right)
+            return;
+
+        var hit = grid.HitTest(e.X, e.Y);
+        if (hit.RowIndex < 0)
+            return;
+
+        grid.ClearSelection();
+        grid.Rows[hit.RowIndex].Selected = true;
+    }
+
+    private static string BuildModelCardText(UeLibraryModel model)
+    {
+        var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
+        return $"{name}{Environment.NewLine}动画 {model.AnimationCount} / 可预览 {model.UsableAnimationCount}";
     }
 
     private static bool MatchesModelFilter(UeLibraryModel model, string filter)

@@ -457,9 +457,9 @@ namespace CUE4Parse_Conversion.Meshes.glTF
 
         private static FColor[] GetViewerSafeVertexColors(CBaseMeshLod lod)
         {
-            if (lod.VertexColors is { Length: > 0 } colors && colors.Any(c => c.R != 0 || c.G != 0 || c.B != 0 || c.A != 0))
-                return colors;
-
+            // UE character vertex colors are often material masks/IDs instead of display colors.
+            // glTF viewers multiply COLOR_0 into baseColor, which makes NTE faces render purple/green.
+            // Keep reusable preview GLB texture-driven unless an explicit material pipeline reinterprets masks.
             return Enumerable.Repeat(new FColor(255, 255, 255, 255), lod.NumVerts).ToArray();
         }
 

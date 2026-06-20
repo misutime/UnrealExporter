@@ -9,28 +9,32 @@ internal sealed class ThumbnailService
 {
     private readonly string _cacheRoot;
     private readonly string? _f3dConsole;
+    private readonly ViewerSafeGltfCache _viewerSafeCache;
     private readonly SemaphoreSlim _gate = new(2);
 
-    public ThumbnailService(string libraryRoot)
+    public ThumbnailService(string libraryRoot, ViewerSafeGltfCache viewerSafeCache)
     {
         _cacheRoot = Path.Combine(libraryRoot, ".ue5_browser_cache", "thumbnails");
         Directory.CreateDirectory(_cacheRoot);
+        _viewerSafeCache = viewerSafeCache;
         _f3dConsole = ToolLocator.FindF3dConsole();
     }
 
     public async Task<Image> GetThumbnailAsync(UeLibraryModel model, CancellationToken cancellationToken)
     {
-        var cachePath = Path.Combine(_cacheRoot, Hash(model.Output) + ".png");
+        var sourceStamp = File.Exists(model.Output) ? File.GetLastWriteTimeUtc(model.Output).Ticks.ToString() : "missing";
+        var cachePath = Path.Combine(_cacheRoot, Hash("viewer-safe-v3|" + model.Output + "|" + sourceStamp) + ".png");
         if (File.Exists(cachePath))
             return Image.FromFile(cachePath);
 
-        if (!string.IsNullOrWhiteSpace(_f3dConsole) && File.Exists(model.Output))
+        var modelPath = _viewerSafeCache.GetViewerSafeModelPath(model.Output);
+        if (!string.IsNullOrWhiteSpace(_f3dConsole) && File.Exists(modelPath))
         {
             await _gate.WaitAsync(cancellationToken);
             try
             {
                 if (!File.Exists(cachePath))
-                    await RenderWithF3dAsync(model.Output, cachePath, cancellationToken);
+                    await RenderWithF3dAsync(modelPath, cachePath, cancellationToken);
             }
             finally
             {

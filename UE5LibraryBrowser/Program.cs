@@ -59,7 +59,8 @@ internal static class Program
         if (pair?.Animation == null)
             throw new InvalidDataException("没有找到可预览的模型动画组合。");
 
-        var composer = new PreviewComposer(index.Root);
+        var viewerSafeCache = new ViewerSafeGltfCache(index.Root);
+        var composer = new PreviewComposer(index.Root, viewerSafeCache);
         var result = await composer.EnsurePreviewAsync(pair.Model, pair.Animation, CancellationToken.None);
         var payload = new
         {

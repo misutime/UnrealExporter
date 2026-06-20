@@ -10,24 +10,27 @@ internal sealed class PreviewComposer
 {
     private readonly string _libraryRoot;
     private readonly string _cacheRoot;
+    private readonly ViewerSafeGltfCache _viewerSafeCache;
 
-    public PreviewComposer(string libraryRoot)
+    public PreviewComposer(string libraryRoot, ViewerSafeGltfCache viewerSafeCache)
     {
         _libraryRoot = libraryRoot;
         _cacheRoot = Path.Combine(libraryRoot, ".ue5_browser_cache", "animation_previews");
+        _viewerSafeCache = viewerSafeCache;
         Directory.CreateDirectory(_cacheRoot);
     }
 
     public async Task<PreviewResult> EnsurePreviewAsync(UeLibraryModel model, UeLibraryAnimation animation, CancellationToken cancellationToken)
     {
-        if (!File.Exists(model.Output))
+        var modelPath = _viewerSafeCache.GetViewerSafeModelPath(model.Output);
+        if (!File.Exists(modelPath))
             return new PreviewResult(false, "", "", "模型文件不存在。");
         if (!File.Exists(animation.Output))
             return new PreviewResult(false, "", "", "动画 .ueanim 文件不存在。");
         if (!animation.IsPreviewable)
             return new PreviewResult(false, "", "", "这个动画不是最高可信可预览候选，或是容器/metadata 动画。");
 
-        var directory = Path.Combine(_cacheRoot, Hash(model.Output + "|" + animation.Output));
+        var directory = Path.Combine(_cacheRoot, Hash(modelPath + "|" + animation.Output));
         Directory.CreateDirectory(directory);
         var output = Path.Combine(directory, $"{SafeName(model.Name)}__{SafeName(animation.Name)}.preview.glb");
         var report = Path.Combine(directory, "preview_validation.json");
@@ -53,7 +56,7 @@ internal sealed class PreviewComposer
         start.ArgumentList.Add("--");
         start.ArgumentList.Add("--preview-ue-animation");
         start.ArgumentList.Add("--model");
-        start.ArgumentList.Add(model.Output);
+        start.ArgumentList.Add(modelPath);
         start.ArgumentList.Add("--animation");
         start.ArgumentList.Add(animation.Output);
         start.ArgumentList.Add("--output");
