@@ -7042,13 +7042,13 @@ internal static class UELibraryPostProcessor
                 candidate_reason TEXT,
                 validation_category TEXT,
                 reason TEXT,
+                track_source TEXT,
                 model_bone_count INTEGER NOT NULL,
                 animation_track_count INTEGER NOT NULL,
                 matched_track_bones INTEGER NOT NULL,
                 track_coverage REAL NOT NULL,
                 hierarchy_compatible INTEGER NOT NULL,
-                is_container_animation INTEGER NOT NULL,
-                raw_json TEXT NOT NULL
+                is_container_animation INTEGER NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -7200,6 +7200,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_relation_animation_sections_name ON relation_animation_sections(section_name);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_track_source ON animation_validation(track_source);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_missing_bones ON animation_validation_missing_track_bones(bone_name, animation_validation_id);");
         Execute(connection, transaction, "CREATE INDEX idx_animation_validation_hierarchy_mismatches ON animation_validation_hierarchy_mismatches(mismatch, animation_validation_id);");
         Execute(connection, transaction, "CREATE INDEX idx_library_reports_name ON library_reports(name, status);");
@@ -8737,42 +8738,20 @@ internal static class UELibraryPostProcessor
     {
         foreach (var validation in summary.Validations)
         {
-            var rawJson = JObject.FromObject(new
-            {
-                validation.Status,
-                validation.CandidateReason,
-                validation.ValidationCategory,
-                validation.Reason,
-                model = validation.ModelOutput,
-                animation = validation.AnimationOutput,
-                validation.SkeletonPath,
-                validation.ModelBoneCount,
-                validation.AnimationTrackCount,
-                validation.TrackSource,
-                validation.MatchedTrackBones,
-                validation.TrackCoverage,
-                validation.HierarchyCompatible,
-                validation.IsContainerAnimation,
-                validation.MissingTrackBones,
-                validation.HierarchyMismatches,
-            });
-
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO animation_validation (
                     model, animation, skeleton_path, status, candidate_reason, reason,
-                    validation_category,
+                    validation_category, track_source,
                     model_bone_count, animation_track_count, matched_track_bones,
-                    track_coverage, hierarchy_compatible, is_container_animation,
-                    raw_json
+                    track_coverage, hierarchy_compatible, is_container_animation
                 )
                 VALUES (
                     $model, $animation, $skeletonPath, $status, $candidateReason, $reason,
-                    $validationCategory,
+                    $validationCategory, $trackSource,
                     $modelBoneCount, $animationTrackCount, $matchedTrackBones,
-                    $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
-                    $rawJson
+                    $trackCoverage, $hierarchyCompatible, $isContainerAnimation
                 );
                 """;
             Add(command, "$model", validation.ModelOutput);
@@ -8782,13 +8761,13 @@ internal static class UELibraryPostProcessor
             Add(command, "$candidateReason", validation.CandidateReason);
             Add(command, "$reason", validation.Reason);
             Add(command, "$validationCategory", validation.ValidationCategory);
+            Add(command, "$trackSource", validation.TrackSource);
             Add(command, "$modelBoneCount", validation.ModelBoneCount);
             Add(command, "$animationTrackCount", validation.AnimationTrackCount);
             Add(command, "$matchedTrackBones", validation.MatchedTrackBones);
             Add(command, "$trackCoverage", validation.TrackCoverage);
             Add(command, "$hierarchyCompatible", validation.HierarchyCompatible ? 1 : 0);
             Add(command, "$isContainerAnimation", validation.IsContainerAnimation ? 1 : 0);
-            Add(command, "$rawJson", rawJson.ToString(Formatting.None));
             command.ExecuteNonQuery();
             var validationId = GetLastInsertRowId(connection, transaction);
             InsertAnimationValidationMissingTrackBones(connection, transaction, validationId, validation.MissingTrackBones);
