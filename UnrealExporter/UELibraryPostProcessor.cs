@@ -88,7 +88,7 @@ internal static class UELibraryPostProcessor
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations, writeCompatibilityJson));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeCompatibilityJson));
         var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex, writeCompatibilityJson));
-        RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
+        RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage, writeCompatibilityJson));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeCompatibilityJson));
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
         RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex));
@@ -441,8 +441,9 @@ internal static class UELibraryPostProcessor
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
 
         var root = Path.GetFullPath(libraryRoot);
+        var writeCompatibilityJson = File.Exists(Path.Combine(root, "model_coverage.json"));
         var modelCoverage = LoadModelCoverageForTaskQuality(root);
-        WriteTaskModelQualityReport(root, modelCoverage);
+        WriteTaskModelQualityReport(root, modelCoverage, writeCompatibilityJson);
         Console.WriteLine($"UE task model quality report refreshed: {root}");
     }
 
@@ -5941,7 +5942,7 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static void WriteTaskModelQualityReport(string root, JObject modelCoverage)
+    private static void WriteTaskModelQualityReport(string root, JObject modelCoverage, bool writeCompatibilityJson)
     {
         var rows = ((JArray?)modelCoverage["models"] ?? [])
             .OfType<JObject>()
@@ -6043,8 +6044,13 @@ internal static class UELibraryPostProcessor
                 .ToArray(),
         });
 
-        File.WriteAllText(Path.Combine(root, "task_model_quality.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
-        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows, relationReviewRows);
+        var jsonPath = Path.Combine(root, "task_model_quality.json");
+        if (writeCompatibilityJson)
+            File.WriteAllText(jsonPath, json.ToString(Formatting.Indented), Encoding.UTF8);
+        else
+            DeleteIfExists(jsonPath);
+
+        WriteTaskModelQualityReadme(root, rows, readyRows, reviewRows, relationReviewRows, writeCompatibilityJson);
     }
 
     private static bool IsTaskOrPropCoverageRow(ModelCoverageRow row)
@@ -6109,7 +6115,8 @@ internal static class UELibraryPostProcessor
         ModelCoverageRow[] rows,
         ModelCoverageRow[] readyRows,
         ModelCoverageRow[] reviewRows,
-        ModelCoverageRow[] relationReviewRows)
+        ModelCoverageRow[] relationReviewRows,
+        bool writeCompatibilityJson)
     {
         var warningCount = rows.Count(x => string.Equals(x.ValidationStatus, "warning", StringComparison.OrdinalIgnoreCase));
         var errorCount = rows.Count(x => string.Equals(x.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase));
@@ -6133,7 +6140,9 @@ internal static class UELibraryPostProcessor
             $"模型验证 warning/error: {warningCount}/{errorCount}",
             $"缺材质/无外部贴图槽: {rows.Count(x => x.MaterialCount == 0)}/{rows.Count(x => x.TextureCount == 0)}",
             "",
-            "详细机器报告: `task_model_quality.json`",
+            writeCompatibilityJson
+                ? "详细机器报告: `task_model_quality.json`"
+                : "详细机器索引: `library_index.db.model_coverage`（筛选 `is_task_or_prop`、`needs_review`、`relation_needs_review`、`review_reasons_json`）",
             "",
             "## 复查原因",
             "",

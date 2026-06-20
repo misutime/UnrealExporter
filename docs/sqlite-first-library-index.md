@@ -28,6 +28,7 @@ JSON and JSONL files are compatibility and human-inspection views unless a speci
 | Model validation cache | `library_work.db.model_validation_cache` | per-model `.ue_model_validation_cache.json` files are legacy read-only cache inputs |
 | Model validation | `library_index.db.model_validation` | `model_validation.json` is a compatibility/debug view |
 | Model coverage | `library_index.db.model_coverage` | `model_coverage.json` is a compatibility/debug view |
+| Task model quality | `library_index.db.model_coverage` columns `is_task_or_prop`, `needs_review`, `relation_needs_review`, `review_reasons_json` and `relation_review_reasons_json` | `task_model_quality.json` is a compatibility/debug view |
 | Skeleton groups | `library_index.db.skeleton_groups` | `skeletons.json` is a compatibility/debug view |
 | Animation validation | `library_index.db.animation_validation` | `animation_validation.json` and `animation_validation.jsonl` are compatibility/debug views |
 | Browser model/animation list | `library_index.db.model_animation_relations` and `library_index.db.relation_animations` | Browser must not depend on `model_animations.json` |
@@ -59,7 +60,7 @@ The mode must preserve row counts and deterministic evidence. For example, when 
 
 `--no-compat-json` is an alias for the same behavior.
 
-Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, model validation, skeleton groups, animation validation, model coverage and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl` and `model_animations.json`.
+Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or `writeCompatibilityJson: false`. This is recommended for large UE5 libraries so one-command exports do not duplicate large machine indexes as JSONL before importing them back into SQLite. In this mode the main export pass still writes `export_events.db`, but skips the compatibility views `export_manifest.jsonl`, `asset_catalog.jsonl`, `animation_bindings.jsonl` and `auto_referenced_exports.jsonl`. Postprocess also keeps the merged catalog, model validation, skeleton groups, animation validation, model coverage and model-animation relations in memory for validation and writes them to `library_index.db`, but skips `asset_catalog.jsonl`, `package_object_maps.jsonl`, `component_groups.json`, `model_coverage.json`, `task_model_quality.json`, `model_validation.json`, `skeletons.json`, `animation_validation.json`, `animation_validation.jsonl` and `model_animations.json`.
 
 ## Migration state
 
@@ -72,5 +73,5 @@ Full export configs can enable the same behavior with `sqliteOnlyIndex: true` or
 - Postprocess can now write texture links, material texture slots and shared glTF texture links to `library_work.db` and skip their JSONL views in SQLite-only mode.
 - Postprocess can now skip animation validation and model-animation compatibility JSON views in SQLite-only mode; query `animation_validation`, `model_animation_relations` and `relation_animations` in `library_index.db`.
 - Postprocess can now skip model validation and skeleton compatibility JSON views in SQLite-only mode; query `model_validation` and `skeleton_groups` in `library_index.db`.
-- Postprocess can now skip model coverage and component group compatibility JSON views in SQLite-only mode; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its report from `library_index.db.model_coverage` when `model_coverage.json` is absent.
-- Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input, validation caches and human-readable reports.
+- Postprocess can now skip model coverage, task model quality and component group compatibility JSON views in SQLite-only mode; query `model_coverage` and `component_groups` in `library_index.db`. `--refresh-task-model-quality` can rebuild its Markdown report from `library_index.db.model_coverage` when `model_coverage.json` is absent without regenerating `task_model_quality.json`.
+- Remaining JSON usage is mostly glTF/GLB structure editing, material JSON input and human-readable reports.
