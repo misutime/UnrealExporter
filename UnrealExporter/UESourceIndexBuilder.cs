@@ -81,6 +81,7 @@ internal static class UESourceIndexBuilder
         Execute(connection, "PRAGMA busy_timeout = 10000;");
         Execute(connection, "PRAGMA journal_mode = WAL;");
         Execute(connection, "PRAGMA synchronous = NORMAL;");
+        EnsureSourceIndexMetadataSchema(connection);
 
         if (!resumeExisting)
         {
@@ -100,7 +101,7 @@ internal static class UESourceIndexBuilder
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (completedPackages.Count > 0)
             Console.WriteLine($"UE source index resume: {completedPackages.Count}/{packageFiles.Length} package(s) already committed.");
-        WriteSourceIndexMetadata(metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
+        WriteSourceIndexMetadata(connection, metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
         var indexedMaterialSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var transaction = connection.BeginTransaction();
         try
@@ -139,7 +140,7 @@ internal static class UESourceIndexBuilder
                     transaction.Dispose();
                     Execute(connection, "PRAGMA wal_checkpoint(PASSIVE);");
                     Console.WriteLine($"UE source index inspected {completedPackages.Count}/{packageFiles.Length} (last: {file.Path})");
-                    WriteSourceIndexMetadata(metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
+                    WriteSourceIndexMetadata(connection, metadataPath, config, fingerprint, "running", packageFiles.Length, completedPackages.Count);
                     transaction = connection.BeginTransaction();
                 }
             }
@@ -152,7 +153,7 @@ internal static class UESourceIndexBuilder
         }
 
         WriteProgress(progressPath, completedPackages.Count, packageFiles.Length, "complete");
-        WriteSourceIndexMetadata(metadataPath, config, fingerprint, "complete", packageFiles.Length, completedPackages.Count);
+        WriteSourceIndexMetadata(connection, metadataPath, config, fingerprint, "complete", packageFiles.Length, completedPackages.Count);
         FinalizeSqliteOutput(connection);
         Console.WriteLine($"UE source index written: {dbPath}");
     }
@@ -181,12 +182,11 @@ internal static class UESourceIndexBuilder
 
     private static bool TryUseCompletedSourceIndex(string dbPath, string metadataPath, string fingerprint, int packageCount)
     {
-        var metadata = LoadSourceIndexMetadata(metadataPath);
-        if (metadata == null ||
-            !string.Equals((string?)metadata["status"], "complete", StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase) ||
-            (int?)metadata["packageCount"] != packageCount ||
-            !File.Exists(dbPath))
+        if (!File.Exists(dbPath))
+            return false;
+
+        var metadata = LoadSourceIndexMetadata(dbPath, metadataPath);
+        if (!IsMatchingSourceIndexMetadata(metadata, fingerprint, packageCount, requireComplete: true))
             return false;
 
         try
@@ -211,10 +211,12 @@ internal static class UESourceIndexBuilder
 
     private static bool CanResumeSourceIndex(string dbPath, string metadataPath, string fingerprint)
     {
-        var metadata = LoadSourceIndexMetadata(metadataPath);
+        if (!File.Exists(dbPath))
+            return false;
+
+        var metadata = LoadSourceIndexMetadata(dbPath, metadataPath);
         if (metadata == null ||
-            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase) ||
-            !File.Exists(dbPath))
+            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase))
             return false;
 
         try
@@ -231,7 +233,68 @@ internal static class UESourceIndexBuilder
         }
     }
 
-    private static JObject? LoadSourceIndexMetadata(string metadataPath)
+    private static bool IsMatchingSourceIndexMetadata(JObject? metadata, string fingerprint, int packageCount, bool requireComplete)
+    {
+        if (metadata == null ||
+            !string.Equals((string?)metadata["fingerprint"], fingerprint, StringComparison.OrdinalIgnoreCase) ||
+            (int?)metadata["packageCount"] != packageCount)
+        {
+            return false;
+        }
+
+        return !requireComplete ||
+               string.Equals((string?)metadata["status"], "complete", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JObject? LoadSourceIndexMetadata(string dbPath, string metadataPath)
+    {
+        var sqliteMetadata = LoadSourceIndexMetadataFromDb(dbPath);
+        if (sqliteMetadata != null)
+            return sqliteMetadata;
+
+        return LoadLegacySourceIndexMetadata(metadataPath);
+    }
+
+    private static JObject? LoadSourceIndexMetadataFromDb(string dbPath)
+    {
+        if (!File.Exists(dbPath))
+            return null;
+
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            connection.Open();
+            if (!TableExists(connection, "source_index_metadata"))
+                return null;
+
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT updated_at, game_title, version, fingerprint, status, package_count, completed_package_count
+                FROM source_index_metadata
+                WHERE id = 1;
+                """;
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+                return null;
+
+            return new JObject
+            {
+                ["updatedAt"] = GetString(reader, 0),
+                ["gameTitle"] = GetString(reader, 1),
+                ["version"] = GetString(reader, 2),
+                ["fingerprint"] = GetString(reader, 3),
+                ["status"] = GetString(reader, 4),
+                ["packageCount"] = reader.GetInt32(5),
+                ["completedPackageCount"] = reader.GetInt32(6),
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static JObject? LoadLegacySourceIndexMetadata(string metadataPath)
     {
         if (!File.Exists(metadataPath))
             return null;
@@ -247,6 +310,7 @@ internal static class UESourceIndexBuilder
     }
 
     private static void WriteSourceIndexMetadata(
+        SqliteConnection connection,
         string metadataPath,
         ConfigObj config,
         string fingerprint,
@@ -264,8 +328,61 @@ internal static class UESourceIndexBuilder
             ["packageCount"] = packageCount,
             ["completedPackageCount"] = completedPackageCount,
         };
-        File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
+        UpsertSourceIndexMetadata(connection, metadata);
+        if (ShouldWriteCompatibilityJson(config))
+            File.WriteAllText(metadataPath, metadata.ToString(Formatting.Indented));
+        else
+            DeleteIfExists(metadataPath);
     }
+
+    private static void EnsureSourceIndexMetadataSchema(SqliteConnection connection)
+    {
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS source_index_metadata (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at TEXT NOT NULL,
+                game_title TEXT,
+                version TEXT,
+                fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                package_count INTEGER NOT NULL,
+                completed_package_count INTEGER NOT NULL
+            );
+            """);
+    }
+
+    private static void UpsertSourceIndexMetadata(SqliteConnection connection, JObject metadata)
+    {
+        EnsureSourceIndexMetadataSchema(connection);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO source_index_metadata (
+                id, updated_at, game_title, version, fingerprint, status, package_count, completed_package_count
+            )
+            VALUES (
+                1, $updatedAt, $gameTitle, $version, $fingerprint, $status, $packageCount, $completedPackageCount
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                game_title = excluded.game_title,
+                version = excluded.version,
+                fingerprint = excluded.fingerprint,
+                status = excluded.status,
+                package_count = excluded.package_count,
+                completed_package_count = excluded.completed_package_count;
+            """;
+        Add(command, "$updatedAt", (string?)metadata["updatedAt"]);
+        Add(command, "$gameTitle", (string?)metadata["gameTitle"]);
+        Add(command, "$version", (string?)metadata["version"]);
+        Add(command, "$fingerprint", (string?)metadata["fingerprint"]);
+        Add(command, "$status", (string?)metadata["status"]);
+        Add(command, "$packageCount", (int?)metadata["packageCount"] ?? 0);
+        Add(command, "$completedPackageCount", (int?)metadata["completedPackageCount"] ?? 0);
+        command.ExecuteNonQuery();
+    }
+
+    private static bool ShouldWriteCompatibilityJson(ConfigObj config)
+        => config.WriteCompatibilityJson && !config.SqliteOnlyIndex;
 
     private static HashSet<string> LoadCompletedSourceIndexPackages(SqliteConnection connection)
     {
@@ -347,6 +464,15 @@ internal static class UESourceIndexBuilder
                 File.Delete(path);
         }
     }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+
+    private static string? GetString(SqliteDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
 
     private static Regex[] BuildPackagePatterns(ConfigObj config)
     {
@@ -441,6 +567,18 @@ internal static class UESourceIndexBuilder
 
     private static void CreateSchema(SqliteConnection connection, SqliteTransaction transaction)
     {
+        Execute(connection, transaction, """
+            CREATE TABLE IF NOT EXISTS source_index_metadata (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at TEXT NOT NULL,
+                game_title TEXT,
+                version TEXT,
+                fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                package_count INTEGER NOT NULL,
+                completed_package_count INTEGER NOT NULL
+            );
+            """);
         Execute(connection, transaction, """
             CREATE TABLE source_files (
                 path TEXT PRIMARY KEY,

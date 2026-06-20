@@ -8500,7 +8500,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `library_index.db` | 浏览器和自动化脚本的主 SQLite 索引，包含资产、模型验证、贴图、材质、组件关系、骨架、动画关系、健康报告和验收状态。 |");
         sb.AppendLine("| `export_events.db` | 导出主流程实时写入的 SQLite 事件库，记录 export manifest、asset catalog、animation bindings 和自动补导诊断；后处理优先读取它。 |");
         sb.AppendLine("| `library_work.db` | 后处理工作 SQLite 库，用于承载不应再写成超大 JSONL 的流式中间关系；例如 `--sqlite-only-index` 下的材质 sidecar 摘要、贴图去重关系、材质贴图槽、glTF 共享贴图改写关系和完整组件关系。 |");
-        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
+        sb.AppendLine("| `ue_source_index.db` | 启用源索引时生成，记录源索引 resume/fingerprint 状态、完整源文件表、已检查对象、Import/Export、Skeleton/Material/Texture/Blueprint/Component 关系、骨骼层级、动画 track 和 Montage/Composite segment。 |");
         sb.AppendLine("| `asset_catalog.jsonl` | 兼容/人工排查视图；新导出以后同类数据以 `export_events.db.asset_catalog` 和 `library_index.db.assets` 为主。 |");
         sb.AppendLine("| `library_health.json` | 健康摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
         sb.AppendLine("| `library_acceptance.json` | 验收摘要兼容/人工排查视图；主数据在 `library_index.db.library_reports`。 |");
