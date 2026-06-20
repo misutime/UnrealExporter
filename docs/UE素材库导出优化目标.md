@@ -53,6 +53,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - `createNewCheckpoint` 默认写 `checkpoints/*.checkpoint.db`，用 `checkpoint_files(path, size)` 替代旧版 `.ckpt` JSON 字典；`useCheckpointFile: "latest"` 读取最新同名 SQLite checkpoint。
    - `resumeExports` 的运行状态写入 `export_resume_state.db.export_jobs` 和 `export_resume_state.db.export_job_outputs`；输出文件列表按行保存，不再用 `outputs_json` 数组。
    - `library_index.db.assets` 是素材库资产查询总入口；`asset_catalog.jsonl` 仅作为兼容视图，导出主链路数据优先来自 `export_events.db.asset_catalog`，后处理再同步到 `library_index.db.assets`。
+   - 浏览器模型列表只读 `library_index.db.assets` 显式列和 `model_validation` / `model_coverage` 等验证表，不再用 `json_extract(assets.raw_json, ...)` 兜底。
    - `library_index.db` 必须包含 assets、export_manifest、animation_bindings、auto_referenced_exports、texture_links、material_sidecars、material_texture_slots、shared_gltf_texture_links、component_asset_relations、component_groups、skeleton_groups、model_validation、model_animation_relations、relation_animations、animation_validation、library_reports、package_object_maps 等常用查询表；贴图去重摘要写入 `library_reports` 的 `texture_dedupe` 记录。
    - `export_events.db.export_manifest` 记录每个实际导出文件来自哪个 UE 包和对象，并同步到 `library_index.db.export_manifest`；`export_manifest.jsonl` 仅作为兼容视图。
    - `export_events.db.animation_bindings` 记录动画发现、导出状态、Skeleton、track/segment/section 和压缩信息，并同步到 `library_index.db.animation_bindings`；`animation_bindings.jsonl` 仅作为兼容视图。

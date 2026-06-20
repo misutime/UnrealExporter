@@ -77,6 +77,7 @@ This default must preserve row counts and deterministic evidence. For example, w
 ## Migration state
 
 - `UE5LibraryBrowser` already requires `library_index.db`.
+- `UE5LibraryBrowser` model list queries read explicit SQLite columns and validation tables; it no longer falls back to `json_extract(assets.raw_json, ...)` for model metadata.
 - `UE5LibraryBrowser` writes animation preview validation to `preview_validation.db` via `--report-db`; it no longer requests `preview_validation.json`.
 - Main export writes `export_events.db` by default and only writes compatibility JSONL when explicitly requested.
 - `createNewCheckpoint` writes SQLite `.checkpoint.db` files; `useCheckpointFile: "latest"` loads the newest matching SQLite checkpoint.
