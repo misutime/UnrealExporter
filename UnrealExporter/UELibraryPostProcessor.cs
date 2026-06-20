@@ -87,7 +87,7 @@ internal static class UELibraryPostProcessor
         var packageObjectMaps = RunStage("写包对象映射", () => WritePackageObjectMaps(root, sourceIndex, writeCompatibilityJson));
         var animationValidation = RunStage("写动画验证", () => WriteAnimationValidation(root, mergedCatalogRows, sourceIndex, componentAssetRelations, writeCompatibilityJson));
         var modelAnimationRelations = RunStage("写模型动画关系", () => WriteModelAnimationRelations(root, mergedCatalogRows, animationValidation, writeCompatibilityJson));
-        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex));
+        var modelCoverage = RunStage("写模型覆盖报告", () => WriteModelCoverage(root, mergedCatalogRows, reports, componentAssetRelations, modelAnimationRelations, sourceIndex, writeCompatibilityJson));
         RunStage("写任务模型质量报告", () => WriteTaskModelQualityReport(root, modelCoverage));
         RunStage("写模型验证报告", () => WriteModelValidation(root, reports, writeCompatibilityJson));
         var skeletonGroups = RunStage("写骨骼索引", () => WriteSkeletonIndex(root, reports, mergedCatalogRows, sourceIndex, writeCompatibilityJson));
@@ -288,13 +288,48 @@ internal static class UELibraryPostProcessor
             throw new ArgumentException("Library root is required.", nameof(libraryRoot));
 
         var root = Path.GetFullPath(libraryRoot);
-        var coveragePath = Path.Combine(root, "model_coverage.json");
-        if (!File.Exists(coveragePath))
-            throw new FileNotFoundException("model_coverage.json not found.", coveragePath);
-
-        var modelCoverage = JObject.Parse(File.ReadAllText(coveragePath));
+        var modelCoverage = LoadModelCoverageForTaskQuality(root);
         WriteTaskModelQualityReport(root, modelCoverage);
         Console.WriteLine($"UE task model quality report refreshed: {root}");
+    }
+
+    private static JObject LoadModelCoverageForTaskQuality(string root)
+    {
+        var coveragePath = Path.Combine(root, "model_coverage.json");
+        if (File.Exists(coveragePath))
+            return JObject.Parse(File.ReadAllText(coveragePath));
+
+        var dbPath = Path.Combine(root, "library_index.db");
+        if (!File.Exists(dbPath))
+            throw new FileNotFoundException("model_coverage.json not found and library_index.db is unavailable.", coveragePath);
+
+        SQLitePCL.Batteries_V2.Init();
+        using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        connection.Open();
+        if (!TableExists(connection, "model_coverage") || !TableColumnExists(connection, "model_coverage", "raw_json"))
+            throw new FileNotFoundException("model_coverage.json not found and library_index.db.model_coverage is unavailable.", coveragePath);
+
+        var rows = new JArray();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT raw_json
+            FROM model_coverage
+            ORDER BY output COLLATE NOCASE;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var rawJson = GetString(reader, 0);
+            if (!string.IsNullOrWhiteSpace(rawJson) && JToken.Parse(rawJson) is JObject row)
+                rows.Add(row);
+        }
+
+        return JObject.FromObject(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            source = "library_index.db.model_coverage",
+            models = rows,
+        });
     }
 
     private static T RunStage<T>(string name, Func<T> action)
@@ -1917,7 +1952,7 @@ internal static class UELibraryPostProcessor
         FinalizeWorkDb(workConnection);
         var links = retainedLinks.ToArray();
         Console.WriteLine($"Component relations streamed: total={totalRelations}, retainedInMemory={links.Length}.");
-        WriteComponentGroups(root, links);
+        WriteComponentGroups(root, links, writeCompatibilityJson);
         return links;
     }
 
@@ -1932,16 +1967,23 @@ internal static class UELibraryPostProcessor
             FinalizeWorkDb(workConnection);
         }
 
-        File.WriteAllText(
-            Path.Combine(root, "component_groups.json"),
-            JsonConvert.SerializeObject(new
-            {
-                generatedAt = DateTime.UtcNow.ToString("O"),
-                rule = "组合关系来自 UE 蓝图/组件/默认对象里的显式 PPtr 和组件模板，不按名称猜测绑定。",
-                groupCount = 0,
-                groups = Array.Empty<object>(),
-            }, Formatting.Indented),
-            Encoding.UTF8);
+        if (writeCompatibilityJson)
+        {
+            File.WriteAllText(
+                Path.Combine(root, "component_groups.json"),
+                JsonConvert.SerializeObject(new
+                {
+                    generatedAt = DateTime.UtcNow.ToString("O"),
+                    rule = "组合关系来自 UE 蓝图/组件/默认对象里的显式 PPtr 和组件模板，不按名称猜测绑定。",
+                    groupCount = 0,
+                    groups = Array.Empty<object>(),
+                }, Formatting.Indented),
+                Encoding.UTF8);
+        }
+        else
+        {
+            DeleteIfExists(Path.Combine(root, "component_groups.json"));
+        }
     }
 
     private static SqliteConnection OpenLibraryWorkDb(string root, params string[] resetTables)
@@ -2459,8 +2501,14 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static void WriteComponentGroups(string root, ComponentAssetRelationLink[] links)
+    private static void WriteComponentGroups(string root, ComponentAssetRelationLink[] links, bool writeCompatibilityJson)
     {
+        if (!writeCompatibilityJson)
+        {
+            DeleteIfExists(Path.Combine(root, "component_groups.json"));
+            return;
+        }
+
         if (links.Length > MaxDetailedComponentGroupRelations)
         {
             WriteComponentGroupSummary(root, links);
@@ -4977,7 +5025,8 @@ internal static class UELibraryPostProcessor
         List<ModelValidationEntry> reports,
         ComponentAssetRelationLink[] componentAssetRelations,
         JObject modelAnimationRelations,
-        SourceIndexSnapshot sourceIndex)
+        SourceIndexSnapshot sourceIndex,
+        bool writeCompatibilityJson)
     {
         var modelRows = catalogRows
             .Where(x => string.Equals((string?)x["kind"], "Model", StringComparison.OrdinalIgnoreCase))
@@ -5101,7 +5150,12 @@ internal static class UELibraryPostProcessor
             models = rows.Select(BuildModelCoverageJsonRow).ToArray(),
         });
 
-        File.WriteAllText(Path.Combine(root, "model_coverage.json"), json.ToString(Formatting.Indented), Encoding.UTF8);
+        var path = Path.Combine(root, "model_coverage.json");
+        if (writeCompatibilityJson)
+            File.WriteAllText(path, json.ToString(Formatting.Indented), Encoding.UTF8);
+        else
+            DeleteIfExists(path);
+
         return json;
     }
 
@@ -7891,7 +7945,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `export_manifest.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.export_manifest` 和 `library_index.db.export_manifest`。 |");
         sb.AppendLine("| `auto_referenced_exports.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.auto_referenced_exports` 和 `library_index.db.auto_referenced_exports`。 |");
         sb.AppendLine("| `animation_bindings.jsonl` | 兼容/人工排查视图；主数据在 `export_events.db.animation_bindings` 和 `library_index.db.animation_bindings`。 |");
-        sb.AppendLine("| `model_coverage.json` | 模型覆盖报告，按资源类型、静态/骨骼、任务/交互路径信号、组件引用和动画候选统计。 |");
+        sb.AppendLine("| `model_coverage.json` | 模型覆盖兼容/人工排查视图；主数据在 `library_index.db.model_coverage`。 |");
         sb.AppendLine("| `model_animations.json` | 模型动画关系兼容/人工排查视图；主数据在 `library_index.db.model_animation_relations` 和 `library_index.db.relation_animations`。 |");
         sb.AppendLine("| `animation_validation.json` | 动画兼容验证兼容/人工排查视图；主数据在 `library_index.db.animation_validation`。 |");
         sb.AppendLine("| `model_validation.json` | GLB/glTF 静态结构、材质、贴图、skin 验证兼容/人工排查视图；主数据在 `library_index.db.model_validation`。 |");
@@ -7900,7 +7954,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine("| `material_texture_slots.jsonl` | 材质 slot 到 UE 贴图、导出贴图和共享贴图的对应关系。 |");
         sb.AppendLine("| `shared_texture_gltf_links.jsonl` | 文本 glTF image URI 改写到共享贴图的记录。 |");
         sb.AppendLine("| `component_asset_relations.jsonl` | 蓝图、组件、默认对象到模型/材质/动画/Skeleton 的显式 UE 关系。 |");
-        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系摘要，包含组件节点、父子关系、socket 和 transform。 |");
+        sb.AppendLine("| `component_groups.json` | 按 owner 蓝图/组件聚合的组合模型与任务素材关系兼容/人工排查视图；主数据在 `library_index.db.component_groups`，完整逐行关系在 `library_index.db.component_asset_relations`。 |");
         sb.AppendLine("| `package_object_maps.jsonl` | UE 包 ImportMap/ExportMap 摘要；完整原始依赖和导出对象记录保留在 `ue_source_index.db`。 |");
         sb.AppendLine("| `Textures/_Shared` | 启用硬链接去重后生成的共享贴图库。 |");
         sb.AppendLine();
@@ -7908,7 +7962,7 @@ internal static class UELibraryPostProcessor
         sb.AppendLine();
         sb.AppendLine("浏览器和验收脚本优先读取 `library_index.db.relation_animations`；`model_animations.json` 只是兼容 JSON 视图，SQLite-only 模式下可不存在。默认可信动画请筛选 `recommended_use = 'defaultTrusted'`，不要只按 `validation_status = 'ok'` 或旧字段 `is_explicit_usage` 统计。");
         sb.AppendLine();
-        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json` 和 `skeletons.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
+        sb.AppendLine("如果导出或后处理使用 `sqliteOnlyIndex`、`--sqlite-only-index` 或 `--no-compat-json`，大型机器索引会优先进入 SQLite，不再生成对应 JSON/JSONL 兼容视图；例如导出事件 JSONL、`asset_catalog.jsonl`、`package_object_maps.jsonl`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`model_coverage.json`、`animation_validation.jsonl`、`model_animations.json`、`model_validation.json` 和 `skeletons.json` 会由 `export_events.db`、`ue_source_index.db`、`library_work.db` 和 `library_index.db` 承载。完整查询仍以 `library_index.db` 为准。");
         sb.AppendLine();
         sb.AppendLine("| 字段 | 用途 |");
         sb.AppendLine("| --- | --- |");
