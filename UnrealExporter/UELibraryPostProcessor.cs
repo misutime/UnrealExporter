@@ -6589,8 +6589,24 @@ internal static class UELibraryPostProcessor
                 bone_count INTEGER NOT NULL,
                 animation_count INTEGER NOT NULL,
                 skeleton_hash TEXT,
-                bbox_json TEXT,
-                notes_json TEXT NOT NULL
+                bbox_min_x REAL,
+                bbox_min_y REAL,
+                bbox_min_z REAL,
+                bbox_max_x REAL,
+                bbox_max_y REAL,
+                bbox_max_z REAL,
+                bbox_size_x REAL,
+                bbox_size_y REAL,
+                bbox_size_z REAL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE model_validation_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_validation_id INTEGER NOT NULL,
+                note_index INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                FOREIGN KEY (model_validation_id) REFERENCES model_validation(id)
             );
             """);
         Execute(connection, transaction, """
@@ -6985,6 +7001,7 @@ internal static class UELibraryPostProcessor
         Execute(connection, transaction, "CREATE INDEX idx_animation_bindings_skeleton ON animation_bindings(skeleton_path);");
         Execute(connection, transaction, "CREATE INDEX idx_auto_referenced_exports_target ON auto_referenced_exports(target_path, relation_type);");
         Execute(connection, transaction, "CREATE INDEX idx_auto_referenced_exports_status ON auto_referenced_exports(stage, status, reason);");
+        Execute(connection, transaction, "CREATE INDEX idx_model_validation_notes ON model_validation_notes(note, model_validation_id);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_kind ON model_coverage(resource_kind, validation_status);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_task ON model_coverage(is_task_or_prop, needs_review, component_reference_count, animation_candidate_count);");
         Execute(connection, transaction, "CREATE INDEX idx_model_coverage_source_index ON model_coverage(is_task_or_prop, source_index_object_count, component_reference_count);");
@@ -7392,13 +7409,18 @@ internal static class UELibraryPostProcessor
         command.CommandText = """
             INSERT INTO model_validation (
                 path, name, resource_kind, status, mesh_count, material_count, texture_count,
-                skin_count, bone_count, animation_count, skeleton_hash, bbox_json, notes_json
+                skin_count, bone_count, animation_count, skeleton_hash,
+                bbox_min_x, bbox_min_y, bbox_min_z, bbox_max_x, bbox_max_y, bbox_max_z,
+                bbox_size_x, bbox_size_y, bbox_size_z
             )
             VALUES (
                 $path, $name, $resourceKind, $status, $meshCount, $materialCount, $textureCount,
-                $skinCount, $boneCount, $animationCount, $skeletonHash, $bboxJson, $notesJson
+                $skinCount, $boneCount, $animationCount, $skeletonHash,
+                $bboxMinX, $bboxMinY, $bboxMinZ, $bboxMaxX, $bboxMaxY, $bboxMaxZ,
+                $bboxSizeX, $bboxSizeY, $bboxSizeZ
             );
             """;
+        var bbox = ReadModelValidationBBox(report.BBox);
         Add(command, "$path", report.RelativePath);
         Add(command, "$name", report.Name);
         Add(command, "$resourceKind", report.ResourceKind);
@@ -7410,9 +7432,65 @@ internal static class UELibraryPostProcessor
         Add(command, "$boneCount", report.BoneCount);
         Add(command, "$animationCount", report.AnimationCount);
         Add(command, "$skeletonHash", report.SkeletonHash);
-        Add(command, "$bboxJson", report.BBox == null ? null : JsonConvert.SerializeObject(report.BBox));
-        Add(command, "$notesJson", JsonConvert.SerializeObject(report.Notes));
+        Add(command, "$bboxMinX", bbox?.MinX);
+        Add(command, "$bboxMinY", bbox?.MinY);
+        Add(command, "$bboxMinZ", bbox?.MinZ);
+        Add(command, "$bboxMaxX", bbox?.MaxX);
+        Add(command, "$bboxMaxY", bbox?.MaxY);
+        Add(command, "$bboxMaxZ", bbox?.MaxZ);
+        Add(command, "$bboxSizeX", bbox?.SizeX);
+        Add(command, "$bboxSizeY", bbox?.SizeY);
+        Add(command, "$bboxSizeZ", bbox?.SizeZ);
         command.ExecuteNonQuery();
+        var validationId = GetLastInsertRowId(connection, transaction);
+        InsertModelValidationNotes(connection, transaction, validationId, report.Notes);
+    }
+
+    private static (double MinX, double MinY, double MinZ, double MaxX, double MaxY, double MaxZ, double SizeX, double SizeY, double SizeZ)? ReadModelValidationBBox(object? bbox)
+    {
+        if (bbox == null)
+            return null;
+
+        var token = bbox as JToken ?? JToken.FromObject(bbox);
+        if (token["min"] is not JArray min || token["max"] is not JArray max || token["size"] is not JArray size ||
+            min.Count < 3 || max.Count < 3 || size.Count < 3)
+            return null;
+
+        return (
+            (double)min[0]!, (double)min[1]!, (double)min[2]!,
+            (double)max[0]!, (double)max[1]!, (double)max[2]!,
+            (double)size[0]!, (double)size[1]!, (double)size[2]!);
+    }
+
+    private static void InsertModelValidationNotes(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long modelValidationId,
+        string[] notes)
+    {
+        if (modelValidationId <= 0 || notes.Length == 0)
+            return;
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO model_validation_notes (
+                model_validation_id, note_index, note
+            )
+            VALUES (
+                $modelValidationId, $noteIndex, $note
+            );
+            """;
+        var idParam = command.Parameters.Add("$modelValidationId", SqliteType.Integer);
+        var indexParam = command.Parameters.Add("$noteIndex", SqliteType.Integer);
+        var noteParam = command.Parameters.Add("$note", SqliteType.Text);
+        idParam.Value = modelValidationId;
+        for (var i = 0; i < notes.Length; i++)
+        {
+            indexParam.Value = i;
+            noteParam.Value = notes[i];
+            command.ExecuteNonQuery();
+        }
     }
 
     private static void InsertModelCoverage(SqliteConnection connection, SqliteTransaction transaction, JObject modelCoverage)
