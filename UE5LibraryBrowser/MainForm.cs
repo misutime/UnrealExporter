@@ -25,11 +25,14 @@ internal sealed class MainForm : Form
     private readonly ToolStripLabel _modelKindLabel = new("类型");
     private readonly ToolStripLabel _modelQualityLabel = new("质量");
     private readonly ToolStripLabel _thumbnailStateLabel = new("缩略图");
+    private readonly ToolStripLabel _thumbnailConcurrencyLabel = new("并发");
     private readonly ToolStripComboBox _modelKindBox = new();
     private readonly ToolStripComboBox _modelQualityBox = new();
     private readonly ToolStripComboBox _thumbnailStateBox = new();
+    private readonly ToolStripComboBox _thumbnailConcurrencyBox = new();
     private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
     private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
+    private readonly ToolStripButton _restartThumbnailsButton = new("重启缩略图");
     private readonly ToolStripLabel _statusLabel = new("请选择 UE5 素材库");
     private readonly TabControl _mainTabs = new();
     private readonly TabPage _modelsPage = new("模型");
@@ -90,6 +93,7 @@ internal sealed class MainForm : Form
     private int _thumbnailFailed;
     private int _thumbnailActive;
     private int _thumbnailCandidateTotal;
+    private int _thumbnailQueueGeneration;
     private string _root = "";
     private string? _initialRoot;
     private bool _suppressFilterEvents;
@@ -147,6 +151,9 @@ internal sealed class MainForm : Form
             _modelQualityBox,
             _thumbnailStateLabel,
             _thumbnailStateBox,
+            _thumbnailConcurrencyLabel,
+            _thumbnailConcurrencyBox,
+            _restartThumbnailsButton,
             _showFavoriteModelsButton,
             _hideIgnoredButton,
             new ToolStripSeparator(),
@@ -429,6 +436,14 @@ internal sealed class MainForm : Form
         _thumbnailStateBox.Items.AddRange(["全部", "已有", "未生成"]);
         _thumbnailStateBox.SelectedIndex = 0;
 
+        _thumbnailConcurrencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _thumbnailConcurrencyBox.Width = 56;
+        _thumbnailConcurrencyBox.Items.AddRange(["1", "2", "3", "4", "6", "8", "12"]);
+        _thumbnailConcurrencyBox.SelectedItem = Math.Clamp(Environment.ProcessorCount / 4, 1, 3).ToString();
+        _thumbnailConcurrencyBox.ToolTipText = "后台缩略图渲染并发；数值越高越快，但会占用更多 CPU/GPU/内存";
+
+        _restartThumbnailsButton.ToolTipText = "按当前筛选与并发设置重新启动缩略图队列";
+
         _showFavoriteModelsButton.CheckOnClick = true;
         _hideIgnoredButton.CheckOnClick = true;
         _hideIgnoredButton.Checked = true;
@@ -654,6 +669,8 @@ internal sealed class MainForm : Form
         _modelKindBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _modelQualityBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _thumbnailStateBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _thumbnailConcurrencyBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RestartThumbnailQueue(); };
+        _restartThumbnailsButton.Click += (_, _) => RestartThumbnailQueue();
         _showFavoriteModelsButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _hideIgnoredButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _animationFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildAnimationGrid(GetSelectedModel()); };
@@ -725,6 +742,9 @@ internal sealed class MainForm : Form
         _modelQualityBox.Visible = isModelTab;
         _thumbnailStateLabel.Visible = isModelTab;
         _thumbnailStateBox.Visible = isModelTab;
+        _thumbnailConcurrencyLabel.Visible = isModelTab;
+        _thumbnailConcurrencyBox.Visible = isModelTab;
+        _restartThumbnailsButton.Visible = isModelTab;
         _showFavoriteModelsButton.Visible = isModelTab;
         _hideIgnoredButton.Visible = isModelTab;
 
@@ -1276,10 +1296,32 @@ internal sealed class MainForm : Form
         if (items.Count == 0 || thumbnails == null)
             return;
 
-        _ = LoadThumbnailsAsync(items.ToArray(), thumbnails, cancellationToken);
+        var generation = Interlocked.Increment(ref _thumbnailQueueGeneration);
+        _ = LoadThumbnailsAsync(items.ToArray(), thumbnails, cancellationToken, generation);
     }
 
-    private async Task LoadThumbnailsAsync(UeLibraryModel[] items, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    private void RestartThumbnailQueue()
+    {
+        if (_index == null || string.IsNullOrWhiteSpace(_root) || _viewerSafeCache == null)
+        {
+            UpdateThumbnailStatus();
+            return;
+        }
+
+        _thumbnailCts?.Cancel();
+        _thumbnails?.Dispose();
+        _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
+
+        var filter = SearchQuery.Parse(_modelFilter.Text);
+        Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
+        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !filter.IsEmpty));
+    }
+
+    private async Task LoadThumbnailsAsync(
+        UeLibraryModel[] items,
+        ThumbnailService thumbnails,
+        CancellationToken cancellationToken,
+        int generation)
     {
         var nextIndex = -1;
         var workerCount = Math.Min(GetThumbnailConcurrency(), items.Length);
@@ -1292,7 +1334,7 @@ internal sealed class MainForm : Form
                     if (index >= items.Length)
                         break;
 
-                    await LoadOneThumbnailAsync(items[index], thumbnails, cancellationToken);
+                    await LoadOneThumbnailAsync(items[index], thumbnails, cancellationToken, generation);
                 }
             }, cancellationToken))
             .ToArray();
@@ -1306,22 +1348,35 @@ internal sealed class MainForm : Form
             // A newer filter/open operation replaced this queue.
         }
 
-        if (!cancellationToken.IsCancellationRequested)
+        if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
             SafeBeginInvoke(UpdateThumbnailStatus);
     }
 
-    private async Task LoadOneThumbnailAsync(UeLibraryModel model, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    private async Task LoadOneThumbnailAsync(
+        UeLibraryModel model,
+        ThumbnailService thumbnails,
+        CancellationToken cancellationToken,
+        int generation)
     {
+        if (cancellationToken.IsCancellationRequested || !IsCurrentThumbnailQueue(generation))
+            return;
+
         Interlocked.Increment(ref _thumbnailActive);
         try
         {
             var thumbnail = await thumbnails.GetThumbnailAsync(model, cancellationToken).ConfigureAwait(false);
+            if (!IsCurrentThumbnailQueue(generation))
+            {
+                thumbnail.Image.Dispose();
+                return;
+            }
+
             if (thumbnail.FromCache)
                 Interlocked.Increment(ref _thumbnailCached);
             else if (!thumbnail.Success)
                 Interlocked.Increment(ref _thumbnailFailed);
 
-            if (!cancellationToken.IsCancellationRequested)
+            if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
             {
                 SafeBeginInvoke(() =>
                 {
@@ -1346,16 +1401,22 @@ internal sealed class MainForm : Form
         }
         catch
         {
-            Interlocked.Increment(ref _thumbnailFailed);
+            if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
+                Interlocked.Increment(ref _thumbnailFailed);
         }
         finally
         {
-            Interlocked.Decrement(ref _thumbnailActive);
-            Interlocked.Increment(ref _thumbnailCompleted);
-            if (!cancellationToken.IsCancellationRequested)
+            if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
+            {
+                Interlocked.Decrement(ref _thumbnailActive);
+                Interlocked.Increment(ref _thumbnailCompleted);
                 SafeBeginInvoke(UpdateThumbnailStatus);
+            }
         }
     }
+
+    private bool IsCurrentThumbnailQueue(int generation)
+        => Volatile.Read(ref _thumbnailQueueGeneration) == generation;
 
     private void UpdateThumbnailStatus()
     {
@@ -1382,8 +1443,13 @@ internal sealed class MainForm : Form
         _statusLabel.Text = $"已打开: {_root} | 缩略图{state} {scope} | 缓存 {cached} | 失败 {failed} | 队列 {queued} | 运行 {active} | 并发 {GetThumbnailConcurrency()} | {renderer}";
     }
 
-    private static int GetThumbnailConcurrency()
-        => Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
+    private int GetThumbnailConcurrency()
+    {
+        if (int.TryParse(_thumbnailConcurrencyBox.SelectedItem as string, out var selected))
+            return Math.Clamp(selected, 1, 12);
+
+        return Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
+    }
 
     private void SafeBeginInvoke(Action action)
     {
