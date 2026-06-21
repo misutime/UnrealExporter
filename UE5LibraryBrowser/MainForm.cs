@@ -25,10 +25,12 @@ internal sealed class MainForm : Form
     private readonly ToolStripLabel _modelKindLabel = new("类型");
     private readonly ToolStripLabel _modelQualityLabel = new("质量");
     private readonly ToolStripLabel _thumbnailStateLabel = new("缩略图");
+    private readonly ToolStripLabel _modelSortLabel = new("排序");
     private readonly ToolStripLabel _thumbnailConcurrencyLabel = new("并发");
     private readonly ToolStripComboBox _modelKindBox = new();
     private readonly ToolStripComboBox _modelQualityBox = new();
     private readonly ToolStripComboBox _thumbnailStateBox = new();
+    private readonly ToolStripComboBox _modelSortBox = new();
     private readonly ToolStripComboBox _thumbnailConcurrencyBox = new();
     private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
     private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
@@ -151,6 +153,8 @@ internal sealed class MainForm : Form
             _modelQualityBox,
             _thumbnailStateLabel,
             _thumbnailStateBox,
+            _modelSortLabel,
+            _modelSortBox,
             _thumbnailConcurrencyLabel,
             _thumbnailConcurrencyBox,
             _restartThumbnailsButton,
@@ -436,6 +440,24 @@ internal sealed class MainForm : Form
         _thumbnailStateBox.Items.AddRange(["全部", "已有", "未生成"]);
         _thumbnailStateBox.SelectedIndex = 0;
 
+        _modelSortBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _modelSortBox.Width = 118;
+        _modelSortBox.Items.AddRange([
+            "推荐优先",
+            "名称 A-Z",
+            "路径 A-Z",
+            "类型 A-Z",
+            "可信动画多",
+            "可预览动画多",
+            "总动画多",
+            "问题优先",
+            "缺材质优先",
+            "无骨骼优先",
+            "未生成缩略图"
+        ]);
+        _modelSortBox.SelectedIndex = 0;
+        _modelSortBox.ToolTipText = "控制当前模型筛选结果的排序方式";
+
         _thumbnailConcurrencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _thumbnailConcurrencyBox.Width = 56;
         _thumbnailConcurrencyBox.Items.AddRange(["1", "2", "3", "4", "6", "8", "12"]);
@@ -669,6 +691,7 @@ internal sealed class MainForm : Form
         _modelKindBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _modelQualityBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _thumbnailStateBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _modelSortBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _thumbnailConcurrencyBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RestartThumbnailQueue(); };
         _restartThumbnailsButton.Click += (_, _) => RestartThumbnailQueue();
         _showFavoriteModelsButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
@@ -742,6 +765,8 @@ internal sealed class MainForm : Form
         _modelQualityBox.Visible = isModelTab;
         _thumbnailStateLabel.Visible = isModelTab;
         _thumbnailStateBox.Visible = isModelTab;
+        _modelSortLabel.Visible = isModelTab;
+        _modelSortBox.Visible = isModelTab;
         _thumbnailConcurrencyLabel.Visible = isModelTab;
         _thumbnailConcurrencyBox.Visible = isModelTab;
         _restartThumbnailsButton.Visible = isModelTab;
@@ -770,6 +795,7 @@ internal sealed class MainForm : Form
                 _modelKindBox.SelectedItem = "All";
                 _modelQualityBox.SelectedIndex = 0;
                 _thumbnailStateBox.SelectedIndex = 0;
+                _modelSortBox.SelectedIndex = 0;
                 _showFavoriteModelsButton.Checked = false;
                 _hideIgnoredButton.Checked = true;
             }
@@ -896,13 +922,8 @@ internal sealed class MainForm : Form
             .Where(MatchesModelKindFilter)
             .Where(MatchesModelQualityFilter)
             .Where(MatchesCurationFilter)
-            .Where(MatchesThumbnailStateFilter)
-            .OrderByDescending(x => x.TrustedAnimationCount)
-            .ThenByDescending(x => x.CompatibleAnimationCount)
-            .ThenByDescending(x => x.UsableAnimationCount)
-            .ThenByDescending(x => x.AnimationCount)
-            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+            .Where(MatchesThumbnailStateFilter);
+        models = SortModels(models).ToList();
 
         _modelList.BeginUpdate();
         _visibleModels.Clear();
@@ -915,7 +936,7 @@ internal sealed class MainForm : Form
         _modelList.VirtualListSize = _visibleModels.Count;
         _modelList.EndUpdate();
 
-        _modelHeader.Text = $"模型 {models.Count}/{_index.Models.Count}";
+        _modelHeader.Text = $"模型 {models.Count()}/{_index.Models.Count}";
         _animationHeader.Text = "动画";
         if (_modelList.VirtualListSize > 0)
         {
@@ -956,6 +977,63 @@ internal sealed class MainForm : Form
         var limit = hasFilter ? MaxFilteredThumbnailItems : MaxUnfilteredThumbnailItems;
         return items.Count <= limit ? items : items.Take(limit).ToArray();
     }
+
+    private IOrderedEnumerable<UeLibraryModel> SortModels(IEnumerable<UeLibraryModel> models)
+    {
+        var sort = _modelSortBox.SelectedItem as string ?? "推荐优先";
+        return sort switch
+        {
+            "名称 A-Z" => models
+                .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Output, StringComparer.OrdinalIgnoreCase),
+            "路径 A-Z" => models
+                .OrderBy(x => x.Output, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "类型 A-Z" => models
+                .OrderBy(x => x.DisplayKind, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "可信动画多" => models
+                .OrderByDescending(x => x.TrustedAnimationCount)
+                .ThenByDescending(x => x.CompatibleAnimationCount)
+                .ThenByDescending(x => x.UsableAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "可预览动画多" => models
+                .OrderByDescending(x => x.UsableAnimationCount)
+                .ThenByDescending(x => x.TrustedAnimationCount)
+                .ThenByDescending(x => x.CompatibleAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "总动画多" => models
+                .OrderByDescending(x => x.AnimationCount)
+                .ThenByDescending(x => x.TrustedAnimationCount)
+                .ThenByDescending(x => x.UsableAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "问题优先" => models
+                .OrderByDescending(HasModelIssue)
+                .ThenByDescending(x => x.ReviewAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "缺材质优先" => models
+                .OrderBy(x => x.MaterialCount > 0)
+                .ThenByDescending(x => x.TrustedAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "无骨骼优先" => models
+                .OrderBy(HasModelSkeleton)
+                .ThenByDescending(x => x.MaterialCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            "未生成缩略图" => models
+                .OrderBy(x => _thumbnails?.IsCached(x) == true)
+                .ThenByDescending(x => x.TrustedAnimationCount)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase),
+            _ => SortModelsByRecommendation(models)
+        };
+    }
+
+    private static IOrderedEnumerable<UeLibraryModel> SortModelsByRecommendation(IEnumerable<UeLibraryModel> models)
+        => models
+            .OrderByDescending(x => x.TrustedAnimationCount)
+            .ThenByDescending(x => x.CompatibleAnimationCount)
+            .ThenByDescending(x => x.UsableAnimationCount)
+            .ThenByDescending(x => x.AnimationCount)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase);
 
     private void RebuildAnimationGrid(UeLibraryModel? model)
     {
@@ -1836,8 +1914,8 @@ internal sealed class MainForm : Form
             "有兼容动画" => model.CompatibleAnimationCount > 0,
             "可预览动画" => model.UsableAnimationCount > 0,
             "需复查动画" => model.ReviewAnimationCount > 0,
-            "有骨骼" => model.HasSkin || model.BoneCount > 0 || !string.IsNullOrWhiteSpace(model.SkeletonPath),
-            "无骨骼" => !model.HasSkin && model.BoneCount <= 0 && string.IsNullOrWhiteSpace(model.SkeletonPath),
+            "有骨骼" => HasModelSkeleton(model),
+            "无骨骼" => !HasModelSkeleton(model),
             "有材质" => model.MaterialCount > 0,
             "缺材质" => model.MaterialCount <= 0,
             "验证OK" => Contains(model.ValidationStatus, "ok") || Contains(model.ValidationStatus, "pass"),
@@ -1938,6 +2016,17 @@ internal sealed class MainForm : Form
 
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+
+    private static bool HasModelSkeleton(UeLibraryModel model)
+        => model.HasSkin || model.BoneCount > 0 || !string.IsNullOrWhiteSpace(model.SkeletonPath);
+
+    private static bool HasModelIssue(UeLibraryModel model)
+        => model.MaterialCount <= 0
+           || !HasModelSkeleton(model)
+           || model.ReviewAnimationCount > 0
+           || (!string.IsNullOrWhiteSpace(model.ValidationStatus)
+               && !Contains(model.ValidationStatus, "ok")
+               && !Contains(model.ValidationStatus, "pass"));
 
     private static void SetRowTooltip(DataGridViewRow row, string text)
     {
