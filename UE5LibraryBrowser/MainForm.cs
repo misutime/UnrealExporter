@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace UE5LibraryBrowser;
@@ -29,28 +30,36 @@ internal sealed class MainForm : Form
     private readonly TabControl _mainTabs = new();
     private readonly TabPage _modelsPage = new("模型");
     private readonly TabPage _globalAnimationsPage = new("全局动画");
+    private readonly TabPage _assetsPage = new("贴图材质");
     private readonly TextBox _modelFilter = new();
     private readonly TextBox _animationFilter = new();
     private readonly TextBox _globalAnimationFilter = new();
+    private readonly TextBox _assetFilter = new();
     private readonly ListView _modelList = new();
     private readonly ListView _globalAnimationList = new();
+    private readonly ListView _assetList = new();
     private readonly ImageList _modelImages = new();
+    private readonly ImageList _assetImages = new();
     private readonly DataGridView _animationGrid = new();
     private readonly DataGridView _globalAnimationModelsGrid = new();
     private readonly ContextMenuStrip _modelMenu = new();
     private readonly ContextMenuStrip _animationMenu = new();
     private readonly ContextMenuStrip _globalAnimationMenu = new();
     private readonly ContextMenuStrip _globalAnimationModelMenu = new();
+    private readonly ContextMenuStrip _assetMenu = new();
     private readonly Label _modelHeader = new();
     private readonly Label _animationHeader = new();
     private readonly Label _globalAnimationHeader = new();
     private readonly Label _globalAnimationModelsHeader = new();
+    private readonly Label _assetHeader = new();
     private readonly TextBox _details = new();
     private readonly TextBox _globalAnimationDetails = new();
+    private readonly TextBox _assetDetails = new();
     private readonly Image _placeholder = BuildPlaceholderImage();
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
+    private readonly List<UeLibraryAsset> _visibleAssets = [];
     private readonly RecentLibraryStore _recentStore = new();
 
     private UeLibraryIndex? _index;
@@ -131,6 +140,7 @@ internal sealed class MainForm : Form
         _mainTabs.Dock = DockStyle.Fill;
         _mainTabs.TabPages.Add(_modelsPage);
         _mainTabs.TabPages.Add(_globalAnimationsPage);
+        _mainTabs.TabPages.Add(_assetsPage);
         Controls.Add(_mainTabs);
         _mainTabs.BringToFront();
 
@@ -199,6 +209,7 @@ internal sealed class MainForm : Form
         right.Controls.Add(_details, 0, 3);
 
         BuildGlobalAnimationPage();
+        BuildAssetPage();
     }
 
     private void BuildGlobalAnimationPage()
@@ -261,6 +272,48 @@ internal sealed class MainForm : Form
         _globalAnimationDetails.ScrollBars = ScrollBars.Vertical;
         _globalAnimationDetails.Font = new Font("Consolas", 9);
         right.Controls.Add(_globalAnimationDetails, 0, 2);
+    }
+
+    private void BuildAssetPage()
+    {
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            SplitterDistance = 980,
+            Orientation = Orientation.Vertical
+        };
+        _assetsPage.Controls.Add(split);
+
+        var left = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 3,
+            ColumnCount = 1,
+            Padding = new Padding(8)
+        };
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        split.Panel1.Controls.Add(left);
+
+        _assetHeader.Dock = DockStyle.Fill;
+        _assetHeader.TextAlign = ContentAlignment.MiddleLeft;
+        _assetHeader.Font = new Font(Font, FontStyle.Bold);
+        left.Controls.Add(_assetHeader, 0, 0);
+
+        _assetFilter.Dock = DockStyle.Fill;
+        _assetFilter.PlaceholderText = "筛选贴图/材质、路径、类型、hash...";
+        left.Controls.Add(_assetFilter, 0, 1);
+
+        ConfigureAssetList();
+        left.Controls.Add(_assetList, 0, 2);
+
+        _assetDetails.Dock = DockStyle.Fill;
+        _assetDetails.Multiline = true;
+        _assetDetails.ReadOnly = true;
+        _assetDetails.ScrollBars = ScrollBars.Vertical;
+        _assetDetails.Font = new Font("Consolas", 9);
+        split.Panel2.Controls.Add(_assetDetails);
     }
 
     private void ConfigureToolbarFilters()
@@ -422,6 +475,36 @@ internal sealed class MainForm : Form
         _globalAnimationModelMenu.Items.Add("复制动画路径", null, (_, _) => CopyText(GetSelectedGlobalAnimationUsage()?.Animation.Output));
     }
 
+    private void ConfigureAssetList()
+    {
+        _assetImages.ImageSize = new Size(128, 128);
+        _assetImages.ColorDepth = ColorDepth.Depth32Bit;
+        _assetImages.Images.Add("__texture", BuildAssetPlaceholderImage("Texture"));
+        _assetImages.Images.Add("__material", BuildAssetPlaceholderImage("Material"));
+
+        _assetList.Dock = DockStyle.Fill;
+        _assetList.View = View.LargeIcon;
+        _assetList.LargeImageList = _assetImages;
+        _assetList.HideSelection = false;
+        _assetList.MultiSelect = false;
+        _assetList.VirtualMode = true;
+        _assetList.ShowItemToolTips = true;
+        _assetList.RetrieveVirtualItem += AssetList_RetrieveVirtualItem;
+        _assetList.HandleCreated += (_, _) =>
+        {
+            EnableListViewDoubleBuffer(_assetList);
+            SetLargeIconSpacing(_assetList);
+        };
+        _assetList.ContextMenuStrip = _assetMenu;
+
+        _assetMenu.Items.Add("打开文件", null, (_, _) => OpenSelectedAsset());
+        _assetMenu.Items.Add("打开目录", null, (_, _) => OpenSelectedAssetFolder());
+        _assetMenu.Items.Add(new ToolStripSeparator());
+        _assetMenu.Items.Add("复制输出路径", null, (_, _) => CopyText(GetSelectedAsset()?.Output));
+        _assetMenu.Items.Add("复制共享贴图路径", null, (_, _) => CopyText(GetSelectedAsset()?.SharedTexture));
+        _assetMenu.Items.Add("复制源资源路径", null, (_, _) => CopyText(GetSelectedAsset()?.Source));
+    }
+
     private void WireEvents()
     {
         _openButton.Click += async (_, _) => await ChooseAndOpenLibraryAsync();
@@ -452,6 +535,10 @@ internal sealed class MainForm : Form
         _globalAnimationModelsGrid.SelectionChanged += (_, _) => ShowSelectedGlobalAnimationUsageDetails();
         _globalAnimationModelsGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
         _globalAnimationModelsGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_globalAnimationModelsGrid, e);
+        _assetFilter.TextChanged += (_, _) => RebuildAssetGrid();
+        _assetList.SelectedIndexChanged += (_, _) => ShowSelectedAssetDetails();
+        _assetList.DoubleClick += (_, _) => OpenSelectedAsset();
+        _assetList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_assetList, e);
     }
 
     private async Task ChooseAndOpenLibraryAsync()
@@ -537,6 +624,7 @@ internal sealed class MainForm : Form
             _statusLabel.Text = $"已打开: {_root}";
             RebuildModelGrid();
             RebuildGlobalAnimationList();
+            RebuildAssetGrid();
         }
         catch (Exception ex)
         {
@@ -771,6 +859,58 @@ internal sealed class MainForm : Form
         ShowSelectedGlobalAnimationUsageDetails();
     }
 
+    private void RebuildAssetGrid()
+    {
+        if (_index == null)
+        {
+            _assetHeader.Text = "贴图材质";
+            _assetList.VirtualListSize = 0;
+            _assetDetails.Clear();
+            return;
+        }
+
+        var filter = _assetFilter.Text.Trim();
+        var assets = _index.Textures
+            .Concat(_index.Materials)
+            .Where(x => MatchesAssetFilter(x, filter))
+            .OrderBy(x => x.Kind, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.ResourceKind, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _visibleAssets.Clear();
+        _visibleAssets.AddRange(assets);
+        _assetList.VirtualListSize = _visibleAssets.Count;
+        _assetHeader.Text = $"贴图材质 {_visibleAssets.Count}/{_index.Textures.Count + _index.Materials.Count}  贴图 {_index.Textures.Count} / 材质 {_index.Materials.Count}";
+        if (_assetList.VirtualListSize > 0)
+        {
+            _assetList.SelectedIndices.Clear();
+            _assetList.SelectedIndices.Add(0);
+        }
+        else
+        {
+            _assetDetails.Clear();
+        }
+        _assetList.Refresh();
+    }
+
+    private void AssetList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    {
+        if (e.ItemIndex < 0 || e.ItemIndex >= _visibleAssets.Count)
+        {
+            e.Item = new ListViewItem("");
+            return;
+        }
+
+        var asset = _visibleAssets[e.ItemIndex];
+        var item = new ListViewItem(BuildAssetCardText(asset), GetAssetImageKey(asset))
+        {
+            Tag = asset,
+            ToolTipText = BuildAssetDetails(asset)
+        };
+        e.Item = item;
+    }
+
     private void StartThumbnailQueue(IReadOnlyList<UeLibraryModel> items)
     {
         _thumbnailCts?.Cancel();
@@ -968,6 +1108,12 @@ internal sealed class MainForm : Form
         _globalAnimationDetails.Text = group == null ? "" : BuildGlobalAnimationGroupDetails(group);
     }
 
+    private void ShowSelectedAssetDetails()
+    {
+        var asset = GetSelectedAsset();
+        _assetDetails.Text = asset == null ? "" : BuildAssetDetails(asset);
+    }
+
     private UeLibraryModel? GetSelectedModel()
     {
         if (_modelList.SelectedIndices.Count == 0)
@@ -993,6 +1139,15 @@ internal sealed class MainForm : Form
         => _globalAnimationModelsGrid.SelectedRows.Count == 0
             ? null
             : _globalAnimationModelsGrid.SelectedRows[0].Tag as UeLibraryAnimationUsage;
+
+    private UeLibraryAsset? GetSelectedAsset()
+    {
+        if (_assetList.SelectedIndices.Count == 0)
+            return null;
+
+        var index = _assetList.SelectedIndices[0];
+        return index >= 0 && index < _visibleAssets.Count ? _visibleAssets[index] : null;
+    }
 
     private void RebuildModelKindFilter()
     {
@@ -1042,6 +1197,27 @@ internal sealed class MainForm : Form
         if (usage == null)
             return;
         var directory = Path.GetDirectoryName(usage.Model.Output);
+        if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
+    }
+
+    private void OpenSelectedAsset()
+    {
+        var asset = GetSelectedAsset();
+        var path = asset?.Kind == "Texture" && File.Exists(asset.SharedTexture)
+            ? asset.SharedTexture
+            : asset?.Output;
+        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+    }
+
+    private void OpenSelectedAssetFolder()
+    {
+        var asset = GetSelectedAsset();
+        if (asset == null)
+            return;
+        var path = File.Exists(asset.Output) ? asset.Output : File.Exists(asset.SharedTexture) ? asset.SharedTexture : "";
+        var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
             Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
     }
@@ -1288,6 +1464,24 @@ internal sealed class MainForm : Form
             || group.Usages.Any(x => Contains(x.Model.Name, filter) || Contains(x.Model.Output, filter));
     }
 
+    private static bool MatchesAssetFilter(UeLibraryAsset asset, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return true;
+
+        return Contains(asset.Name, filter)
+            || Contains(asset.Kind, filter)
+            || Contains(asset.Output, filter)
+            || Contains(asset.SharedTexture, filter)
+            || Contains(asset.Source, filter)
+            || Contains(asset.SourceType, filter)
+            || Contains(asset.ResourceKind, filter)
+            || Contains(asset.Format, filter)
+            || Contains(asset.Sha256, filter)
+            || Contains(asset.BlendMode, filter)
+            || Contains(asset.ShadingModel, filter);
+    }
+
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -1378,6 +1572,131 @@ internal sealed class MainForm : Form
                Container animation: {animation.IsContainerAnimation}
                Favorite: {_curationStore?.IsFavoriteAnimation(animation) == true}
                """;
+    }
+
+    private string BuildAssetCardText(UeLibraryAsset asset)
+    {
+        var name = asset.Name.Length <= 24 ? asset.Name : asset.Name[..21] + "...";
+        if (string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase))
+            return $"{name}{Environment.NewLine}{asset.SourceType}{Environment.NewLine}Slots {asset.TextureSlotCount}";
+
+        var size = asset.SizeBytes > 0 ? FormatBytes(asset.SizeBytes) : "";
+        var shared = File.Exists(asset.SharedTexture) ? "shared" : "local";
+        return $"{name}{Environment.NewLine}{asset.ResourceKind}{Environment.NewLine}{shared} {size}";
+    }
+
+    private string BuildAssetDetails(UeLibraryAsset asset)
+        => string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase)
+            ? $"""
+               Material: {asset.Name}
+               File: {asset.Output}
+               Source: {asset.Source}
+               Source type: {asset.SourceType}
+               Resource kind: {asset.ResourceKind}
+               Texture slots: {asset.TextureSlotCount}
+               Colors: {asset.ColorCount}
+               Scalars: {asset.ScalarCount}
+               Switches: {asset.SwitchCount}
+               Blend mode: {asset.BlendMode}
+               Shading model: {asset.ShadingModel}
+               Size: {FormatBytes(asset.SizeBytes)}
+               Validation: {asset.ValidationStatus}
+               """
+            : $"""
+               Texture: {asset.Name}
+               File: {asset.Output}
+               Shared: {asset.SharedTexture}
+               Source: {asset.Source}
+               Source type: {asset.SourceType}
+               Resource kind: {asset.ResourceKind}
+               Format: {asset.Format}
+               Size: {FormatBytes(asset.SizeBytes)}
+               Sha256: {asset.Sha256}
+               Hard linked: {asset.HardLinked}
+               Link error: {asset.LinkError}
+               Validation: {asset.ValidationStatus}
+               """;
+
+    private string GetAssetImageKey(UeLibraryAsset asset)
+    {
+        if (string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase))
+            return "__material";
+
+        var key = asset.SharedTexture.Length > 0 ? asset.SharedTexture : asset.Output;
+        if (_assetImages.Images.ContainsKey(key))
+            return key;
+
+        var imagePath = File.Exists(asset.SharedTexture) ? asset.SharedTexture : asset.Output;
+        var image = TryCreateTextureThumbnail(imagePath, _assetImages.ImageSize);
+        if (image == null)
+            return "__texture";
+
+        _assetImages.Images.Add(key, image);
+        return key;
+    }
+
+    private static Image? TryCreateTextureThumbnail(string path, Size imageSize)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return null;
+
+        var extension = Path.GetExtension(path);
+        if (!extension.Equals(".png", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".bmp", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var source = Image.FromFile(path);
+            var bitmap = new Bitmap(imageSize.Width, imageSize.Height);
+            using var g = Graphics.FromImage(bitmap);
+            g.Clear(Color.FromArgb(42, 48, 56));
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            var scale = Math.Min((float)imageSize.Width / source.Width, (float)imageSize.Height / source.Height);
+            var width = Math.Max(1, (int)(source.Width * scale));
+            var height = Math.Max(1, (int)(source.Height * scale));
+            var x = (imageSize.Width - width) / 2;
+            var y = (imageSize.Height - height) / 2;
+            g.DrawImage(source, x, y, width, height);
+            return bitmap;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Image BuildAssetPlaceholderImage(string label)
+    {
+        var bitmap = new Bitmap(128, 128);
+        using var g = Graphics.FromImage(bitmap);
+        g.Clear(Color.FromArgb(42, 48, 56));
+        using var pen = new Pen(Color.FromArgb(110, 126, 145), 2);
+        g.DrawRectangle(pen, 18, 18, 92, 92);
+        using var brush = new SolidBrush(Color.WhiteSmoke);
+        using var font = new Font("Segoe UI", 12, FontStyle.Bold);
+        var size = g.MeasureString(label, font);
+        g.DrawString(label, font, brush, (128 - size.Width) / 2, (128 - size.Height) / 2);
+        return bitmap;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes <= 0)
+            return "";
+        string[] units = ["B", "KB", "MB", "GB"];
+        var value = (double)bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return $"{value:0.##} {units[unit]}";
     }
 
     private static string DisplayUsageEvidence(UeLibraryAnimation animation)

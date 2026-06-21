@@ -7,4 +7,6 @@ internal sealed class UeLibraryIndex
     public Dictionary<string, List<UeLibraryAnimation>> AnimationsByModel { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public List<UeLibraryAnimationUsage> AnimationUsages { get; init; } = [];
     public List<UeLibraryAnimationGroup> AnimationGroups { get; init; } = [];
+    public List<UeLibraryAsset> Textures { get; init; } = [];
+    public List<UeLibraryAsset> Materials { get; init; } = [];
 }

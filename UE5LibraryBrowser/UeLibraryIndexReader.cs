@@ -25,6 +25,8 @@ internal static class UeLibraryIndexReader
         var models = LoadModels(root, connection, animationsByModel);
         var animationUsages = BuildAnimationUsages(root, models, animationsByModel);
         var animationGroups = BuildAnimationGroups(animationUsages);
+        var textures = LoadTextures(root, connection);
+        var materials = LoadMaterials(root, connection);
 
         return new UeLibraryIndex
         {
@@ -32,9 +34,164 @@ internal static class UeLibraryIndexReader
             Models = models,
             AnimationsByModel = animationsByModel,
             AnimationUsages = animationUsages,
-            AnimationGroups = animationGroups
+            AnimationGroups = animationGroups,
+            Textures = textures,
+            Materials = materials
         };
     }
+
+    private static List<UeLibraryAsset> LoadTextures(string root, SqliteConnection connection)
+    {
+        var links = LoadTextureLinkMap(connection);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT a.name,
+                   a.output,
+                   a.source,
+                   a.source_type,
+                   a.resource_kind,
+                   a.format,
+                   COALESCE(a.validation_status, '')
+            FROM assets a
+            WHERE a.kind = 'Texture'
+              AND a.output IS NOT NULL
+            ORDER BY a.name COLLATE NOCASE;
+            """;
+
+        var result = new List<UeLibraryAsset>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var rawOutput = ReadString(reader, 1) ?? "";
+            var output = ResolveLibraryPath(root, rawOutput);
+            links.TryGetValue(NormalizeLibraryKey(rawOutput), out var link);
+            var shared = ResolveLibraryPath(root, link.Shared);
+            result.Add(new UeLibraryAsset
+            {
+                Kind = "Texture",
+                Name = ReadString(reader, 0) ?? Path.GetFileNameWithoutExtension(output),
+                Output = output,
+                Source = ReadString(reader, 2) ?? "",
+                SourceType = ReadString(reader, 3) ?? "",
+                ResourceKind = ReadString(reader, 4) ?? "",
+                Format = ReadString(reader, 5) ?? "",
+                ValidationStatus = ReadString(reader, 6) ?? "",
+                SharedTexture = shared,
+                Sha256 = link.Sha256 ?? "",
+                SizeBytes = link.SizeBytes,
+                HardLinked = link.HardLinked,
+                LinkError = link.LinkError ?? ""
+            });
+        }
+
+        return result;
+    }
+
+    private static List<UeLibraryAsset> LoadMaterials(string root, SqliteConnection connection)
+    {
+        var sidecars = LoadMaterialSidecarMap(connection);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT a.name,
+                   a.output,
+                   a.source,
+                   a.source_type,
+                   a.resource_kind,
+                   a.format,
+                   COALESCE(a.validation_status, '')
+            FROM assets a
+            WHERE a.kind = 'Material'
+              AND a.output IS NOT NULL
+            ORDER BY a.name COLLATE NOCASE;
+            """;
+
+        var result = new List<UeLibraryAsset>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var rawOutput = ReadString(reader, 1) ?? "";
+            var output = ResolveLibraryPath(root, rawOutput);
+            sidecars.TryGetValue(NormalizeLibraryKey(rawOutput), out var material);
+            result.Add(new UeLibraryAsset
+            {
+                Kind = "Material",
+                Name = ReadString(reader, 0) ?? Path.GetFileNameWithoutExtension(output),
+                Output = output,
+                Source = ReadString(reader, 2) ?? "",
+                SourceType = ReadString(reader, 3) ?? "",
+                ResourceKind = ReadString(reader, 4) ?? "",
+                Format = ReadString(reader, 5) ?? "",
+                ValidationStatus = ReadString(reader, 6) ?? "",
+                SizeBytes = material.SizeBytes,
+                TextureSlotCount = material.TextureSlotCount,
+                ColorCount = material.ColorCount,
+                ScalarCount = material.ScalarCount,
+                SwitchCount = material.SwitchCount,
+                BlendMode = material.BlendMode ?? "",
+                ShadingModel = material.ShadingModel ?? ""
+            });
+        }
+
+        return result;
+    }
+
+    private static Dictionary<string, TextureLinkRow> LoadTextureLinkMap(SqliteConnection connection)
+    {
+        var result = new Dictionary<string, TextureLinkRow>(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source, shared, sha256, size_bytes, hard_linked, COALESCE(link_error, '')
+            FROM texture_links;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var source = NormalizeLibraryKey(ReadString(reader, 0));
+            if (string.IsNullOrWhiteSpace(source))
+                continue;
+
+            result[source] = new TextureLinkRow(
+                ReadString(reader, 1) ?? "",
+                ReadString(reader, 2) ?? "",
+                ReadInt64(reader, 3),
+                ReadBool(reader, 4),
+                ReadString(reader, 5) ?? "");
+        }
+
+        return result;
+    }
+
+    private static Dictionary<string, MaterialSidecarRow> LoadMaterialSidecarMap(SqliteConnection connection)
+    {
+        var result = new Dictionary<string, MaterialSidecarRow>(StringComparer.OrdinalIgnoreCase);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT relative_path, size_bytes, texture_slot_count, color_count, scalar_count, switch_count, COALESCE(blend_mode, ''), COALESCE(shading_model, '')
+            FROM material_sidecars;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var path = NormalizeLibraryKey(ReadString(reader, 0));
+            if (string.IsNullOrWhiteSpace(path))
+                continue;
+
+            result[path] = new MaterialSidecarRow(
+                ReadInt64(reader, 1),
+                ReadInt32(reader, 2),
+                ReadInt32(reader, 3),
+                ReadInt32(reader, 4),
+                ReadInt32(reader, 5),
+                ReadString(reader, 6) ?? "",
+                ReadString(reader, 7) ?? "");
+        }
+
+        return result;
+    }
+
+    private readonly record struct TextureLinkRow(string Shared, string Sha256, long SizeBytes, bool HardLinked, string LinkError);
+
+    private readonly record struct MaterialSidecarRow(long SizeBytes, int TextureSlotCount, int ColorCount, int ScalarCount, int SwitchCount, string BlendMode, string ShadingModel);
 
     private static List<UeLibraryAnimationUsage> BuildAnimationUsages(
         string root,
@@ -423,6 +580,16 @@ internal static class UeLibraryIndexReader
         if (value is bool b)
             return b ? 1 : 0;
         return Convert.ToInt32(value);
+    }
+
+    private static long ReadInt64(SqliteDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal))
+            return 0;
+        var value = reader.GetValue(ordinal);
+        if (value is bool b)
+            return b ? 1 : 0;
+        return Convert.ToInt64(value);
     }
 
     private static double ReadDouble(SqliteDataReader reader, int ordinal)
