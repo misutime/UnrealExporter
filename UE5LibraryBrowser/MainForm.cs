@@ -183,7 +183,7 @@ internal sealed class MainForm : Form
         left.Controls.Add(_modelHeader, 0, 0);
 
         _modelFilter.Dock = DockStyle.Fill;
-        _modelFilter.PlaceholderText = "筛选模型、路径、Skeleton...";
+        _modelFilter.PlaceholderText = "筛选模型、路径、Skeleton；支持 * ? 和 -排除";
         left.Controls.Add(_modelFilter, 0, 1);
 
         ConfigureModelList();
@@ -208,7 +208,7 @@ internal sealed class MainForm : Form
         right.Controls.Add(_animationHeader, 0, 0);
 
         _animationFilter.Dock = DockStyle.Fill;
-        _animationFilter.PlaceholderText = "筛选动画、来源、验证状态...";
+        _animationFilter.PlaceholderText = "筛选动画、来源、验证状态；支持 * ? 和 -排除";
         right.Controls.Add(_animationFilter, 0, 1);
 
         ConfigureAnimationGrid();
@@ -254,7 +254,7 @@ internal sealed class MainForm : Form
         left.Controls.Add(_globalAnimationHeader, 0, 0);
 
         _globalAnimationFilter.Dock = DockStyle.Fill;
-        _globalAnimationFilter.PlaceholderText = "筛选动画、路径、证据、验证状态...";
+        _globalAnimationFilter.PlaceholderText = "筛选动画、路径、证据、验证状态；支持 * ? 和 -排除";
         left.Controls.Add(_globalAnimationFilter, 0, 1);
 
         ConfigureGlobalAnimationList();
@@ -316,7 +316,7 @@ internal sealed class MainForm : Form
         left.Controls.Add(_assetHeader, 0, 0);
 
         _assetFilter.Dock = DockStyle.Fill;
-        _assetFilter.PlaceholderText = "筛选贴图/材质、路径、类型、hash...";
+        _assetFilter.PlaceholderText = "筛选贴图/材质、路径、类型、hash；支持 * ? 和 -排除";
         left.Controls.Add(_assetFilter, 0, 1);
 
         ConfigureAssetList();
@@ -358,7 +358,7 @@ internal sealed class MainForm : Form
         left.Controls.Add(_componentHeader, 0, 0);
 
         _componentFilter.Dock = DockStyle.Fill;
-        _componentFilter.PlaceholderText = "筛选蓝图/地图 source path...";
+        _componentFilter.PlaceholderText = "筛选蓝图/地图 source path；支持 * ? 和 -排除";
         left.Controls.Add(_componentFilter, 0, 1);
 
         ConfigureComponentSummaryList();
@@ -785,7 +785,7 @@ internal sealed class MainForm : Form
         if (_index == null)
             return;
 
-        var filter = _modelFilter.Text.Trim();
+        var filter = SearchQuery.Parse(_modelFilter.Text);
         var models = _index.Models
             .Where(x => MatchesModelFilter(x, filter))
             .Where(MatchesModelKindFilter)
@@ -824,7 +824,7 @@ internal sealed class MainForm : Form
         }
 
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
-        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !string.IsNullOrWhiteSpace(filter)));
+        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !filter.IsEmpty));
     }
 
     private void ModelList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
@@ -866,7 +866,7 @@ internal sealed class MainForm : Form
         _index.AnimationsByModel.TryGetValue(key, out var animations);
         animations ??= [];
 
-        var filter = _animationFilter.Text.Trim();
+        var filter = SearchQuery.Parse(_animationFilter.Text);
         var visible = animations
             .Where(x => MatchesAnimationFilter(x, filter))
             .OrderBy(x => RecommendedUseSortKey(x.RecommendedUse))
@@ -913,7 +913,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var filter = _globalAnimationFilter.Text.Trim();
+        var filter = SearchQuery.Parse(_globalAnimationFilter.Text);
         var groups = _index.AnimationGroups
             .Where(x => MatchesGlobalAnimationFilter(x, filter))
             .OrderByDescending(x => x.DefaultTrustedCount)
@@ -1012,7 +1012,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var filter = _assetFilter.Text.Trim();
+        var filter = SearchQuery.Parse(_assetFilter.Text);
         var assets = _index.Textures
             .Concat(_index.Materials)
             .Where(x => MatchesAssetFilter(x, filter))
@@ -1085,7 +1085,7 @@ internal sealed class MainForm : Form
 
     private void RebuildComponentSummaryGrid()
     {
-        var filter = _componentFilter.Text.Trim();
+        var filter = SearchQuery.Parse(_componentFilter.Text);
         var summaries = _componentSummaries
             .Where(x => MatchesComponentSummaryFilter(x, filter))
             .OrderByDescending(x => x.RelationCount)
@@ -1722,81 +1722,68 @@ internal sealed class MainForm : Form
         };
     }
 
-    private static bool MatchesModelFilter(UeLibraryModel model, string filter)
+    private static bool MatchesModelFilter(UeLibraryModel model, SearchQuery filter)
+        => filter.Matches(
+            model.Name,
+            model.Output,
+            model.Source,
+            model.SkeletonPath,
+            model.SkeletonName,
+            model.ResourceKind,
+            model.SourceType,
+            model.ValidationStatus);
+
+    private static bool MatchesAnimationFilter(UeLibraryAnimation animation, SearchQuery filter)
+        => filter.Matches(
+            animation.Name,
+            animation.Output,
+            animation.Source,
+            animation.UsageEvidence,
+            animation.ConfidenceTier,
+            animation.RelationshipKind,
+            animation.RecommendedUse,
+            animation.RelationSource,
+            animation.ValidationStatus,
+            animation.ValidationReason,
+            animation.EvidenceSummary);
+
+    private static bool MatchesGlobalAnimationFilter(UeLibraryAnimationGroup group, SearchQuery filter)
     {
-        if (string.IsNullOrWhiteSpace(filter))
-            return true;
-
-        return Contains(model.Name, filter)
-            || Contains(model.Output, filter)
-            || Contains(model.Source, filter)
-            || Contains(model.SkeletonPath, filter)
-            || Contains(model.ResourceKind, filter)
-            || Contains(model.SourceType, filter);
-    }
-
-    private static bool MatchesAnimationFilter(UeLibraryAnimation animation, string filter)
-    {
-        if (string.IsNullOrWhiteSpace(filter))
-            return true;
-
-        return Contains(animation.Name, filter)
-            || Contains(animation.Output, filter)
-            || Contains(animation.Source, filter)
-            || Contains(animation.UsageEvidence, filter)
-            || Contains(animation.ConfidenceTier, filter)
-            || Contains(animation.RelationshipKind, filter)
-            || Contains(animation.RecommendedUse, filter)
-            || Contains(animation.RelationSource, filter)
-            || Contains(animation.ValidationStatus, filter)
-            || Contains(animation.ValidationReason, filter);
-    }
-
-    private static bool MatchesGlobalAnimationFilter(UeLibraryAnimationGroup group, string filter)
-    {
-        if (string.IsNullOrWhiteSpace(filter))
-            return true;
-
         var animation = group.Representative;
-        return Contains(group.Name, filter)
-            || Contains(group.Output, filter)
-            || Contains(group.Source, filter)
-            || Contains(animation.UsageEvidence, filter)
-            || Contains(animation.ConfidenceTier, filter)
-            || Contains(animation.RelationshipKind, filter)
-            || Contains(animation.RecommendedUse, filter)
-            || Contains(animation.RelationSource, filter)
-            || Contains(animation.ValidationStatus, filter)
-            || Contains(animation.ValidationReason, filter)
-            || group.Usages.Any(x => Contains(x.Model.Name, filter) || Contains(x.Model.Output, filter));
+        return filter.Matches(
+            new[]
+            {
+                group.Name,
+                group.Output,
+                group.Source,
+                animation.UsageEvidence,
+                animation.ConfidenceTier,
+                animation.RelationshipKind,
+                animation.RecommendedUse,
+                animation.RelationSource,
+                animation.ValidationStatus,
+                animation.ValidationReason,
+                animation.EvidenceSummary
+            }.Concat(group.Usages.SelectMany(x => new[] { x.Model.Name, x.Model.Output })));
     }
 
-    private static bool MatchesAssetFilter(UeLibraryAsset asset, string filter)
-    {
-        if (string.IsNullOrWhiteSpace(filter))
-            return true;
+    private static bool MatchesAssetFilter(UeLibraryAsset asset, SearchQuery filter)
+        => filter.Matches(
+            asset.Name,
+            asset.Kind,
+            asset.Output,
+            asset.SharedTexture,
+            asset.Source,
+            asset.SourceType,
+            asset.ResourceKind,
+            asset.Format,
+            asset.Sha256,
+            asset.BlendMode,
+            asset.ShadingModel,
+            asset.ValidationStatus);
 
-        return Contains(asset.Name, filter)
-            || Contains(asset.Kind, filter)
-            || Contains(asset.Output, filter)
-            || Contains(asset.SharedTexture, filter)
-            || Contains(asset.Source, filter)
-            || Contains(asset.SourceType, filter)
-            || Contains(asset.ResourceKind, filter)
-            || Contains(asset.Format, filter)
-            || Contains(asset.Sha256, filter)
-            || Contains(asset.BlendMode, filter)
-            || Contains(asset.ShadingModel, filter);
-    }
-
-    private static bool MatchesComponentSummaryFilter(UeLibraryComponentSummary summary, string filter)
-    {
-        if (string.IsNullOrWhiteSpace(filter))
-            return true;
-
-        return Contains(summary.SourcePath, filter)
-            || Contains(summary.Name, filter);
-    }
+    private static bool MatchesComponentSummaryFilter(UeLibraryComponentSummary summary, SearchQuery filter)
+        => filter.Matches(summary.SourcePath, summary.Name);
 
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
