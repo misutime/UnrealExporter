@@ -1,6 +1,6 @@
 namespace UE5LibraryBrowser;
 
-internal sealed class UeLibraryComponentSummary
+internal sealed class AssetLibraryComponentSummary
 {
     public string SourcePath { get; init; } = "";
     public int RelationCount { get; init; }
@@ -15,7 +15,7 @@ internal sealed class UeLibraryComponentSummary
     public string Name => string.IsNullOrWhiteSpace(SourcePath) ? "(unknown source)" : Path.GetFileNameWithoutExtension(SourcePath);
 }
 
-internal sealed class UeLibraryComponentRelation
+internal sealed class AssetLibraryComponentRelation
 {
     public string OwnerObjectPath { get; init; } = "";
     public string OwnerType { get; init; } = "";

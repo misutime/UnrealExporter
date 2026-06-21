@@ -190,7 +190,7 @@ internal static class Program
     private static void ValidateComponents(string root)
     {
         root = Path.GetFullPath(root);
-        var summaries = UeLibraryComponentRelationReader.LoadSummaries(root);
+        var summaries = AssetLibraryComponentRelationReader.LoadSummaries(root);
         var payload = new
         {
             root,

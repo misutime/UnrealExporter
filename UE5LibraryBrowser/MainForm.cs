@@ -92,8 +92,8 @@ internal sealed class MainForm : Form
     private readonly HashSet<string> _modelThumbnailDisplayRequests = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<AssetLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
     private readonly List<AssetLibraryAsset> _visibleAssets = [];
-    private readonly List<UeLibraryComponentSummary> _componentSummaries = [];
-    private readonly List<UeLibraryComponentSummary> _visibleComponentSummaries = [];
+    private readonly List<AssetLibraryComponentSummary> _componentSummaries = [];
+    private readonly List<AssetLibraryComponentSummary> _visibleComponentSummaries = [];
     private CancellationTokenSource? _componentLoadCts;
     private readonly RecentLibraryStore _recentStore = new();
 
@@ -1384,7 +1384,7 @@ internal sealed class MainForm : Form
         _componentHeader.Text = "组件关系: 正在后台读取 component_asset_relations...";
         try
         {
-            var summaries = await Task.Run(() => UeLibraryComponentRelationReader.LoadSummaries(_root), token);
+            var summaries = await Task.Run(() => AssetLibraryComponentRelationReader.LoadSummaries(_root), token);
             if (token.IsCancellationRequested)
                 return;
 
@@ -1463,7 +1463,7 @@ internal sealed class MainForm : Form
         try
         {
             var sourcePath = summary.SourcePath;
-            var relations = await Task.Run(() => UeLibraryComponentRelationReader.LoadRelationsForSource(_root, sourcePath));
+            var relations = await Task.Run(() => AssetLibraryComponentRelationReader.LoadRelationsForSource(_root, sourcePath));
             if (!string.Equals(GetSelectedComponentSummary()?.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
                 return;
 
@@ -1906,7 +1906,7 @@ internal sealed class MainForm : Form
         return index >= 0 && index < _visibleAssets.Count ? _visibleAssets[index] : null;
     }
 
-    private UeLibraryComponentSummary? GetSelectedComponentSummary()
+    private AssetLibraryComponentSummary? GetSelectedComponentSummary()
     {
         if (_componentSummaryList.SelectedIndices.Count == 0)
             return null;
@@ -1915,10 +1915,10 @@ internal sealed class MainForm : Form
         return index >= 0 && index < _visibleComponentSummaries.Count ? _visibleComponentSummaries[index] : null;
     }
 
-    private UeLibraryComponentRelation? GetSelectedComponentRelation()
+    private AssetLibraryComponentRelation? GetSelectedComponentRelation()
         => _componentRelationGrid.SelectedRows.Count == 0
             ? null
-            : _componentRelationGrid.SelectedRows[0].Tag as UeLibraryComponentRelation;
+            : _componentRelationGrid.SelectedRows[0].Tag as AssetLibraryComponentRelation;
 
     private void RebuildModelKindFilter()
     {
@@ -2269,7 +2269,7 @@ internal sealed class MainForm : Form
             asset.ShadingModel,
             asset.ValidationStatus);
 
-    private static bool MatchesComponentSummaryFilter(UeLibraryComponentSummary summary, SearchQuery filter)
+    private static bool MatchesComponentSummaryFilter(AssetLibraryComponentSummary summary, SearchQuery filter)
         => filter.Matches(summary.SourcePath, summary.Name);
 
     private static bool Contains(string value, string filter)
@@ -2418,7 +2418,7 @@ internal sealed class MainForm : Form
                Validation: {asset.ValidationStatus}
                """;
 
-    private static string BuildComponentSummaryDetails(UeLibraryComponentSummary summary)
+    private static string BuildComponentSummaryDetails(AssetLibraryComponentSummary summary)
         => $"""
            Source: {summary.SourcePath}
            Relations: {summary.RelationCount}
@@ -2431,7 +2431,7 @@ internal sealed class MainForm : Form
            Missing/nonmatched: {summary.MissingReferenceCount}
            """;
 
-    private static string BuildComponentRelationDetails(UeLibraryComponentRelation relation)
+    private static string BuildComponentRelationDetails(AssetLibraryComponentRelation relation)
         => $"""
            Owner: {relation.OwnerObjectPath}
            Owner type: {relation.OwnerType}

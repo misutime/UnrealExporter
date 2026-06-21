@@ -3,9 +3,9 @@ using Microsoft.Data.Sqlite;
 
 namespace UE5LibraryBrowser;
 
-internal static class UeLibraryComponentRelationReader
+internal static class AssetLibraryComponentRelationReader
 {
-    public static List<UeLibraryComponentSummary> LoadSummaries(string root, int limit = 2000)
+    public static List<AssetLibraryComponentSummary> LoadSummaries(string root, int limit = 2000)
     {
         using var connection = Open(root);
         using var command = connection.CreateCommand();
@@ -27,11 +27,11 @@ internal static class UeLibraryComponentRelationReader
             """;
         command.Parameters.AddWithValue("$limit", limit);
 
-        var result = new List<UeLibraryComponentSummary>();
+        var result = new List<AssetLibraryComponentSummary>();
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            result.Add(new UeLibraryComponentSummary
+            result.Add(new AssetLibraryComponentSummary
             {
                 SourcePath = ReadString(reader, 0),
                 RelationCount = ReadInt32(reader, 1),
@@ -48,7 +48,7 @@ internal static class UeLibraryComponentRelationReader
         return result;
     }
 
-    public static List<UeLibraryComponentRelation> LoadRelationsForSource(string root, string sourcePath, int limit = 1000)
+    public static List<AssetLibraryComponentRelation> LoadRelationsForSource(string root, string sourcePath, int limit = 1000)
     {
         using var connection = Open(root);
         using var command = connection.CreateCommand();
@@ -78,11 +78,11 @@ internal static class UeLibraryComponentRelationReader
         command.Parameters.AddWithValue("$sourcePath", sourcePath);
         command.Parameters.AddWithValue("$limit", limit);
 
-        var result = new List<UeLibraryComponentRelation>();
+        var result = new List<AssetLibraryComponentRelation>();
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            result.Add(new UeLibraryComponentRelation
+            result.Add(new AssetLibraryComponentRelation
             {
                 OwnerObjectPath = ReadString(reader, 0),
                 OwnerType = ReadString(reader, 1),
