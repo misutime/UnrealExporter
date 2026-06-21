@@ -115,6 +115,17 @@ internal static class UeLibraryIndexReader
         var hasRecommendedUse = HasColumn(connection, "relation_animations", "recommended_use");
         var hasDeterministicUsage = HasColumn(connection, "relation_animations", "is_deterministic_usage");
         var hasCompatibilityCandidate = HasColumn(connection, "relation_animations", "is_compatibility_candidate");
+        var hasEvidenceSummary = HasColumn(connection, "relation_animations", "evidence_summary");
+        var hasValidationStatus = HasColumn(connection, "relation_animations", "validation_status");
+        var hasValidationCategory = HasColumn(connection, "relation_animations", "validation_category");
+        var hasValidationReason = HasColumn(connection, "relation_animations", "validation_reason");
+        var hasDuration = HasColumn(connection, "relation_animations", "duration");
+        var hasFrameCount = HasColumn(connection, "relation_animations", "frame_count");
+        var hasTrackCount = HasColumn(connection, "relation_animations", "track_count");
+        var hasTrackCoverage = HasColumn(connection, "relation_animations", "track_coverage");
+        var hasHierarchyCompatible = HasColumn(connection, "relation_animations", "hierarchy_compatible");
+        var hasContainerAnimation = HasColumn(connection, "relation_animations", "is_container_animation");
+        var hasUsableCandidate = HasColumn(connection, "relation_animations", "is_usable_candidate");
         var usageEvidenceSelect = hasUsageEvidence
             ? "ra.usage_evidence"
             : """
@@ -159,10 +170,12 @@ internal static class UeLibraryIndexReader
                 ELSE 'unknown'
               END
               """;
+        var validationStatusSelect = hasValidationStatus ? "ra.validation_status" : "''";
+        var usableCandidateSelect = hasUsableCandidate ? "ra.is_usable_candidate" : "1";
         var recommendedUseFallback = $"""
             CASE
-              WHEN COALESCE(ra.is_usable_candidate, 0) = 0 OR LOWER(COALESCE(ra.validation_status, '')) = 'error' THEN 'notUsable'
-              WHEN LOWER(COALESCE(ra.validation_status, '')) <> 'ok' THEN
+              WHEN COALESCE({usableCandidateSelect}, 0) = 0 OR LOWER(COALESCE({validationStatusSelect}, '')) = 'error' THEN 'notUsable'
+              WHEN LOWER(COALESCE({validationStatusSelect}, '')) <> 'ok' THEN
                 CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 'compatibleNeedsReview' ELSE 'manualReview' END
               WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 'defaultTrusted'
               WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 'compatibleCandidate'
@@ -176,6 +189,15 @@ internal static class UeLibraryIndexReader
         var compatibilityCandidateSelect = hasCompatibilityCandidate
             ? "ra.is_compatibility_candidate"
             : $"CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 1 ELSE 0 END";
+        var evidenceSummarySelect = hasEvidenceSummary ? "COALESCE(ra.evidence_summary, '')" : "''";
+        var validationCategorySelect = hasValidationCategory ? "ra.validation_category" : "''";
+        var validationReasonSelect = hasValidationReason ? "ra.validation_reason" : "''";
+        var durationSelect = hasDuration ? "COALESCE(ra.duration, 0)" : "0";
+        var frameCountSelect = hasFrameCount ? "COALESCE(ra.frame_count, 0)" : "0";
+        var trackCountSelect = hasTrackCount ? "COALESCE(ra.track_count, 0)" : "0";
+        var trackCoverageSelect = hasTrackCoverage ? "COALESCE(ra.track_coverage, 0)" : "0";
+        var hierarchyCompatibleSelect = hasHierarchyCompatible ? "ra.hierarchy_compatible" : "0";
+        var containerAnimationSelect = hasContainerAnimation ? "ra.is_container_animation" : "0";
 
         using var command = connection.CreateCommand();
         command.CommandText = $"""
@@ -191,19 +213,19 @@ internal static class UeLibraryIndexReader
                    {confidenceTierSelect},
                    {relationshipKindSelect},
                    {recommendedUseSelect},
-                   COALESCE(ra.evidence_summary, ''),
+                   {evidenceSummarySelect},
                    {deterministicUsageSelect},
                    {compatibilityCandidateSelect},
-                   ra.validation_status,
-                   ra.validation_category,
-                   ra.validation_reason,
-                   COALESCE(ra.duration, 0),
-                   COALESCE(ra.frame_count, 0),
-                   COALESCE(ra.track_count, 0),
-                   COALESCE(ra.track_coverage, 0),
-                   ra.hierarchy_compatible,
-                   ra.is_container_animation,
-                   ra.is_usable_candidate
+                   {validationStatusSelect},
+                   {validationCategorySelect},
+                   {validationReasonSelect},
+                   {durationSelect},
+                   {frameCountSelect},
+                   {trackCountSelect},
+                   {trackCoverageSelect},
+                   {hierarchyCompatibleSelect},
+                   {containerAnimationSelect},
+                   {usableCandidateSelect}
             FROM relation_animations ra
             JOIN model_animation_relations mar ON mar.id = ra.relation_id
             ORDER BY mar.model COLLATE NOCASE,
@@ -214,7 +236,7 @@ internal static class UeLibraryIndexReader
                        WHEN ({recommendedUseSelect}) = 'compatibleNeedsReview' THEN 3
                        ELSE 4
                      END,
-                     ra.is_usable_candidate DESC,
+                     {usableCandidateSelect} DESC,
                      ra.name COLLATE NOCASE;
             """;
 

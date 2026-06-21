@@ -59,16 +59,8 @@ internal sealed class MainForm : Form
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        var root = !string.IsNullOrWhiteSpace(_initialRoot)
-            ? _initialRoot
-            : Directory.Exists(@"F:\UE-Assets\nte-reusable-library")
-                ? @"F:\UE-Assets\nte-reusable-library"
-                : Directory.Exists(@"F:\UE-Assets\nte-useful-assets")
-                    ? @"F:\UE-Assets\nte-useful-assets"
-                    : "";
-
-        if (!string.IsNullOrWhiteSpace(root))
-            await OpenLibraryAsync(root);
+        if (!string.IsNullOrWhiteSpace(_initialRoot))
+            await OpenLibraryAsync(_initialRoot);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
