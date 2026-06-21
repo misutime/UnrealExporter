@@ -12,7 +12,7 @@ internal sealed class MainForm : Form
     private const int LvmSetIconSpacing = LvmFirst + 53;
     private const int LvsExDoubleBuffer = 0x00010000;
     private const int LargeIconCellWidth = 176;
-    private const int LargeIconCellHeight = 226;
+    private const int LargeIconCellHeight = 240;
     private const int ModelPanelPreferredWidth = 1680;
     private const int AnimationPanelMinWidth = 810;
     private const int ThumbnailVirtualPrefetchBefore = 48;
@@ -1634,9 +1634,7 @@ internal sealed class MainForm : Form
                     if (!_modelImageIndices.ContainsKey(key))
                     {
                         var imageIndex = _modelImages.Images.Count;
-                        var image = BuildModelThumbnailImage(model, thumbnail.Image);
-                        thumbnail.Image.Dispose();
-                        _modelImages.Images.Add(key, image);
+                        _modelImages.Images.Add(key, thumbnail.Image);
                         _modelImageIndices[key] = imageIndex;
                     }
                     else
@@ -2088,28 +2086,7 @@ internal sealed class MainForm : Form
         var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
         if (_curationStore?.IsFavoriteModel(model) == true)
             name = "[*] " + name;
-        return $"{name}{Environment.NewLine}动{model.AnimationCount} 可{model.UsableAnimationCount} 信{model.TrustedAnimationCount}";
-    }
-
-    private static Image BuildModelThumbnailImage(UeLibraryModel model, Image source)
-    {
-        var bitmap = new Bitmap(source.Width, source.Height);
-        using var g = Graphics.FromImage(bitmap);
-        g.DrawImage(source, 0, 0, bitmap.Width, bitmap.Height);
-
-        var text = model.AnimationCount > 0
-            ? $"动 {model.AnimationCount}  可 {model.UsableAnimationCount}"
-            : "动 0";
-        using var font = new Font("Segoe UI", Math.Max(10f, bitmap.Height / 13f), FontStyle.Bold);
-        var size = g.MeasureString(text, font);
-        var width = Math.Min(bitmap.Width - 12, (int)Math.Ceiling(size.Width) + 14);
-        var height = Math.Min(bitmap.Height - 8, (int)Math.Ceiling(size.Height) + 6);
-        var rect = new Rectangle(6, bitmap.Height - height - 6, width, height);
-        using var bg = new SolidBrush(Color.FromArgb(190, 12, 16, 20));
-        using var fg = new SolidBrush(Color.WhiteSmoke);
-        g.FillRectangle(bg, rect);
-        g.DrawString(text, font, fg, rect.X + 7, rect.Y + 2);
-        return bitmap;
+        return $"{name}{Environment.NewLine}动画 {model.AnimationCount}";
     }
 
     private bool MatchesModelKindFilter(UeLibraryModel model)
