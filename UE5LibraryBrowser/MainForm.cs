@@ -2510,17 +2510,14 @@ internal sealed class MainForm : Form
 
         if (!animation.IsPreviewable)
         {
-            var match = animation switch
+            var status = animation switch
             {
                 { IsContainerAnimation: true } => "容器",
                 { TrackCount: <= 0 } => "无轨道",
                 _ when !animation.Output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) => "无文件",
                 _ => "不可预览"
             };
-            var status = animation.IsContainerAnimation
-                ? "需合成"
-                : "不可预览";
-            return new AnimationDisplay(match, status, Color.FromArgb(232, 180, 76), Color.FromArgb(36, 28, 10));
+            return new AnimationDisplay("不可用", status, Color.FromArgb(190, 66, 66), Color.White);
         }
 
         if (animation.IsDefaultTrusted
