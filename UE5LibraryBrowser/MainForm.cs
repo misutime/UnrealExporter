@@ -13,7 +13,7 @@ internal sealed class MainForm : Form
     private const int LvsExDoubleBuffer = 0x00010000;
     private const int LargeIconCellWidth = 176;
     private const int LargeIconCellHeight = 156;
-    private const int ModelPanelPreferredWidth = 1400;
+    private const int ModelPanelPreferredWidth = 1680;
     private const int AnimationPanelMinWidth = 900;
     private const int ThumbnailVirtualPrefetchBefore = 48;
     private const int ThumbnailVirtualPrefetchAfter = 192;
@@ -131,7 +131,7 @@ internal sealed class MainForm : Form
         var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 2240, 1220);
         var maxWidth = Math.Max(MinimumSize.Width, area.Width - 80);
         var maxHeight = Math.Max(MinimumSize.Height, area.Height - 80);
-        var targetWidth = Math.Min(Math.Max(2200, (int)(area.Width * 0.72)), maxWidth);
+        var targetWidth = Math.Min(Math.Max(2420, (int)(area.Width * 0.792)), maxWidth);
         var targetHeight = Math.Min(Math.Max(1180, (int)(area.Height * 0.82)), maxHeight);
         Size = new Size(targetWidth, targetHeight);
     }
@@ -606,14 +606,13 @@ internal sealed class MainForm : Form
         _animationGrid.ReadOnly = true;
         _animationGrid.RowHeadersVisible = false;
         _animationGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
         _animationGrid.BackgroundColor = SystemColors.Window;
 
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 58, MinimumWidth = 320 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", FillWeight = 7, MinimumWidth = 70 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", FillWeight = 10, MinimumWidth = 82 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 6, MinimumWidth = 62 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 12, MinimumWidth = 92 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", Width = 420, MinimumWidth = 260 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", Width = 74, MinimumWidth = 64 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", Width = 86, MinimumWidth = 76 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", Width = 68, MinimumWidth = 58 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
@@ -1174,10 +1173,9 @@ internal sealed class MainForm : Form
             var display = GetAnimationDisplay(animation);
             var rowIndex = _animationGrid.Rows.Add(
                 displayName,
-                animation.Duration > 0 ? animation.Duration.ToString("0.###") : "",
+                animation.Duration > 0 ? animation.Duration.ToString("0.00") : "",
                 display.Match,
-                animation.TrackCount,
-                display.Status);
+                animation.TrackCount);
             var row = _animationGrid.Rows[rowIndex];
             row.Tag = animation;
             row.Cells["Match"].Style.BackColor = display.BadgeBackColor;
@@ -2087,7 +2085,7 @@ internal sealed class MainForm : Form
         var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
         if (_curationStore?.IsFavoriteModel(model) == true)
             name = "[*] " + name;
-        return $"{name}{Environment.NewLine}可信 {model.TrustedAnimationCount} 兼容 {model.CompatibleAnimationCount}{Environment.NewLine}预览 {model.UsableAnimationCount} 总 {model.AnimationCount}";
+        return $"{name}{Environment.NewLine}动{model.AnimationCount} 可{model.UsableAnimationCount} 信{model.TrustedAnimationCount}";
     }
 
     private bool MatchesModelKindFilter(UeLibraryModel model)
