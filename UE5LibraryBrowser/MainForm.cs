@@ -28,6 +28,11 @@ internal sealed class MainForm : Form
     private PreviewComposer? _previewComposer;
     private ViewerSafeGltfCache? _viewerSafeCache;
     private CancellationTokenSource? _thumbnailCts;
+    private int _thumbnailTotal;
+    private int _thumbnailCompleted;
+    private int _thumbnailCached;
+    private int _thumbnailFailed;
+    private int _thumbnailActive;
     private string _root = "";
     private string? _initialRoot;
 
@@ -61,6 +66,7 @@ internal sealed class MainForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _thumbnailCts?.Cancel();
+        _thumbnails?.Dispose();
         base.OnFormClosing(e);
     }
 
@@ -233,16 +239,17 @@ internal sealed class MainForm : Form
             _details.Clear();
             _thumbnailCts?.Cancel();
             _thumbnailCts = new CancellationTokenSource();
+            _thumbnails?.Dispose();
 
             var index = await Task.Run(() => UeLibraryIndexReader.Load(root));
             _root = index.Root;
             _index = index;
             _viewerSafeCache = new ViewerSafeGltfCache(_root);
-            _thumbnails = new ThumbnailService(_root, _viewerSafeCache);
+            _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
             _previewComposer = new PreviewComposer(_root, _viewerSafeCache);
 
-            RebuildModelGrid();
             _statusLabel.Text = $"已打开: {_root}";
+            RebuildModelGrid();
         }
         catch (Exception ex)
         {
@@ -272,13 +279,16 @@ internal sealed class MainForm : Form
 
         _modelList.BeginUpdate();
         _modelList.Items.Clear();
+        var thumbnailItems = new List<(UeLibraryModel Model, ListViewItem Item)>(models.Count);
         foreach (var model in models)
         {
-            _modelList.Items.Add(new ListViewItem(BuildModelCardText(model), "__placeholder")
+            var item = new ListViewItem(BuildModelCardText(model), "__placeholder")
             {
                 Tag = model,
                 ToolTipText = BuildModelDetails(model)
-            });
+            };
+            _modelList.Items.Add(item);
+            thumbnailItems.Add((model, item));
         }
         _modelList.EndUpdate();
 
@@ -287,7 +297,7 @@ internal sealed class MainForm : Form
         if (_modelList.Items.Count > 0)
             _modelList.Items[0].Selected = true;
 
-        _ = LoadVisibleThumbnailsAsync(_thumbnailCts?.Token ?? CancellationToken.None);
+        StartThumbnailQueue(thumbnailItems);
     }
 
     private void RebuildAnimationGrid(UeLibraryModel? model)
@@ -337,33 +347,135 @@ internal sealed class MainForm : Form
         ShowSelectedAnimationDetails();
     }
 
-    private async Task LoadVisibleThumbnailsAsync(CancellationToken cancellationToken)
+    private void StartThumbnailQueue(IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> items)
     {
-        if (_thumbnails == null)
+        _thumbnailCts?.Cancel();
+        _thumbnailCts = new CancellationTokenSource();
+        var cancellationToken = _thumbnailCts.Token;
+
+        Interlocked.Exchange(ref _thumbnailTotal, items.Count);
+        Interlocked.Exchange(ref _thumbnailCompleted, 0);
+        Interlocked.Exchange(ref _thumbnailCached, 0);
+        Interlocked.Exchange(ref _thumbnailFailed, 0);
+        Interlocked.Exchange(ref _thumbnailActive, 0);
+        UpdateThumbnailStatus();
+
+        var thumbnails = _thumbnails;
+        if (items.Count == 0 || thumbnails == null)
             return;
 
-        foreach (ListViewItem item in _modelList.Items)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                break;
-            if (item.Tag is not UeLibraryModel model)
-                continue;
+        _ = LoadThumbnailsAsync(items.ToArray(), thumbnails, cancellationToken);
+    }
 
-            try
+    private async Task LoadThumbnailsAsync((UeLibraryModel Model, ListViewItem Item)[] items, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    {
+        var nextIndex = -1;
+        var workerCount = Math.Min(GetThumbnailConcurrency(), items.Length);
+        var workers = Enumerable.Range(0, workerCount)
+            .Select(_ => Task.Run(async () =>
             {
-                var image = await _thumbnails.GetThumbnailAsync(model, cancellationToken);
-                if (!cancellationToken.IsCancellationRequested)
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var index = Interlocked.Increment(ref nextIndex);
+                    if (index >= items.Length)
+                        break;
+
+                    await LoadOneThumbnailAsync(items[index].Model, items[index].Item, thumbnails, cancellationToken);
+                }
+            }, cancellationToken))
+            .ToArray();
+
+        try
+        {
+            await Task.WhenAll(workers);
+        }
+        catch (OperationCanceledException)
+        {
+            // A newer filter/open operation replaced this queue.
+        }
+
+        if (!cancellationToken.IsCancellationRequested)
+            SafeBeginInvoke(UpdateThumbnailStatus);
+    }
+
+    private async Task LoadOneThumbnailAsync(UeLibraryModel model, ListViewItem item, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _thumbnailActive);
+        try
+        {
+            var thumbnail = await thumbnails.GetThumbnailAsync(model, cancellationToken).ConfigureAwait(false);
+            if (thumbnail.FromCache)
+                Interlocked.Increment(ref _thumbnailCached);
+            else if (!thumbnail.Success)
+                Interlocked.Increment(ref _thumbnailFailed);
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                SafeBeginInvoke(() =>
                 {
                     var key = model.Output;
                     if (!_modelImages.Images.ContainsKey(key))
-                        _modelImages.Images.Add(key, image);
+                        _modelImages.Images.Add(key, thumbnail.Image);
                     item.ImageKey = key;
-                }
+                    UpdateThumbnailStatus();
+                });
             }
-            catch
+            else
             {
-                // Thumbnail failures should not block browsing.
+                thumbnail.Image.Dispose();
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // RebuildModelGrid cancels obsolete thumbnail queues.
+        }
+        catch
+        {
+            Interlocked.Increment(ref _thumbnailFailed);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _thumbnailActive);
+            Interlocked.Increment(ref _thumbnailCompleted);
+            if (!cancellationToken.IsCancellationRequested)
+                SafeBeginInvoke(UpdateThumbnailStatus);
+        }
+    }
+
+    private void UpdateThumbnailStatus()
+    {
+        var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
+        if (total == 0)
+        {
+            _statusLabel.Text = string.IsNullOrWhiteSpace(_root)
+                ? "请选择 UE5 素材库"
+                : $"已打开: {_root} | 缩略图 0/0";
+            return;
+        }
+
+        var completed = Math.Min(total, Math.Max(0, Volatile.Read(ref _thumbnailCompleted)));
+        var active = Math.Max(0, Volatile.Read(ref _thumbnailActive));
+        var queued = Math.Max(0, total - completed - active);
+        var cached = Math.Max(0, Volatile.Read(ref _thumbnailCached));
+        var failed = Math.Max(0, Volatile.Read(ref _thumbnailFailed));
+        var state = completed >= total ? "完成" : "后台生成";
+        var renderer = _thumbnails?.RendererLabel ?? "OpenGL worker";
+        _statusLabel.Text = $"已打开: {_root} | 缩略图{state} {completed}/{total} | 缓存 {cached} | 失败 {failed} | 队列 {queued} | 运行 {active} | 并发 {GetThumbnailConcurrency()} | {renderer}";
+    }
+
+    private static int GetThumbnailConcurrency()
+        => Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+
+    private void SafeBeginInvoke(Action action)
+    {
+        try
+        {
+            if (!IsDisposed && IsHandleCreated)
+                BeginInvoke(action);
+        }
+        catch
+        {
+            // The form may be closing while background thumbnail workers finish.
         }
     }
 
