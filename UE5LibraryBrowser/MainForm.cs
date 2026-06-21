@@ -21,6 +21,10 @@ internal sealed class MainForm : Form
     private readonly ToolStripButton _refreshButton = new("刷新");
     private readonly ToolStripButton _openModelButton = new("打开模型");
     private readonly ToolStripButton _openFolderButton = new("打开目录");
+    private readonly ToolStripButton _clearFilterButton = new("清除筛选");
+    private readonly ToolStripLabel _modelKindLabel = new("类型");
+    private readonly ToolStripLabel _modelQualityLabel = new("质量");
+    private readonly ToolStripLabel _thumbnailStateLabel = new("缩略图");
     private readonly ToolStripComboBox _modelKindBox = new();
     private readonly ToolStripComboBox _modelQualityBox = new();
     private readonly ToolStripComboBox _thumbnailStateBox = new();
@@ -88,6 +92,7 @@ internal sealed class MainForm : Form
     private int _thumbnailCandidateTotal;
     private string _root = "";
     private string? _initialRoot;
+    private bool _suppressFilterEvents;
 
     public MainForm(string? initialRoot)
     {
@@ -134,12 +139,13 @@ internal sealed class MainForm : Form
             new ToolStripSeparator(),
             _openModelButton,
             _openFolderButton,
+            _clearFilterButton,
             new ToolStripSeparator(),
-            new ToolStripLabel("类型"),
+            _modelKindLabel,
             _modelKindBox,
-            new ToolStripLabel("质量"),
+            _modelQualityLabel,
             _modelQualityBox,
-            new ToolStripLabel("缩略图"),
+            _thumbnailStateLabel,
             _thumbnailStateBox,
             _showFavoriteModelsButton,
             _hideIgnoredButton,
@@ -224,6 +230,7 @@ internal sealed class MainForm : Form
         BuildGlobalAnimationPage();
         BuildAssetPage();
         BuildComponentPage();
+        UpdateToolbarForActiveTab();
     }
 
     private void BuildGlobalAnimationPage()
@@ -642,36 +649,38 @@ internal sealed class MainForm : Form
         };
         _openModelButton.Click += (_, _) => OpenSelectedModel();
         _openFolderButton.Click += (_, _) => OpenSelectedModelFolder();
-        _modelFilter.TextChanged += (_, _) => RebuildModelGrid();
-        _modelKindBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
-        _modelQualityBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
-        _thumbnailStateBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
-        _showFavoriteModelsButton.CheckedChanged += (_, _) => RebuildModelGrid();
-        _hideIgnoredButton.CheckedChanged += (_, _) => RebuildModelGrid();
-        _animationFilter.TextChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
+        _clearFilterButton.Click += (_, _) => ClearActiveFilters();
+        _modelFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _modelKindBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _modelQualityBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _thumbnailStateBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _showFavoriteModelsButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _hideIgnoredButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        _animationFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildAnimationGrid(GetSelectedModel()); };
         _modelList.SelectedIndexChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
         _modelList.DoubleClick += (_, _) => OpenSelectedModel();
         _modelList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_modelList, e);
         _animationGrid.SelectionChanged += (_, _) => ShowSelectedAnimationDetails();
         _animationGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedAnimationAsync();
         _animationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_animationGrid, e);
-        _globalAnimationFilter.TextChanged += (_, _) => RebuildGlobalAnimationList();
+        _globalAnimationFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildGlobalAnimationList(); };
         _globalAnimationList.SelectedIndexChanged += (_, _) => RebuildGlobalAnimationModelsGrid();
         _globalAnimationList.DoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
         _globalAnimationList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_globalAnimationList, e);
         _globalAnimationModelsGrid.SelectionChanged += (_, _) => ShowSelectedGlobalAnimationUsageDetails();
         _globalAnimationModelsGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
         _globalAnimationModelsGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_globalAnimationModelsGrid, e);
-        _assetFilter.TextChanged += (_, _) => RebuildAssetGrid();
+        _assetFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildAssetGrid(); };
         _assetList.SelectedIndexChanged += (_, _) => ShowSelectedAssetDetails();
         _assetList.DoubleClick += (_, _) => OpenSelectedAsset();
         _assetList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_assetList, e);
         _mainTabs.SelectedIndexChanged += (_, _) =>
         {
+            UpdateToolbarForActiveTab();
             if (_mainTabs.SelectedTab == _componentsPage)
                 _ = EnsureComponentSummariesLoadedAsync();
         };
-        _componentFilter.TextChanged += (_, _) => RebuildComponentSummaryGrid();
+        _componentFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildComponentSummaryGrid(); };
         _componentSummaryList.SelectedIndexChanged += async (_, _) => await LoadSelectedComponentRelationsAsync();
         _componentSummaryList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_componentSummaryList, e);
         _componentRelationGrid.SelectionChanged += (_, _) => ShowSelectedComponentRelationDetails();
@@ -703,6 +712,82 @@ internal sealed class MainForm : Form
             return recent;
 
         return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    }
+
+    private void UpdateToolbarForActiveTab()
+    {
+        var isModelTab = _mainTabs.SelectedTab == _modelsPage;
+        _openModelButton.Visible = isModelTab;
+        _openFolderButton.Visible = isModelTab;
+        _modelKindLabel.Visible = isModelTab;
+        _modelKindBox.Visible = isModelTab;
+        _modelQualityLabel.Visible = isModelTab;
+        _modelQualityBox.Visible = isModelTab;
+        _thumbnailStateLabel.Visible = isModelTab;
+        _thumbnailStateBox.Visible = isModelTab;
+        _showFavoriteModelsButton.Visible = isModelTab;
+        _hideIgnoredButton.Visible = isModelTab;
+
+        _clearFilterButton.ToolTipText = _mainTabs.SelectedTab switch
+        {
+            var tab when tab == _modelsPage => "清除模型页和当前模型动画筛选",
+            var tab when tab == _globalAnimationsPage => "清除全局动画筛选",
+            var tab when tab == _assetsPage => "清除贴图材质筛选",
+            var tab when tab == _componentsPage => "清除组件关系筛选",
+            _ => "清除当前筛选"
+        };
+    }
+
+    private void ClearActiveFilters()
+    {
+        _suppressFilterEvents = true;
+        try
+        {
+            if (_mainTabs.SelectedTab == _modelsPage)
+            {
+                _modelFilter.Clear();
+                _animationFilter.Clear();
+                _modelKindBox.SelectedItem = "All";
+                _modelQualityBox.SelectedIndex = 0;
+                _thumbnailStateBox.SelectedIndex = 0;
+                _showFavoriteModelsButton.Checked = false;
+                _hideIgnoredButton.Checked = true;
+            }
+            else if (_mainTabs.SelectedTab == _globalAnimationsPage)
+            {
+                _globalAnimationFilter.Clear();
+            }
+            else if (_mainTabs.SelectedTab == _assetsPage)
+            {
+                _assetFilter.Clear();
+            }
+            else if (_mainTabs.SelectedTab == _componentsPage)
+            {
+                _componentFilter.Clear();
+            }
+        }
+        finally
+        {
+            _suppressFilterEvents = false;
+        }
+
+        if (_mainTabs.SelectedTab == _modelsPage)
+        {
+            RebuildModelGrid();
+            RebuildAnimationGrid(GetSelectedModel());
+        }
+        else if (_mainTabs.SelectedTab == _globalAnimationsPage)
+        {
+            RebuildGlobalAnimationList();
+        }
+        else if (_mainTabs.SelectedTab == _assetsPage)
+        {
+            RebuildAssetGrid();
+        }
+        else if (_mainTabs.SelectedTab == _componentsPage)
+        {
+            RebuildComponentSummaryGrid();
+        }
     }
 
     private void RebuildRecentMenu()
