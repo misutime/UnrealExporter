@@ -605,18 +605,14 @@ internal sealed class MainForm : Form
         _animationGrid.ReadOnly = true;
         _animationGrid.RowHeadersVisible = false;
         _animationGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _animationGrid.BackgroundColor = SystemColors.Window;
 
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", Width = 260, MinimumWidth = 160 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Recommended", HeaderText = "推荐", Width = 86, MinimumWidth = 70 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relationship", HeaderText = "关系", Width = 92, MinimumWidth = 76 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Confidence", HeaderText = "置信", Width = 94, MinimumWidth = 78 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "来源", Width = 110, MinimumWidth = 82 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Validation", HeaderText = "验证", Width = 90, MinimumWidth = 74 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时长", Width = 64, MinimumWidth = 58 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", Width = 64, MinimumWidth = 58 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", Width = 360, MinimumWidth = 180 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 64, MinimumWidth = 360 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", FillWeight = 13, MinimumWidth = 96 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", FillWeight = 7, MinimumWidth = 70 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 6, MinimumWidth = 62 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 10, MinimumWidth = 96 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
@@ -1166,18 +1162,19 @@ internal sealed class MainForm : Form
             var displayName = _curationStore?.IsFavoriteAnimation(animation) == true
                 ? "[*] " + animation.Name
                 : animation.Name;
+            var display = GetAnimationDisplay(animation);
             var rowIndex = _animationGrid.Rows.Add(
                 displayName,
-                DisplayRecommendedUse(animation),
-                DisplayRelationshipKind(animation),
-                string.IsNullOrWhiteSpace(animation.ConfidenceTier) ? DisplayUsageEvidence(animation) : animation.ConfidenceTier,
-                animation.RelationSource,
-                string.IsNullOrWhiteSpace(animation.ValidationStatus) ? animation.Status : animation.ValidationStatus,
+                display.Match,
                 animation.Duration > 0 ? animation.Duration.ToString("0.###") : "",
                 animation.TrackCount,
-                animation.Output);
+                display.Status);
             var row = _animationGrid.Rows[rowIndex];
             row.Tag = animation;
+            row.Cells["Match"].Style.BackColor = display.BadgeBackColor;
+            row.Cells["Match"].Style.ForeColor = display.BadgeForeColor;
+            row.Cells["Match"].Style.SelectionBackColor = display.BadgeBackColor;
+            row.Cells["Match"].Style.SelectionForeColor = display.BadgeForeColor;
             SetRowTooltip(row, BuildAnimationDetails(model, animation));
             if (!animation.IsPreviewable)
                 row.DefaultCellStyle.ForeColor = Color.DimGray;
@@ -2492,6 +2489,53 @@ internal sealed class MainForm : Form
             "unknown" => "未知",
             _ => string.IsNullOrWhiteSpace(animation.RelationshipKind) ? "未知" : animation.RelationshipKind
         };
+
+    private readonly record struct AnimationDisplay(string Match, string Status, Color BadgeBackColor, Color BadgeForeColor);
+
+    private static AnimationDisplay GetAnimationDisplay(UeLibraryAnimation animation)
+    {
+        if (string.Equals(animation.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(animation.RecommendedUse, "notUsable", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AnimationDisplay("不可用", "验证失败", Color.FromArgb(204, 64, 64), Color.White);
+        }
+
+        if (!animation.IsPreviewable)
+        {
+            var status = animation switch
+            {
+                { IsContainerAnimation: true } => "容器动画",
+                { TrackCount: <= 0 } => "Track 0",
+                _ when !animation.Output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) => "无独立动画",
+                _ => "不可预览"
+            };
+            return new AnimationDisplay("需上下文", status, Color.FromArgb(232, 180, 76), Color.FromArgb(36, 28, 10));
+        }
+
+        if (animation.IsDefaultTrusted
+            || animation.IsDeterministicUsage
+            || animation.IsExplicitUsage
+            || string.Equals(animation.RelationshipKind, "deterministicUsage", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AnimationDisplay("确定", "可预览", Color.FromArgb(43, 150, 92), Color.White);
+        }
+
+        if (animation.IsCompatibilityCandidate
+            || animation.IsSkeletonCompatible
+            || string.Equals(animation.RecommendedUse, "compatibleCandidate", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(animation.RelationshipKind, "compatibilityCandidate", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AnimationDisplay("兼容", "可预览", Color.FromArgb(225, 176, 66), Color.FromArgb(35, 28, 10));
+        }
+
+        if (string.Equals(animation.RecommendedUse, "manualReview", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(animation.RecommendedUse, "compatibleNeedsReview", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AnimationDisplay("需复查", "待确认", Color.FromArgb(197, 143, 50), Color.White);
+        }
+
+        return new AnimationDisplay("未知", "待确认", Color.FromArgb(128, 128, 128), Color.White);
+    }
 
     private static int RecommendedUseSortKey(string value)
         => value switch
