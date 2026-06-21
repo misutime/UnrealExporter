@@ -26,7 +26,7 @@ namespace UE5LibraryBrowser
                 _threads[i] = new Thread(RenderLoop)
                 {
                     IsBackground = true,
-                    Name = $"UE5LibraryBrowser GL Thumbnail Worker Bridge {i + 1}"
+                    Name = $"AssetLibraryBrowser GL Thumbnail Worker Bridge {i + 1}"
                 };
                 _threads[i].Start();
             }
@@ -178,7 +178,7 @@ namespace UE5LibraryBrowser
                 var dll = Assembly.GetExecutingAssembly().Location;
                 if (string.IsNullOrWhiteSpace(dll) || !File.Exists(dll))
                 {
-                    throw new FileNotFoundException("无法定位当前 UE5LibraryBrowser dll。");
+                    throw new FileNotFoundException("无法定位当前 AssetLibraryBrowser dll。");
                 }
 
                 var startInfo = new ProcessStartInfo

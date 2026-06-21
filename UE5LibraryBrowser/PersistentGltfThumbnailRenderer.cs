@@ -42,7 +42,7 @@ namespace UE5LibraryBrowser
                 StartVisible = false,
                 APIVersion = new Version(3, 3),
                 Profile = ContextProfile.Core,
-                Title = "UE5LibraryBrowser Thumbnail Renderer"
+                Title = "AssetLibraryBrowser Thumbnail Renderer"
             };
             _window = new OpenTkNativeWindow(settings);
             _window.MakeCurrent();

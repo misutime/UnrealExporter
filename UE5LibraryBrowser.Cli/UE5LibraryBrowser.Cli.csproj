@@ -6,7 +6,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyName>UE5LibraryBrowser.Cli</AssemblyName>
+    <AssemblyName>AssetLibraryBrowser.Cli</AssemblyName>
     <RootNamespace>UE5LibraryBrowser.Cli</RootNamespace>
   </PropertyGroup>
 

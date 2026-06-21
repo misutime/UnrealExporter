@@ -9,7 +9,7 @@ internal sealed record PreviewResult(bool Success, string OutputPath, string Rep
 
 internal sealed class PreviewComposer
 {
-    private const string PreviewCacheVersion = "preview-v3-conservative-trs-no-scale";
+    private const string PreviewCacheVersion = "preview-v4-f3d-stable-skinning";
     private readonly AssetLibraryIndex _index;
     private readonly string _libraryRoot;
     private readonly string _cacheRoot;
@@ -178,6 +178,8 @@ internal sealed class PreviewComposer
         }
 
         var start = new ProcessStartInfo(f3d) { UseShellExecute = false };
+        start.ArgumentList.Add("--no-config");
+        start.ArgumentList.Add("--blending=none");
         start.ArgumentList.Add("--tone-mapping");
         start.ArgumentList.Add("--hdri-ambient");
         start.ArgumentList.Add("--anti-aliasing=fxaa");

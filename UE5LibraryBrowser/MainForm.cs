@@ -820,7 +820,7 @@ internal sealed class MainForm : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "选择 UnrealExporter 生成的 UE5 素材库根目录",
+            Description = "选择统一 3D 素材库根目录",
             SelectedPath = ChooseInitialBrowsePath()
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
@@ -850,9 +850,11 @@ internal sealed class MainForm : Form
         if (Directory.Exists(_root))
             return _root;
 
-        var dDriveAssets = @"D:\UE5-Assets";
-        if (Directory.Exists(dDriveAssets))
-            return dDriveAssets;
+        foreach (var candidate in new[] { @"D:\Assets", @"D:\UE5-Assets" })
+        {
+            if (Directory.Exists(candidate))
+                return candidate;
+        }
 
         var recent = _recentStore.Load().FirstOrDefault();
         if (!string.IsNullOrWhiteSpace(recent) && Directory.Exists(recent))
@@ -1749,7 +1751,7 @@ internal sealed class MainForm : Form
         if (total == 0)
         {
             _statusLabel.Text = string.IsNullOrWhiteSpace(_root)
-                ? "请选择 UE5 素材库"
+            ? "请选择素材库"
                 : $"已打开: {_root} | 缩略图 0/0";
             return;
         }
@@ -2628,8 +2630,8 @@ internal sealed class MainForm : Form
         g.DrawRectangle(pen, 18, 18, 92, 92);
         using var brush = new SolidBrush(Color.WhiteSmoke);
         using var font = new Font("Segoe UI", 12, FontStyle.Bold);
-        var size = g.MeasureString("UE5", font);
-        g.DrawString("UE5", font, brush, (bitmap.Width - size.Width) / 2f, (bitmap.Height - size.Height) / 2f);
+        var size = g.MeasureString("3D", font);
+        g.DrawString("3D", font, brush, (bitmap.Width - size.Width) / 2f, (bitmap.Height - size.Height) / 2f);
         return bitmap;
     }
 

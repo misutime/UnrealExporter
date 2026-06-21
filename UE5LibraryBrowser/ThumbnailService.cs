@@ -9,7 +9,7 @@ namespace UE5LibraryBrowser;
 
 internal sealed class ThumbnailService : IDisposable
 {
-    private const string ThumbnailCacheVersion = "opengl-v2-alpha-aware";
+    private const string ThumbnailCacheVersion = "opengl-v3-f3d-stable-skinning";
     private readonly string _cacheRoot;
     private readonly string? _f3dConsole;
     private readonly ViewerSafeGltfCache _viewerSafeCache;
@@ -115,7 +115,8 @@ internal sealed class ThumbnailService : IDisposable
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
-        start.ArgumentList.Add("--blending=ddp");
+        start.ArgumentList.Add("--no-config");
+        start.ArgumentList.Add("--blending=none");
         start.ArgumentList.Add("--tone-mapping");
         start.ArgumentList.Add("--hdri-ambient");
         start.ArgumentList.Add("--anti-aliasing=fxaa");
@@ -173,7 +174,7 @@ internal sealed class ThumbnailService : IDisposable
         using var font = new Font("Segoe UI", 10, FontStyle.Bold);
         using var small = new Font("Segoe UI", 8);
         using var brush = new SolidBrush(Color.WhiteSmoke);
-        var text = string.IsNullOrWhiteSpace(model.Name) ? "UE5 Model" : model.Name;
+        var text = string.IsNullOrWhiteSpace(model.Name) ? "3D Model" : model.Name;
         g.DrawString(Trim(text, 24), font, brush, new RectangleF(24, 54, bitmap.Width - 48, 24));
         g.DrawString($"{model.UsableAnimationCount}/{model.AnimationCount} animations", small, brush, new RectangleF(24, 82, bitmap.Width - 48, 22));
         return bitmap;

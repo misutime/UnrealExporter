@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <DebugType>embedded</DebugType>
-    <AssemblyName>UE5LibraryBrowser</AssemblyName>
+    <AssemblyName>AssetLibraryBrowser</AssemblyName>
     <RootNamespace>UE5LibraryBrowser</RootNamespace>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>
