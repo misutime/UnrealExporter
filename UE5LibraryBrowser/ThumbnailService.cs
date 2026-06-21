@@ -20,7 +20,7 @@ internal sealed class ThumbnailService : IDisposable
 
     public ThumbnailService(string libraryRoot, ViewerSafeGltfCache viewerSafeCache, int maxConcurrency)
     {
-        _cacheRoot = Path.Combine(libraryRoot, ".ue5_browser_cache", "thumbnails", ThumbnailCacheVersion);
+        _cacheRoot = Path.Combine(libraryRoot, ".asset_browser_cache", "thumbnails", ThumbnailCacheVersion);
         Directory.CreateDirectory(_cacheRoot);
         _viewerSafeCache = viewerSafeCache;
         _f3dConsole = ToolLocator.FindF3dConsole();

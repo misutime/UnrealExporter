@@ -14,7 +14,7 @@ internal sealed class AssetLibraryCurationStore
     public AssetLibraryCurationStore(string root)
     {
         _root = Path.GetFullPath(root);
-        var browserDir = Path.Combine(_root, ".ue5_browser_cache");
+        var browserDir = Path.Combine(_root, ".asset_browser_cache");
         Directory.CreateDirectory(browserDir);
         _path = Path.Combine(browserDir, "curation_marks.jsonl");
         Load();

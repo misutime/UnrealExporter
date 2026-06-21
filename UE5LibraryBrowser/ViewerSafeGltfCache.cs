@@ -13,7 +13,7 @@ internal sealed class ViewerSafeGltfCache
 
     public ViewerSafeGltfCache(string libraryRoot)
     {
-        _cacheRoot = Path.Combine(libraryRoot, ".ue5_browser_cache", "viewer_safe_models");
+        _cacheRoot = Path.Combine(libraryRoot, ".asset_browser_cache", "viewer_safe_models");
         Directory.CreateDirectory(_cacheRoot);
     }
 
