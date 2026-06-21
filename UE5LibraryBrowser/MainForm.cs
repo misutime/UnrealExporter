@@ -1,10 +1,17 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 
 namespace UE5LibraryBrowser;
 
 internal sealed class MainForm : Form
 {
+    private const int LvmFirst = 0x1000;
+    private const int LvmSetExtendedListViewStyle = LvmFirst + 54;
+    private const int LvmSetIconSpacing = LvmFirst + 53;
+    private const int LvsExDoubleBuffer = 0x00010000;
+    private const int LargeIconCellWidth = 176;
+    private const int LargeIconCellHeight = 156;
     private const int MaxUnfilteredThumbnailItems = 360;
     private const int MaxFilteredThumbnailItems = 1200;
     private readonly ToolStrip _toolbar = new();
@@ -24,6 +31,8 @@ internal sealed class MainForm : Form
     private readonly Label _animationHeader = new();
     private readonly TextBox _details = new();
     private readonly Image _placeholder = BuildPlaceholderImage();
+    private readonly List<UeLibraryModel> _visibleModels = [];
+    private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
 
     private UeLibraryIndex? _index;
     private ThumbnailService? _thumbnails;
@@ -160,6 +169,13 @@ internal sealed class MainForm : Form
         _modelList.Sorting = SortOrder.None;
         _modelList.BackColor = SystemColors.Window;
         _modelList.BorderStyle = BorderStyle.FixedSingle;
+        _modelList.VirtualMode = true;
+        _modelList.RetrieveVirtualItem += ModelList_RetrieveVirtualItem;
+        _modelList.HandleCreated += (_, _) =>
+        {
+            EnableListViewDoubleBuffer(_modelList);
+            SetLargeIconSpacing(_modelList);
+        };
 
         _modelMenu.Items.Add("复制模型路径", null, (_, _) => CopySelectedModelPath());
         _modelMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedModelSource());
@@ -281,31 +297,52 @@ internal sealed class MainForm : Form
             .ToList();
 
         _modelList.BeginUpdate();
-        _modelList.Items.Clear();
-        var thumbnailItems = new List<(UeLibraryModel Model, ListViewItem Item)>(models.Count);
-        foreach (var model in models)
+        _visibleModels.Clear();
+        _visibleModelIndices.Clear();
+        _visibleModels.AddRange(models);
+        for (var i = 0; i < _visibleModels.Count; i++)
         {
-            var item = new ListViewItem(BuildModelCardText(model), "__placeholder")
-            {
-                Tag = model,
-                ToolTipText = BuildModelDetails(model)
-            };
-            _modelList.Items.Add(item);
-            thumbnailItems.Add((model, item));
+            _visibleModelIndices[_visibleModels[i].Output] = i;
         }
+        _modelList.VirtualListSize = _visibleModels.Count;
         _modelList.EndUpdate();
 
         _modelHeader.Text = $"模型 {models.Count}/{_index.Models.Count}";
         _animationHeader.Text = "动画";
-        if (_modelList.Items.Count > 0)
-            _modelList.Items[0].Selected = true;
+        if (_modelList.VirtualListSize > 0)
+        {
+            _modelList.SelectedIndices.Clear();
+            _modelList.SelectedIndices.Add(0);
+            _modelList.EnsureVisible(0);
+        }
+        else
+        {
+            RebuildAnimationGrid(null);
+        }
 
-        Interlocked.Exchange(ref _thumbnailCandidateTotal, thumbnailItems.Count);
-        StartThumbnailQueue(LimitThumbnailItems(thumbnailItems, !string.IsNullOrWhiteSpace(filter)));
+        Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
+        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !string.IsNullOrWhiteSpace(filter)));
     }
 
-    private static IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> LimitThumbnailItems(
-        IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> items,
+    private void ModelList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    {
+        if (e.ItemIndex < 0 || e.ItemIndex >= _visibleModels.Count)
+        {
+            e.Item = new ListViewItem("");
+            return;
+        }
+
+        var model = _visibleModels[e.ItemIndex];
+        var imageKey = _modelImages.Images.ContainsKey(model.Output) ? model.Output : "__placeholder";
+        e.Item = new ListViewItem(BuildModelCardText(model), imageKey)
+        {
+            Tag = model,
+            ToolTipText = BuildModelDetails(model)
+        };
+    }
+
+    private static IReadOnlyList<UeLibraryModel> LimitThumbnailItems(
+        IReadOnlyList<UeLibraryModel> items,
         bool hasFilter)
     {
         var limit = hasFilter ? MaxFilteredThumbnailItems : MaxUnfilteredThumbnailItems;
@@ -359,7 +396,7 @@ internal sealed class MainForm : Form
         ShowSelectedAnimationDetails();
     }
 
-    private void StartThumbnailQueue(IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> items)
+    private void StartThumbnailQueue(IReadOnlyList<UeLibraryModel> items)
     {
         _thumbnailCts?.Cancel();
         _thumbnailCts = new CancellationTokenSource();
@@ -379,7 +416,7 @@ internal sealed class MainForm : Form
         _ = LoadThumbnailsAsync(items.ToArray(), thumbnails, cancellationToken);
     }
 
-    private async Task LoadThumbnailsAsync((UeLibraryModel Model, ListViewItem Item)[] items, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    private async Task LoadThumbnailsAsync(UeLibraryModel[] items, ThumbnailService thumbnails, CancellationToken cancellationToken)
     {
         var nextIndex = -1;
         var workerCount = Math.Min(GetThumbnailConcurrency(), items.Length);
@@ -392,7 +429,7 @@ internal sealed class MainForm : Form
                     if (index >= items.Length)
                         break;
 
-                    await LoadOneThumbnailAsync(items[index].Model, items[index].Item, thumbnails, cancellationToken);
+                    await LoadOneThumbnailAsync(items[index], thumbnails, cancellationToken);
                 }
             }, cancellationToken))
             .ToArray();
@@ -410,7 +447,7 @@ internal sealed class MainForm : Form
             SafeBeginInvoke(UpdateThumbnailStatus);
     }
 
-    private async Task LoadOneThumbnailAsync(UeLibraryModel model, ListViewItem item, ThumbnailService thumbnails, CancellationToken cancellationToken)
+    private async Task LoadOneThumbnailAsync(UeLibraryModel model, ThumbnailService thumbnails, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _thumbnailActive);
         try
@@ -428,7 +465,10 @@ internal sealed class MainForm : Form
                     var key = model.Output;
                     if (!_modelImages.Images.ContainsKey(key))
                         _modelImages.Images.Add(key, thumbnail.Image);
-                    item.ImageKey = key;
+                    if (_visibleModelIndices.TryGetValue(key, out var index) && index >= 0 && index < _modelList.VirtualListSize)
+                    {
+                        _modelList.RedrawItems(index, index, false);
+                    }
                     UpdateThumbnailStatus();
                 });
             }
@@ -541,7 +581,13 @@ internal sealed class MainForm : Form
     }
 
     private UeLibraryModel? GetSelectedModel()
-        => _modelList.SelectedItems.Count == 0 ? null : _modelList.SelectedItems[0].Tag as UeLibraryModel;
+    {
+        if (_modelList.SelectedIndices.Count == 0)
+            return null;
+
+        var index = _modelList.SelectedIndices[0];
+        return index >= 0 && index < _visibleModels.Count ? _visibleModels[index] : null;
+    }
 
     private UeLibraryAnimation? GetSelectedAnimation()
         => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as UeLibraryAnimation;
@@ -589,13 +635,21 @@ internal sealed class MainForm : Form
         if (e.Button != MouseButtons.Right)
             return;
 
-        var item = list.GetItemAt(e.X, e.Y);
-        if (item == null)
+        var hit = list.HitTest(e.X, e.Y);
+        if (hit.Item == null)
             return;
 
+        if (list.VirtualMode)
+        {
+            list.SelectedIndices.Clear();
+            list.SelectedIndices.Add(hit.Item.Index);
+            hit.Item.Focused = true;
+            return;
+        }
+
         list.SelectedItems.Clear();
-        item.Selected = true;
-        item.Focused = true;
+        hit.Item.Selected = true;
+        hit.Item.Focused = true;
     }
 
     private static void SelectGridRowOnRightClick(DataGridView grid, MouseEventArgs e)
@@ -763,4 +817,22 @@ internal sealed class MainForm : Form
         g.DrawString("UE5", font, brush, 48, 34);
         return bitmap;
     }
+
+    private static void SetLargeIconSpacing(ListView list)
+    {
+        if (list.IsHandleCreated)
+            SendMessage(list.Handle, LvmSetIconSpacing, IntPtr.Zero, MakeLParam(LargeIconCellWidth, LargeIconCellHeight));
+    }
+
+    private static void EnableListViewDoubleBuffer(ListView list)
+    {
+        if (list.IsHandleCreated)
+            SendMessage(list.Handle, LvmSetExtendedListViewStyle, (IntPtr)LvsExDoubleBuffer, (IntPtr)LvsExDoubleBuffer);
+    }
+
+    private static IntPtr MakeLParam(int low, int high)
+        => (IntPtr)((high << 16) | (low & 0xffff));
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 }
