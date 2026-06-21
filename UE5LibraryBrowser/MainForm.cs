@@ -12,9 +12,9 @@ internal sealed class MainForm : Form
     private const int LvmSetIconSpacing = LvmFirst + 53;
     private const int LvsExDoubleBuffer = 0x00010000;
     private const int LargeIconCellWidth = 176;
-    private const int LargeIconCellHeight = 156;
+    private const int LargeIconCellHeight = 226;
     private const int ModelPanelPreferredWidth = 1680;
-    private const int AnimationPanelMinWidth = 900;
+    private const int AnimationPanelMinWidth = 810;
     private const int ThumbnailVirtualPrefetchBefore = 48;
     private const int ThumbnailVirtualPrefetchAfter = 192;
     private const int ThumbnailVirtualBatchLimit = 720;
@@ -559,7 +559,7 @@ internal sealed class MainForm : Form
 
     private void ConfigureModelList()
     {
-        _modelImages.ImageSize = new Size(168, 118);
+        _modelImages.ImageSize = new Size(168, 168);
         _modelImages.ColorDepth = ColorDepth.Depth32Bit;
         _modelImages.Images.Add("__placeholder", _placeholder);
         _modelImageIndices["__placeholder"] = 0;
@@ -569,6 +569,7 @@ internal sealed class MainForm : Form
         _modelList.LargeImageList = _modelImages;
         _modelList.MultiSelect = false;
         _modelList.HideSelection = false;
+        _modelList.LabelWrap = true;
         _modelList.ShowItemToolTips = true;
         _modelList.Sorting = SortOrder.None;
         _modelList.BackColor = SystemColors.Window;
@@ -606,13 +607,13 @@ internal sealed class MainForm : Form
         _animationGrid.ReadOnly = true;
         _animationGrid.RowHeadersVisible = false;
         _animationGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _animationGrid.BackgroundColor = SystemColors.Window;
 
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", Width = 420, MinimumWidth = 260 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", Width = 74, MinimumWidth = 64 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", Width = 86, MinimumWidth = 76 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", Width = 68, MinimumWidth = 58 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 57, MinimumWidth = 260 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", FillWeight = 14, MinimumWidth = 96 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", FillWeight = 20, MinimumWidth = 120 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 9, MinimumWidth = 90 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
@@ -1633,7 +1634,9 @@ internal sealed class MainForm : Form
                     if (!_modelImageIndices.ContainsKey(key))
                     {
                         var imageIndex = _modelImages.Images.Count;
-                        _modelImages.Images.Add(key, thumbnail.Image);
+                        var image = BuildModelThumbnailImage(model, thumbnail.Image);
+                        thumbnail.Image.Dispose();
+                        _modelImages.Images.Add(key, image);
                         _modelImageIndices[key] = imageIndex;
                     }
                     else
@@ -2086,6 +2089,27 @@ internal sealed class MainForm : Form
         if (_curationStore?.IsFavoriteModel(model) == true)
             name = "[*] " + name;
         return $"{name}{Environment.NewLine}动{model.AnimationCount} 可{model.UsableAnimationCount} 信{model.TrustedAnimationCount}";
+    }
+
+    private static Image BuildModelThumbnailImage(UeLibraryModel model, Image source)
+    {
+        var bitmap = new Bitmap(source.Width, source.Height);
+        using var g = Graphics.FromImage(bitmap);
+        g.DrawImage(source, 0, 0, bitmap.Width, bitmap.Height);
+
+        var text = model.AnimationCount > 0
+            ? $"动 {model.AnimationCount}  可 {model.UsableAnimationCount}"
+            : "动 0";
+        using var font = new Font("Segoe UI", Math.Max(10f, bitmap.Height / 13f), FontStyle.Bold);
+        var size = g.MeasureString(text, font);
+        var width = Math.Min(bitmap.Width - 12, (int)Math.Ceiling(size.Width) + 14);
+        var height = Math.Min(bitmap.Height - 8, (int)Math.Ceiling(size.Height) + 6);
+        var rect = new Rectangle(6, bitmap.Height - height - 6, width, height);
+        using var bg = new SolidBrush(Color.FromArgb(190, 12, 16, 20));
+        using var fg = new SolidBrush(Color.WhiteSmoke);
+        g.FillRectangle(bg, rect);
+        g.DrawString(text, font, fg, rect.X + 7, rect.Y + 2);
+        return bitmap;
     }
 
     private bool MatchesModelKindFilter(UeLibraryModel model)
@@ -2556,14 +2580,15 @@ internal sealed class MainForm : Form
 
     private static Image BuildPlaceholderImage()
     {
-        var bitmap = new Bitmap(128, 88);
+        var bitmap = new Bitmap(128, 128);
         using var g = Graphics.FromImage(bitmap);
         g.Clear(Color.FromArgb(42, 48, 56));
         using var pen = new Pen(Color.FromArgb(110, 126, 145), 2);
-        g.DrawRectangle(pen, 16, 14, 96, 60);
+        g.DrawRectangle(pen, 18, 18, 92, 92);
         using var brush = new SolidBrush(Color.WhiteSmoke);
-        using var font = new Font("Segoe UI", 9, FontStyle.Bold);
-        g.DrawString("UE5", font, brush, 48, 34);
+        using var font = new Font("Segoe UI", 12, FontStyle.Bold);
+        var size = g.MeasureString("UE5", font);
+        g.DrawString("UE5", font, brush, (bitmap.Width - size.Width) / 2f, (bitmap.Height - size.Height) / 2f);
         return bitmap;
     }
 
