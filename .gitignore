@@ -2,6 +2,8 @@
 /UnrealExporter/obj
 /UE5LibraryBrowser/bin
 /UE5LibraryBrowser/obj
+/UE5LibraryBrowser.Cli/bin
+/UE5LibraryBrowser.Cli/obj
 /Content
 /output
 /output2
