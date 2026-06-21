@@ -705,8 +705,8 @@ internal static class UELibraryPostProcessor
             try
             {
                 var info = BuildMaterialInfo(root, path, ReadMaterialJsonObject(path));
-                if (!result.ContainsKey(info.Name))
-                    result[info.Name] = info;
+                if (!result.ContainsKey(info.RelativePath))
+                    result[info.RelativePath] = info;
             }
             catch (Exception ex)
             {
@@ -851,10 +851,10 @@ internal static class UELibraryPostProcessor
             }
 
             var name = GetString(reader, 0) ?? Path.GetFileNameWithoutExtension(path);
-            if (result.ContainsKey(name))
+            if (result.ContainsKey(relativePath))
                 continue;
 
-            result[name] = new MaterialInfo
+            result[relativePath] = new MaterialInfo
             {
                 Name = name,
                 Path = path,
@@ -951,12 +951,15 @@ internal static class UELibraryPostProcessor
         var materialNames = materials
             .Select(x => ((string?)x["name"]) ?? "Material")
             .ToArray();
+        var materialNamesInIndex = materialIndex.Values
+            .Select(x => x.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var matchedMaterials = materialNames
-            .Where(materialIndex.ContainsKey)
+            .Where(materialNamesInIndex.Contains)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var missingSidecars = materialNames
-            .Where(x => !materialIndex.ContainsKey(x))
+            .Where(x => !materialNamesInIndex.Contains(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(64)
             .ToArray();
@@ -2214,11 +2217,12 @@ internal static class UELibraryPostProcessor
                 StringComparer.OrdinalIgnoreCase);
 
         // 材质槽数量可能非常大，不能每个槽都线性扫描全部贴图。
+        var materialLookup = BuildMaterialNameLookup(materialIndex.Values);
         var textureLookup = BuildTextureLinkLookup(textureLinks);
         var result = new List<MaterialTextureSlotLink>();
         foreach (var slot in sourceIndex.MaterialTextureSlots)
         {
-            var material = FindMaterialInfo(materialIndex, slot.MaterialName);
+            var material = FindMaterialInfo(materialLookup, slot.MaterialName);
             var textureLink = FindTextureLink(textureLookup, slot);
             var textureInfo = FindTextureObjectInfo(textureObjects, slot);
             var textureClassName = slot.TextureClassName ?? textureInfo?.ClassName;
@@ -3910,15 +3914,24 @@ internal static class UELibraryPostProcessor
         };
     }
 
-    private static MaterialInfo? FindMaterialInfo(Dictionary<string, MaterialInfo> materialIndex, string? materialName)
+    private static Dictionary<string, MaterialInfo> BuildMaterialNameLookup(IEnumerable<MaterialInfo> materials)
+        => materials
+            .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+            .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => x.OrderBy(y => y.RelativePath, StringComparer.OrdinalIgnoreCase).First(),
+                StringComparer.OrdinalIgnoreCase);
+
+    private static MaterialInfo? FindMaterialInfo(Dictionary<string, MaterialInfo> materialNameLookup, string? materialName)
     {
         if (string.IsNullOrWhiteSpace(materialName))
             return null;
 
-        if (materialIndex.TryGetValue(materialName, out var exact))
+        if (materialNameLookup.TryGetValue(materialName, out var exact))
             return exact;
 
-        return materialIndex.Values.FirstOrDefault(x => string.Equals(x.Name, materialName, StringComparison.OrdinalIgnoreCase));
+        return null;
     }
 
     private static TextureLinkLookup BuildTextureLinkLookup(List<TextureLinkInfo> textureLinks)
