@@ -13,13 +13,13 @@ internal sealed class MainForm : Form
     private const int LvsExDoubleBuffer = 0x00010000;
     private const int LargeIconCellWidth = 176;
     private const int LargeIconCellHeight = 156;
-    private const int MaxUnfilteredThumbnailItems = 360;
-    private const int MaxFilteredThumbnailItems = 1200;
     private const int ModelPanelPreferredWidth = 1400;
     private const int AnimationPanelMinWidth = 900;
     private const int ThumbnailVirtualPrefetchBefore = 48;
     private const int ThumbnailVirtualPrefetchAfter = 192;
     private const int ThumbnailVirtualBatchLimit = 720;
+    private const int ThumbnailQueueBatchSize = 100;
+    private const int ThumbnailQueueBatchPauseMs = 250;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
     private readonly ToolStripDropDownButton _recentButton = new("最近");
@@ -83,6 +83,7 @@ internal sealed class MainForm : Form
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _modelImageIndices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _modelThumbnailDisplayRequests = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
     private readonly List<UeLibraryAsset> _visibleAssets = [];
     private readonly List<UeLibraryComponentSummary> _componentSummaries = [];
@@ -104,6 +105,7 @@ internal sealed class MainForm : Form
     private int _thumbnailCandidateTotal;
     private int _thumbnailQueueGeneration;
     private bool _thumbnailRangeRequestScheduled;
+    private bool _thumbnailStatusUpdateScheduled;
     private int _pendingThumbnailStart = int.MaxValue;
     private int _pendingThumbnailEnd = -1;
     private string _root = "";
@@ -1035,7 +1037,7 @@ internal sealed class MainForm : Form
         }
 
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
-        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !filter.IsEmpty));
+        StartThumbnailQueue(BuildThumbnailBackfillItems(_visibleModels));
     }
 
     private void ModelList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
@@ -1047,6 +1049,7 @@ internal sealed class MainForm : Form
         }
 
         var model = _visibleModels[e.ItemIndex];
+        _modelThumbnailDisplayRequests.Add(model.Output);
         var imageIndex = _modelImageIndices.TryGetValue(model.Output, out var cachedImageIndex)
             ? cachedImageIndex
             : _modelImageIndices["__placeholder"];
@@ -1065,12 +1068,18 @@ internal sealed class MainForm : Form
         RequestThumbnailRangeForVisibleItems(e.StartIndex, e.EndIndex);
     }
 
-    private static IReadOnlyList<UeLibraryModel> LimitThumbnailItems(
-        IReadOnlyList<UeLibraryModel> items,
-        bool hasFilter)
+    private IReadOnlyList<UeLibraryModel> BuildThumbnailBackfillItems(IReadOnlyList<UeLibraryModel> items)
     {
-        var limit = hasFilter ? MaxFilteredThumbnailItems : MaxUnfilteredThumbnailItems;
-        return items.Count <= limit ? items : items.Take(limit).ToArray();
+        var thumbnails = _thumbnails;
+        if (thumbnails == null || items.Count == 0)
+            return [];
+
+        return items
+            .Where(x => !thumbnails.IsCached(x)
+                || (_modelThumbnailDisplayRequests.Contains(x.Output) && !_modelImageIndices.ContainsKey(x.Output)))
+            .OrderByDescending(x => _modelThumbnailDisplayRequests.Contains(x.Output))
+            .ThenBy(x => _visibleModelIndices.TryGetValue(x.Output, out var index) ? index : int.MaxValue)
+            .ToArray();
     }
 
     private IOrderedEnumerable<UeLibraryModel> SortModels(IEnumerable<UeLibraryModel> models)
@@ -1478,26 +1487,25 @@ internal sealed class MainForm : Form
         if (_index == null || _thumbnails == null || _visibleModels.Count == 0)
             return;
 
-        var active = Math.Max(0, Volatile.Read(ref _thumbnailActive));
-        var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
-        var completed = Math.Max(0, Volatile.Read(ref _thumbnailCompleted));
-        if (active > 0 || completed < total)
-        {
-            _ = Task.Delay(1200).ContinueWith(_ =>
-                SafeBeginInvoke(() => RequestThumbnailRangeForVisibleItems(startIndex, endIndex)));
-            return;
-        }
-
         var start = Math.Clamp(startIndex - ThumbnailVirtualPrefetchBefore, 0, _visibleModels.Count - 1);
         var end = Math.Clamp(endIndex + ThumbnailVirtualPrefetchAfter, start, _visibleModels.Count - 1);
         if (end - start + 1 > ThumbnailVirtualBatchLimit)
             end = start + ThumbnailVirtualBatchLimit - 1;
 
-        var items = _visibleModels
+        var requestedItems = _visibleModels
             .Skip(start)
             .Take(end - start + 1)
-            .Where(x => !_modelImageIndices.ContainsKey(x.Output))
             .ToList();
+        var hasNewPriority = requestedItems.Any(x => !_modelThumbnailDisplayRequests.Contains(x.Output));
+        foreach (var item in requestedItems)
+            _modelThumbnailDisplayRequests.Add(item.Output);
+        var active = Math.Max(0, Volatile.Read(ref _thumbnailActive));
+        var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
+        var completed = Math.Max(0, Volatile.Read(ref _thumbnailCompleted));
+        if (!hasNewPriority && (active > 0 || completed < total))
+            return;
+
+        var items = BuildThumbnailBackfillItems(_visibleModels);
         if (items.Count == 0)
             return;
 
@@ -1540,9 +1548,8 @@ internal sealed class MainForm : Form
         _thumbnails?.Dispose();
         _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
 
-        var filter = SearchQuery.Parse(_modelFilter.Text);
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
-        StartThumbnailQueue(LimitThumbnailItems(_visibleModels, !filter.IsEmpty));
+        StartThumbnailQueue(BuildThumbnailBackfillItems(_visibleModels));
     }
 
     private async Task LoadThumbnailsAsync(
@@ -1551,25 +1558,35 @@ internal sealed class MainForm : Form
         CancellationToken cancellationToken,
         int generation)
     {
-        var nextIndex = -1;
-        var workerCount = Math.Min(GetThumbnailConcurrency(), items.Length);
-        var workers = Enumerable.Range(0, workerCount)
-            .Select(_ => Task.Run(async () =>
-            {
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    var index = Interlocked.Increment(ref nextIndex);
-                    if (index >= items.Length)
-                        break;
-
-                    await LoadOneThumbnailAsync(items[index], thumbnails, cancellationToken, generation);
-                }
-            }, cancellationToken))
-            .ToArray();
-
         try
         {
-            await Task.WhenAll(workers);
+            for (var offset = 0; offset < items.Length && !cancellationToken.IsCancellationRequested; offset += ThumbnailQueueBatchSize)
+            {
+                if (!IsCurrentThumbnailQueue(generation))
+                    break;
+
+                var count = Math.Min(ThumbnailQueueBatchSize, items.Length - offset);
+                var nextIndex = -1;
+                var workerCount = Math.Min(GetThumbnailConcurrency(), count);
+                var workers = Enumerable.Range(0, workerCount)
+                    .Select(_ => Task.Run(async () =>
+                    {
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            var index = Interlocked.Increment(ref nextIndex);
+                            if (index >= count)
+                                break;
+
+                            await LoadOneThumbnailAsync(items[offset + index], thumbnails, cancellationToken, generation);
+                        }
+                    }, cancellationToken))
+                    .ToArray();
+
+                await Task.WhenAll(workers);
+                ScheduleThumbnailStatusUpdate();
+                if (offset + count < items.Length)
+                    await Task.Delay(ThumbnailQueueBatchPauseMs, cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1577,7 +1594,7 @@ internal sealed class MainForm : Form
         }
 
         if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
-            SafeBeginInvoke(UpdateThumbnailStatus);
+            ScheduleThumbnailStatusUpdate();
     }
 
     private async Task LoadOneThumbnailAsync(
@@ -1604,7 +1621,8 @@ internal sealed class MainForm : Form
             else if (!thumbnail.Success)
                 Interlocked.Increment(ref _thumbnailFailed);
 
-            if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
+            var shouldDisplay = _modelThumbnailDisplayRequests.Contains(model.Output);
+            if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation) && shouldDisplay)
             {
                 SafeBeginInvoke(() =>
                 {
@@ -1624,7 +1642,7 @@ internal sealed class MainForm : Form
                     {
                         _modelList.RedrawItems(index, index, true);
                     }
-                    UpdateThumbnailStatus();
+                    ScheduleThumbnailStatusUpdate();
                 });
             }
             else
@@ -1647,13 +1665,26 @@ internal sealed class MainForm : Form
             {
                 Interlocked.Decrement(ref _thumbnailActive);
                 Interlocked.Increment(ref _thumbnailCompleted);
-                SafeBeginInvoke(UpdateThumbnailStatus);
+                ScheduleThumbnailStatusUpdate();
             }
         }
     }
 
     private bool IsCurrentThumbnailQueue(int generation)
         => Volatile.Read(ref _thumbnailQueueGeneration) == generation;
+
+    private void ScheduleThumbnailStatusUpdate()
+    {
+        if (_thumbnailStatusUpdateScheduled)
+            return;
+
+        _thumbnailStatusUpdateScheduled = true;
+        _ = Task.Delay(250).ContinueWith(_ => SafeBeginInvoke(() =>
+        {
+            _thumbnailStatusUpdateScheduled = false;
+            UpdateThumbnailStatus();
+        }));
+    }
 
     private void UpdateThumbnailStatus()
     {
@@ -1675,7 +1706,7 @@ internal sealed class MainForm : Form
         var state = completed >= total ? "完成" : "后台生成";
         var renderer = _thumbnails?.RendererLabel ?? "OpenGL worker";
         var scope = candidateTotal > total
-            ? $"本批 {completed}/{total}（当前列表 {candidateTotal}，滚动继续按需生成）"
+            ? $"缺失补全 {completed}/{total}（当前列表 {candidateTotal}，当前可见优先）"
             : $"{completed}/{total}";
         _statusLabel.Text = $"已打开: {_root} | 缩略图{state} {scope} | 缓存 {cached} | 失败 {failed} | 队列 {queued} | 运行 {active} | 并发 {GetThumbnailConcurrency()} | {renderer}";
     }
