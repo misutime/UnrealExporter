@@ -5,6 +5,7 @@
 /Content
 /output
 /output2
+/dist/
 /.cache
 .env
 /test
