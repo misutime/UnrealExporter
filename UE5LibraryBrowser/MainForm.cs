@@ -40,12 +40,20 @@ internal sealed class MainForm : Form
     {
         _initialRoot = initialRoot;
         Text = "UE5 Library Browser";
+        LoadAppIcon();
         Width = 1500;
         Height = 920;
         MinimumSize = new Size(1100, 700);
 
         BuildLayout();
         WireEvents();
+    }
+
+    private void LoadAppIcon()
+    {
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        if (File.Exists(iconPath))
+            Icon = new Icon(iconPath);
     }
 
     protected override async void OnShown(EventArgs e)
