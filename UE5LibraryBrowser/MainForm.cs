@@ -5,6 +5,8 @@ namespace UE5LibraryBrowser;
 
 internal sealed class MainForm : Form
 {
+    private const int MaxUnfilteredThumbnailItems = 360;
+    private const int MaxFilteredThumbnailItems = 1200;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
     private readonly ToolStripButton _refreshButton = new("刷新");
@@ -33,6 +35,7 @@ internal sealed class MainForm : Form
     private int _thumbnailCached;
     private int _thumbnailFailed;
     private int _thumbnailActive;
+    private int _thumbnailCandidateTotal;
     private string _root = "";
     private string? _initialRoot;
 
@@ -297,7 +300,16 @@ internal sealed class MainForm : Form
         if (_modelList.Items.Count > 0)
             _modelList.Items[0].Selected = true;
 
-        StartThumbnailQueue(thumbnailItems);
+        Interlocked.Exchange(ref _thumbnailCandidateTotal, thumbnailItems.Count);
+        StartThumbnailQueue(LimitThumbnailItems(thumbnailItems, !string.IsNullOrWhiteSpace(filter)));
+    }
+
+    private static IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> LimitThumbnailItems(
+        IReadOnlyList<(UeLibraryModel Model, ListViewItem Item)> items,
+        bool hasFilter)
+    {
+        var limit = hasFilter ? MaxFilteredThumbnailItems : MaxUnfilteredThumbnailItems;
+        return items.Count <= limit ? items : items.Take(limit).ToArray();
     }
 
     private void RebuildAnimationGrid(UeLibraryModel? model)
@@ -445,6 +457,7 @@ internal sealed class MainForm : Form
     private void UpdateThumbnailStatus()
     {
         var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
+        var candidateTotal = Math.Max(total, Volatile.Read(ref _thumbnailCandidateTotal));
         if (total == 0)
         {
             _statusLabel.Text = string.IsNullOrWhiteSpace(_root)
@@ -460,11 +473,14 @@ internal sealed class MainForm : Form
         var failed = Math.Max(0, Volatile.Read(ref _thumbnailFailed));
         var state = completed >= total ? "完成" : "后台生成";
         var renderer = _thumbnails?.RendererLabel ?? "OpenGL worker";
-        _statusLabel.Text = $"已打开: {_root} | 缩略图{state} {completed}/{total} | 缓存 {cached} | 失败 {failed} | 队列 {queued} | 运行 {active} | 并发 {GetThumbnailConcurrency()} | {renderer}";
+        var scope = candidateTotal > total
+            ? $"前 {completed}/{total}（当前列表 {candidateTotal}）"
+            : $"{completed}/{total}";
+        _statusLabel.Text = $"已打开: {_root} | 缩略图{state} {scope} | 缓存 {cached} | 失败 {failed} | 队列 {queued} | 运行 {active} | 并发 {GetThumbnailConcurrency()} | {renderer}";
     }
 
     private static int GetThumbnailConcurrency()
-        => Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+        => Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
 
     private void SafeBeginInvoke(Action action)
     {
