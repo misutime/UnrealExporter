@@ -49,9 +49,13 @@ internal static class Program
             return;
         }
 
-        if (args.Length == 2 && args[0].Equals("--smoke-preview", StringComparison.OrdinalIgnoreCase))
+        if (args.Length >= 2 && args[0].Equals("--smoke-preview", StringComparison.OrdinalIgnoreCase))
         {
-            SmokePreviewAsync(args[1]).GetAwaiter().GetResult();
+            SmokePreviewAsync(
+                args[1],
+                GetCommandOption(args, "--model"),
+                GetCommandOption(args, "--animation"),
+                args.Any(x => x.Equals("--open", StringComparison.OrdinalIgnoreCase))).GetAwaiter().GetResult();
             return;
         }
 
@@ -210,10 +214,11 @@ internal static class Program
         Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
     }
 
-    private static async Task SmokePreviewAsync(string root)
+    private static async Task SmokePreviewAsync(string root, string? modelFilter = null, string? animationFilter = null, bool open = false)
     {
         var index = AssetLibraryIndexReader.Load(root);
         var pair = index.Models
+            .Where(model => MatchesOptionalFilter(model.Output, model.Name, modelFilter))
             .Select(model =>
             {
                 var key = AssetLibraryIndexReader.MakeLibraryRelative(index.Root, model.Output);
@@ -221,7 +226,8 @@ internal static class Program
                 return new
                 {
                     Model = model,
-                    Animation = animations?.FirstOrDefault(x => x.IsPreviewable)
+                    Animation = animations?.FirstOrDefault(x =>
+                        x.IsPreviewable && MatchesOptionalFilter(x.Output, x.Name, animationFilter))
                 };
             })
             .FirstOrDefault(x => x.Animation != null);
@@ -243,7 +249,33 @@ internal static class Program
         };
         Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
         if (!result.Success)
+        {
             Environment.ExitCode = 1;
+            return;
+        }
+
+        if (open)
+            PreviewComposer.OpenWithF3d(result.OutputPath);
+    }
+
+    private static bool MatchesOptionalFilter(string path, string name, string? filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return true;
+
+        return path.Contains(filter, StringComparison.OrdinalIgnoreCase)
+               || name.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetCommandOption(string[] args, string name)
+    {
+        for (var i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i].Equals(name, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+
+        return null;
     }
 
     private sealed class ThumbnailWorkerRequest
