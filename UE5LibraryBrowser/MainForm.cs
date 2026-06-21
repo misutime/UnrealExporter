@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 
@@ -59,10 +58,10 @@ internal sealed class MainForm : Form
             await OpenLibraryAsync(root);
     }
 
-    protected override void OnClosing(CancelEventArgs e)
+    protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _thumbnailCts?.Cancel();
-        base.OnClosing(e);
+        base.OnFormClosing(e);
     }
 
     private void BuildLayout()
