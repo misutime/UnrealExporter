@@ -79,6 +79,8 @@ internal static class Program
             models = index.Models.Count,
             modelsWithAnimations = index.Models.Count(x => x.AnimationCount > 0),
             animations = index.Models.Sum(x => x.AnimationCount),
+            animationUsages = index.AnimationUsages.Count,
+            animationGroups = index.AnimationGroups.Count,
             usableAnimations = index.AnimationsByModel.Values.SelectMany(x => x).Count(x => x.IsUsableCandidate),
             source = "library_index.db"
         };

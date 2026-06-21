@@ -26,19 +26,31 @@ internal sealed class MainForm : Form
     private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
     private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
     private readonly ToolStripLabel _statusLabel = new("请选择 UE5 素材库");
+    private readonly TabControl _mainTabs = new();
+    private readonly TabPage _modelsPage = new("模型");
+    private readonly TabPage _globalAnimationsPage = new("全局动画");
     private readonly TextBox _modelFilter = new();
     private readonly TextBox _animationFilter = new();
+    private readonly TextBox _globalAnimationFilter = new();
     private readonly ListView _modelList = new();
+    private readonly ListView _globalAnimationList = new();
     private readonly ImageList _modelImages = new();
     private readonly DataGridView _animationGrid = new();
+    private readonly DataGridView _globalAnimationModelsGrid = new();
     private readonly ContextMenuStrip _modelMenu = new();
     private readonly ContextMenuStrip _animationMenu = new();
+    private readonly ContextMenuStrip _globalAnimationMenu = new();
+    private readonly ContextMenuStrip _globalAnimationModelMenu = new();
     private readonly Label _modelHeader = new();
     private readonly Label _animationHeader = new();
+    private readonly Label _globalAnimationHeader = new();
+    private readonly Label _globalAnimationModelsHeader = new();
     private readonly TextBox _details = new();
+    private readonly TextBox _globalAnimationDetails = new();
     private readonly Image _placeholder = BuildPlaceholderImage();
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
     private readonly RecentLibraryStore _recentStore = new();
 
     private UeLibraryIndex? _index;
@@ -116,14 +128,19 @@ internal sealed class MainForm : Form
         Controls.Add(_toolbar);
         RebuildRecentMenu();
 
+        _mainTabs.Dock = DockStyle.Fill;
+        _mainTabs.TabPages.Add(_modelsPage);
+        _mainTabs.TabPages.Add(_globalAnimationsPage);
+        Controls.Add(_mainTabs);
+        _mainTabs.BringToFront();
+
         var split = new SplitContainer
         {
             Dock = DockStyle.Fill,
             SplitterDistance = 760,
             Orientation = Orientation.Vertical
         };
-        Controls.Add(split);
-        split.BringToFront();
+        _modelsPage.Controls.Add(split);
 
         var left = new TableLayoutPanel
         {
@@ -180,6 +197,70 @@ internal sealed class MainForm : Form
         _details.ScrollBars = ScrollBars.Vertical;
         _details.Font = new Font("Consolas", 9);
         right.Controls.Add(_details, 0, 3);
+
+        BuildGlobalAnimationPage();
+    }
+
+    private void BuildGlobalAnimationPage()
+    {
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            SplitterDistance = 650,
+            Orientation = Orientation.Vertical
+        };
+        _globalAnimationsPage.Controls.Add(split);
+
+        var left = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 3,
+            ColumnCount = 1,
+            Padding = new Padding(8)
+        };
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        split.Panel1.Controls.Add(left);
+
+        _globalAnimationHeader.Dock = DockStyle.Fill;
+        _globalAnimationHeader.TextAlign = ContentAlignment.MiddleLeft;
+        _globalAnimationHeader.Font = new Font(Font, FontStyle.Bold);
+        left.Controls.Add(_globalAnimationHeader, 0, 0);
+
+        _globalAnimationFilter.Dock = DockStyle.Fill;
+        _globalAnimationFilter.PlaceholderText = "筛选动画、路径、证据、验证状态...";
+        left.Controls.Add(_globalAnimationFilter, 0, 1);
+
+        ConfigureGlobalAnimationList();
+        left.Controls.Add(_globalAnimationList, 0, 2);
+
+        var right = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 3,
+            ColumnCount = 1,
+            Padding = new Padding(8)
+        };
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 190));
+        split.Panel2.Controls.Add(right);
+
+        _globalAnimationModelsHeader.Dock = DockStyle.Fill;
+        _globalAnimationModelsHeader.TextAlign = ContentAlignment.MiddleLeft;
+        _globalAnimationModelsHeader.Font = new Font(Font, FontStyle.Bold);
+        right.Controls.Add(_globalAnimationModelsHeader, 0, 0);
+
+        ConfigureGlobalAnimationModelsGrid();
+        right.Controls.Add(_globalAnimationModelsGrid, 0, 1);
+
+        _globalAnimationDetails.Dock = DockStyle.Fill;
+        _globalAnimationDetails.Multiline = true;
+        _globalAnimationDetails.ReadOnly = true;
+        _globalAnimationDetails.ScrollBars = ScrollBars.Vertical;
+        _globalAnimationDetails.Font = new Font("Consolas", 9);
+        right.Controls.Add(_globalAnimationDetails, 0, 2);
     }
 
     private void ConfigureToolbarFilters()
@@ -287,6 +368,60 @@ internal sealed class MainForm : Form
         _animationGrid.ContextMenuStrip = _animationMenu;
     }
 
+    private void ConfigureGlobalAnimationList()
+    {
+        _globalAnimationList.Dock = DockStyle.Fill;
+        _globalAnimationList.View = View.Details;
+        _globalAnimationList.FullRowSelect = true;
+        _globalAnimationList.HideSelection = false;
+        _globalAnimationList.MultiSelect = false;
+        _globalAnimationList.VirtualMode = true;
+        _globalAnimationList.Columns.Add("动画", 260);
+        _globalAnimationList.Columns.Add("模型", 58);
+        _globalAnimationList.Columns.Add("可信", 58);
+        _globalAnimationList.Columns.Add("兼容", 58);
+        _globalAnimationList.Columns.Add("可预览", 66);
+        _globalAnimationList.Columns.Add("时长", 58);
+        _globalAnimationList.Columns.Add("文件", 360);
+        _globalAnimationList.RetrieveVirtualItem += GlobalAnimationList_RetrieveVirtualItem;
+        _globalAnimationList.HandleCreated += (_, _) => EnableListViewDoubleBuffer(_globalAnimationList);
+        _globalAnimationList.ContextMenuStrip = _globalAnimationMenu;
+
+        _globalAnimationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedGlobalAnimationPath());
+        _globalAnimationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedGlobalAnimationSource());
+        _globalAnimationMenu.Items.Add(new ToolStripSeparator());
+        _globalAnimationMenu.Items.Add("收藏动画", null, (_, _) => SetSelectedGlobalAnimationFavorite(true));
+        _globalAnimationMenu.Items.Add("取消收藏", null, (_, _) => SetSelectedGlobalAnimationFavorite(false));
+    }
+
+    private void ConfigureGlobalAnimationModelsGrid()
+    {
+        _globalAnimationModelsGrid.Dock = DockStyle.Fill;
+        _globalAnimationModelsGrid.AllowUserToAddRows = false;
+        _globalAnimationModelsGrid.AllowUserToDeleteRows = false;
+        _globalAnimationModelsGrid.AllowUserToResizeRows = false;
+        _globalAnimationModelsGrid.MultiSelect = false;
+        _globalAnimationModelsGrid.ReadOnly = true;
+        _globalAnimationModelsGrid.RowHeadersVisible = false;
+        _globalAnimationModelsGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _globalAnimationModelsGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _globalAnimationModelsGrid.BackgroundColor = SystemColors.Window;
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Model", HeaderText = "模型", FillWeight = 26 });
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Recommended", HeaderText = "推荐", FillWeight = 13 });
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relationship", HeaderText = "关系", FillWeight = 13 });
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Confidence", HeaderText = "置信", FillWeight = 14 });
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Validation", HeaderText = "验证", FillWeight = 12 });
+        _globalAnimationModelsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ModelFile", HeaderText = "模型文件", FillWeight = 30 });
+        _globalAnimationModelsGrid.ContextMenuStrip = _globalAnimationModelMenu;
+
+        _globalAnimationModelMenu.Items.Add("生成并打开 preview", null, async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync());
+        _globalAnimationModelMenu.Items.Add("打开模型", null, (_, _) => OpenSelectedGlobalAnimationModel());
+        _globalAnimationModelMenu.Items.Add("打开模型目录", null, (_, _) => OpenSelectedGlobalAnimationModelFolder());
+        _globalAnimationModelMenu.Items.Add(new ToolStripSeparator());
+        _globalAnimationModelMenu.Items.Add("复制模型路径", null, (_, _) => CopyText(GetSelectedGlobalAnimationUsage()?.Model.Output));
+        _globalAnimationModelMenu.Items.Add("复制动画路径", null, (_, _) => CopyText(GetSelectedGlobalAnimationUsage()?.Animation.Output));
+    }
+
     private void WireEvents()
     {
         _openButton.Click += async (_, _) => await ChooseAndOpenLibraryAsync();
@@ -310,6 +445,13 @@ internal sealed class MainForm : Form
         _animationGrid.SelectionChanged += (_, _) => ShowSelectedAnimationDetails();
         _animationGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedAnimationAsync();
         _animationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_animationGrid, e);
+        _globalAnimationFilter.TextChanged += (_, _) => RebuildGlobalAnimationList();
+        _globalAnimationList.SelectedIndexChanged += (_, _) => RebuildGlobalAnimationModelsGrid();
+        _globalAnimationList.DoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
+        _globalAnimationList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_globalAnimationList, e);
+        _globalAnimationModelsGrid.SelectionChanged += (_, _) => ShowSelectedGlobalAnimationUsageDetails();
+        _globalAnimationModelsGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
+        _globalAnimationModelsGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_globalAnimationModelsGrid, e);
     }
 
     private async Task ChooseAndOpenLibraryAsync()
@@ -394,6 +536,7 @@ internal sealed class MainForm : Form
             RebuildModelKindFilter();
             _statusLabel.Text = $"已打开: {_root}";
             RebuildModelGrid();
+            RebuildGlobalAnimationList();
         }
         catch (Exception ex)
         {
@@ -526,6 +669,106 @@ internal sealed class MainForm : Form
         if (_animationGrid.Rows.Count > 0)
             _animationGrid.Rows[0].Selected = true;
         ShowSelectedAnimationDetails();
+    }
+
+    private void RebuildGlobalAnimationList()
+    {
+        if (_index == null)
+        {
+            _globalAnimationHeader.Text = "全局动画";
+            _globalAnimationList.VirtualListSize = 0;
+            _globalAnimationModelsGrid.Rows.Clear();
+            _globalAnimationDetails.Clear();
+            return;
+        }
+
+        var filter = _globalAnimationFilter.Text.Trim();
+        var groups = _index.AnimationGroups
+            .Where(x => MatchesGlobalAnimationFilter(x, filter))
+            .OrderByDescending(x => x.DefaultTrustedCount)
+            .ThenByDescending(x => x.CompatibleCount)
+            .ThenByDescending(x => x.PreviewableCount)
+            .ThenByDescending(x => x.ModelCount)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _visibleGlobalAnimationGroups.Clear();
+        _visibleGlobalAnimationGroups.AddRange(groups);
+        _globalAnimationList.VirtualListSize = _visibleGlobalAnimationGroups.Count;
+        _globalAnimationHeader.Text = $"全局动画 {_visibleGlobalAnimationGroups.Count}/{_index.AnimationGroups.Count}  关系 {_index.AnimationUsages.Count}";
+        if (_globalAnimationList.VirtualListSize > 0)
+        {
+            _globalAnimationList.SelectedIndices.Clear();
+            _globalAnimationList.SelectedIndices.Add(0);
+        }
+        else
+        {
+            RebuildGlobalAnimationModelsGrid();
+        }
+        _globalAnimationList.Refresh();
+    }
+
+    private void GlobalAnimationList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    {
+        if (e.ItemIndex < 0 || e.ItemIndex >= _visibleGlobalAnimationGroups.Count)
+        {
+            e.Item = new ListViewItem("");
+            return;
+        }
+
+        var group = _visibleGlobalAnimationGroups[e.ItemIndex];
+        var animation = group.Representative;
+        var name = _curationStore?.IsFavoriteAnimation(animation) == true ? "[*] " + group.Name : group.Name;
+        var item = new ListViewItem(name);
+        item.SubItems.Add(group.ModelCount.ToString());
+        item.SubItems.Add(group.DefaultTrustedCount.ToString());
+        item.SubItems.Add(group.CompatibleCount.ToString());
+        item.SubItems.Add(group.PreviewableCount.ToString());
+        item.SubItems.Add(animation.Duration > 0 ? animation.Duration.ToString("0.###") : "");
+        item.SubItems.Add(group.Output);
+        item.Tag = group;
+        item.ToolTipText = BuildGlobalAnimationGroupDetails(group);
+        e.Item = item;
+    }
+
+    private void RebuildGlobalAnimationModelsGrid()
+    {
+        _globalAnimationModelsGrid.Rows.Clear();
+        var group = GetSelectedGlobalAnimationGroup();
+        if (group == null)
+        {
+            _globalAnimationModelsHeader.Text = "关联模型";
+            _globalAnimationDetails.Clear();
+            return;
+        }
+
+        var usages = group.Usages
+            .OrderBy(x => RecommendedUseSortKey(x.Animation.RecommendedUse))
+            .ThenByDescending(x => x.Animation.IsPreviewable)
+            .ThenByDescending(x => x.Model.TrustedAnimationCount)
+            .ThenBy(x => x.Model.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (var usage in usages)
+        {
+            var rowIndex = _globalAnimationModelsGrid.Rows.Add(
+                usage.Model.Name,
+                DisplayRecommendedUse(usage.Animation),
+                DisplayRelationshipKind(usage.Animation),
+                string.IsNullOrWhiteSpace(usage.Animation.ConfidenceTier) ? DisplayUsageEvidence(usage.Animation) : usage.Animation.ConfidenceTier,
+                string.IsNullOrWhiteSpace(usage.Animation.ValidationStatus) ? usage.Animation.Status : usage.Animation.ValidationStatus,
+                usage.Model.Output);
+            var row = _globalAnimationModelsGrid.Rows[rowIndex];
+            row.Tag = usage;
+            SetRowTooltip(row, BuildAnimationDetails(usage.Model, usage.Animation));
+            if (!usage.Animation.IsPreviewable)
+                row.DefaultCellStyle.ForeColor = Color.DimGray;
+        }
+
+        _globalAnimationModelsHeader.Text = $"关联模型: {group.Name}  模型 {group.ModelCount} / 可信 {group.DefaultTrustedCount} / 兼容 {group.CompatibleCount} / 可预览 {group.PreviewableCount}";
+        if (_globalAnimationModelsGrid.Rows.Count > 0)
+            _globalAnimationModelsGrid.Rows[0].Selected = true;
+        ShowSelectedGlobalAnimationUsageDetails();
     }
 
     private void StartThumbnailQueue(IReadOnlyList<UeLibraryModel> items)
@@ -712,6 +955,19 @@ internal sealed class MainForm : Form
                 : BuildAnimationDetails(model, animation);
     }
 
+    private void ShowSelectedGlobalAnimationUsageDetails()
+    {
+        var usage = GetSelectedGlobalAnimationUsage();
+        if (usage != null)
+        {
+            _globalAnimationDetails.Text = BuildAnimationDetails(usage.Model, usage.Animation);
+            return;
+        }
+
+        var group = GetSelectedGlobalAnimationGroup();
+        _globalAnimationDetails.Text = group == null ? "" : BuildGlobalAnimationGroupDetails(group);
+    }
+
     private UeLibraryModel? GetSelectedModel()
     {
         if (_modelList.SelectedIndices.Count == 0)
@@ -723,6 +979,20 @@ internal sealed class MainForm : Form
 
     private UeLibraryAnimation? GetSelectedAnimation()
         => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as UeLibraryAnimation;
+
+    private UeLibraryAnimationGroup? GetSelectedGlobalAnimationGroup()
+    {
+        if (_globalAnimationList.SelectedIndices.Count == 0)
+            return null;
+
+        var index = _globalAnimationList.SelectedIndices[0];
+        return index >= 0 && index < _visibleGlobalAnimationGroups.Count ? _visibleGlobalAnimationGroups[index] : null;
+    }
+
+    private UeLibraryAnimationUsage? GetSelectedGlobalAnimationUsage()
+        => _globalAnimationModelsGrid.SelectedRows.Count == 0
+            ? null
+            : _globalAnimationModelsGrid.SelectedRows[0].Tag as UeLibraryAnimationUsage;
 
     private void RebuildModelKindFilter()
     {
@@ -759,6 +1029,23 @@ internal sealed class MainForm : Form
             Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
     }
 
+    private void OpenSelectedGlobalAnimationModel()
+    {
+        var usage = GetSelectedGlobalAnimationUsage();
+        if (usage?.Model.Output is { Length: > 0 } path && File.Exists(path))
+            PreviewComposer.OpenWithF3d(_viewerSafeCache?.GetViewerSafeModelPath(path) ?? path);
+    }
+
+    private void OpenSelectedGlobalAnimationModelFolder()
+    {
+        var usage = GetSelectedGlobalAnimationUsage();
+        if (usage == null)
+            return;
+        var directory = Path.GetDirectoryName(usage.Model.Output);
+        if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
+    }
+
     private void CopySelectedModelPath()
         => CopyText(GetSelectedModel()?.Output);
 
@@ -773,6 +1060,12 @@ internal sealed class MainForm : Form
 
     private void CopySelectedAnimationSource()
         => CopyText(GetSelectedAnimation()?.Source);
+
+    private void CopySelectedGlobalAnimationPath()
+        => CopyText(GetSelectedGlobalAnimationGroup()?.Representative.Output);
+
+    private void CopySelectedGlobalAnimationSource()
+        => CopyText(GetSelectedGlobalAnimationGroup()?.Representative.Source);
 
     private void SetSelectedModelFavorite(bool favorite)
     {
@@ -790,6 +1083,55 @@ internal sealed class MainForm : Form
     {
         _curationStore?.SetFavoriteAnimation(GetSelectedAnimation(), favorite);
         RebuildAnimationGrid(GetSelectedModel());
+    }
+
+    private void SetSelectedGlobalAnimationFavorite(bool favorite)
+    {
+        _curationStore?.SetFavoriteAnimation(GetSelectedGlobalAnimationGroup()?.Representative, favorite);
+        RebuildGlobalAnimationList();
+    }
+
+    private async Task GenerateAndOpenSelectedGlobalAnimationPreviewAsync()
+    {
+        var usage = GetSelectedGlobalAnimationUsage();
+        if (usage == null)
+        {
+            var group = GetSelectedGlobalAnimationGroup();
+            usage = group?.Usages
+                .OrderBy(x => RecommendedUseSortKey(x.Animation.RecommendedUse))
+                .ThenByDescending(x => x.Animation.IsPreviewable)
+                .FirstOrDefault(x => x.Animation.IsPreviewable)
+                ?? group?.Usages.FirstOrDefault();
+        }
+
+        if (usage == null || _previewComposer == null)
+            return;
+
+        if (!usage.Animation.IsPreviewable)
+        {
+            MessageBox.Show(this, BuildAnimationDetails(usage.Model, usage.Animation), "动画不可直接预览", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            UseWaitCursor = true;
+            _statusLabel.Text = $"正在合成 {usage.Model.Name} + {usage.Animation.Name}...";
+            var result = await _previewComposer.EnsurePreviewAsync(usage.Model, usage.Animation, CancellationToken.None);
+            _globalAnimationDetails.Text = BuildAnimationDetails(usage.Model, usage.Animation) + Environment.NewLine + Environment.NewLine + result.Message;
+            if (!result.Success)
+            {
+                MessageBox.Show(this, result.Message, "合成 preview 失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _statusLabel.Text = "preview 已生成，正在打开 F3D";
+            PreviewComposer.OpenWithF3d(result.OutputPath);
+        }
+        finally
+        {
+            UseWaitCursor = false;
+        }
     }
 
     private static void CopyText(string? text)
@@ -927,6 +1269,25 @@ internal sealed class MainForm : Form
             || Contains(animation.ValidationReason, filter);
     }
 
+    private static bool MatchesGlobalAnimationFilter(UeLibraryAnimationGroup group, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return true;
+
+        var animation = group.Representative;
+        return Contains(group.Name, filter)
+            || Contains(group.Output, filter)
+            || Contains(group.Source, filter)
+            || Contains(animation.UsageEvidence, filter)
+            || Contains(animation.ConfidenceTier, filter)
+            || Contains(animation.RelationshipKind, filter)
+            || Contains(animation.RecommendedUse, filter)
+            || Contains(animation.RelationSource, filter)
+            || Contains(animation.ValidationStatus, filter)
+            || Contains(animation.ValidationReason, filter)
+            || group.Usages.Any(x => Contains(x.Model.Name, filter) || Contains(x.Model.Output, filter));
+    }
+
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -992,6 +1353,32 @@ internal sealed class MainForm : Form
            Previewable: {animation.IsPreviewable}
            Favorite: {_curationStore?.IsFavoriteAnimation(animation) == true}
            """;
+
+    private string BuildGlobalAnimationGroupDetails(UeLibraryAnimationGroup group)
+    {
+        var animation = group.Representative;
+        return $"""
+               Animation: {group.Name}
+               Animation file: {group.Output}
+               Source: {group.Source}
+               Related models: {group.ModelCount}
+               Default trusted: {group.DefaultTrustedCount}
+               Compatible candidates: {group.CompatibleCount}
+               Previewable pairs: {group.PreviewableCount}
+               Review/not usable pairs: {group.ReviewCount}
+               Recommended use: {animation.RecommendedUse}
+               Relationship kind: {animation.RelationshipKind}
+               Confidence tier: {animation.ConfidenceTier}
+               Evidence: {DisplayUsageEvidence(animation)} ({animation.UsageEvidence})
+               Evidence chain: {animation.EvidenceSummary}
+               Validation: {animation.ValidationStatus} / {animation.ValidationCategory}
+               Duration: {animation.Duration:0.###}
+               Frames: {animation.FrameCount}
+               Tracks: {animation.TrackCount}
+               Container animation: {animation.IsContainerAnimation}
+               Favorite: {_curationStore?.IsFavoriteAnimation(animation) == true}
+               """;
+    }
 
     private static string DisplayUsageEvidence(UeLibraryAnimation animation)
     {

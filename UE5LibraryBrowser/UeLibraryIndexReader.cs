@@ -23,14 +23,89 @@ internal static class UeLibraryIndexReader
 
         var animationsByModel = LoadAnimations(root, connection);
         var models = LoadModels(root, connection, animationsByModel);
+        var animationUsages = BuildAnimationUsages(root, models, animationsByModel);
+        var animationGroups = BuildAnimationGroups(animationUsages);
 
         return new UeLibraryIndex
         {
             Root = root,
             Models = models,
-            AnimationsByModel = animationsByModel
+            AnimationsByModel = animationsByModel,
+            AnimationUsages = animationUsages,
+            AnimationGroups = animationGroups
         };
     }
+
+    private static List<UeLibraryAnimationUsage> BuildAnimationUsages(
+        string root,
+        IReadOnlyList<UeLibraryModel> models,
+        IReadOnlyDictionary<string, List<UeLibraryAnimation>> animationsByModel)
+    {
+        var modelByKey = models.ToDictionary(x => MakeLibraryRelative(root, x.Output), StringComparer.OrdinalIgnoreCase);
+        var result = new List<UeLibraryAnimationUsage>();
+        foreach (var pair in animationsByModel)
+        {
+            if (!modelByKey.TryGetValue(pair.Key, out var model))
+                continue;
+
+            foreach (var animation in pair.Value)
+            {
+                result.Add(new UeLibraryAnimationUsage
+                {
+                    Model = model,
+                    Animation = animation
+                });
+            }
+        }
+
+        return result;
+    }
+
+    private static List<UeLibraryAnimationGroup> BuildAnimationGroups(IEnumerable<UeLibraryAnimationUsage> usages)
+    {
+        return usages
+            .GroupBy(x => AnimationKey(x.Animation), StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var list = group.ToList();
+                var representative = list
+                    .OrderBy(x => RecommendedUseSortKey(x.Animation.RecommendedUse))
+                    .ThenByDescending(x => x.Animation.IsPreviewable)
+                    .ThenBy(x => x.Animation.Name, StringComparer.OrdinalIgnoreCase)
+                    .First()
+                    .Animation;
+                return new UeLibraryAnimationGroup
+                {
+                    Key = group.Key,
+                    Representative = representative,
+                    Usages = list
+                };
+            })
+            .OrderByDescending(x => x.DefaultTrustedCount)
+            .ThenByDescending(x => x.CompatibleCount)
+            .ThenByDescending(x => x.PreviewableCount)
+            .ThenByDescending(x => x.ModelCount)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string AnimationKey(UeLibraryAnimation animation)
+        => !string.IsNullOrWhiteSpace(animation.Output)
+            ? animation.Output
+            : !string.IsNullOrWhiteSpace(animation.Source)
+                ? animation.Source
+                : animation.Name;
+
+    private static int RecommendedUseSortKey(string value)
+        => value switch
+        {
+            "defaultTrusted" => 0,
+            "compatibleCandidate" => 1,
+            "manualReview" => 2,
+            "compatibleNeedsReview" => 3,
+            "notUsable" => 4,
+            _ => 5
+        };
 
     private static List<UeLibraryModel> LoadModels(
         string root,
