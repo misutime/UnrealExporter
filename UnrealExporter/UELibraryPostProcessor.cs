@@ -98,9 +98,32 @@ internal static class UELibraryPostProcessor
         var libraryHealth = RunStage("写健康报告", () => WriteLibraryHealth(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeDebugJson));
         var libraryAcceptance = RunStage("写验收报告", () => WriteLibraryAcceptance(root, mergedCatalogRows, reports, textureLinks, materialTextureSlots, componentAssetRelations, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, writeDebugJson));
         RunStage("写SQLite索引", () => WriteLibraryIndexDb(root, mergedCatalogRows, reports, materialIndex.Values, textureLinks, materialTextureSlots, sharedGltfTextureLinks, componentAssetRelations, packageObjectMaps, skeletonGroups, modelAnimationRelations, modelCoverage, animationValidation, sourceIndex, libraryHealth, libraryAcceptance, textureDedupeSummary));
+        RunStage("写统一素材库入口", () => WriteAssetLibraryManifest(root));
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
+    }
+
+    private static void WriteAssetLibraryManifest(string root)
+    {
+        var manifest = new JObject
+        {
+            ["schemaVersion"] = 1,
+            ["libraryKind"] = "AssetLibrary",
+            ["libraryName"] = new DirectoryInfo(root).Name,
+            ["sourceTool"] = "UnrealExporter",
+            ["sourceGame"] = "",
+            ["createdUtc"] = DateTimeOffset.UtcNow.ToString("O"),
+            ["index"] = "library_index.db",
+            ["capabilities"] = new JObject
+            {
+                ["models"] = true,
+                ["animations"] = true,
+                ["animationPreviewComposer"] = "unreal-ueanim"
+            }
+        };
+
+        File.WriteAllText(Path.Combine(root, "asset_library.json"), manifest.ToString(Formatting.Indented), new UTF8Encoding(false));
     }
 
     public static void MaterializeAnimationMetadataSidecars(string libraryRoot, bool writeDebugJson = false)

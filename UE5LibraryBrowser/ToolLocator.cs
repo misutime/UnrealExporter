@@ -44,4 +44,38 @@ internal static class ToolLocator
 
         return null;
     }
+
+    public static string? FindAnimeStudioCliProject()
+    {
+        foreach (var root in CandidateRoots())
+        {
+            var sibling = Path.GetFullPath(Path.Combine(root, "..", "AnimeStudio", "AnimeStudio.CLI", "AnimeStudio.CLI.csproj"));
+            if (File.Exists(sibling))
+                return sibling;
+
+            var nested = Path.Combine(root, "AnimeStudio.CLI", "AnimeStudio.CLI.csproj");
+            if (File.Exists(nested))
+                return nested;
+        }
+
+        var fixedPath = @"D:\misutime\AnimeStudio\AnimeStudio.CLI\AnimeStudio.CLI.csproj";
+        return File.Exists(fixedPath) ? fixedPath : null;
+    }
+
+    private static IEnumerable<string> CandidateRoots()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null)
+        {
+            yield return directory.FullName;
+            directory = directory.Parent;
+        }
+
+        var cwd = new DirectoryInfo(Environment.CurrentDirectory);
+        while (cwd != null)
+        {
+            yield return cwd.FullName;
+            cwd = cwd.Parent;
+        }
+    }
 }

@@ -13,6 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\AssetLibrary.Core\AssetLibrary.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="OpenTK" Version="4.9.4" />
     <PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />

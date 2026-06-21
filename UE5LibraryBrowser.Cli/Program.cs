@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using System.Text.Json;
 using UE5LibraryBrowser;
 
@@ -21,6 +22,12 @@ internal static class Program
                 return 0;
             }
 
+            if (args.Length == 2 && args[0].Equals("validate-library", StringComparison.OrdinalIgnoreCase))
+            {
+                ValidateLibrary(args[1]);
+                return 0;
+            }
+
             PrintUsage();
             return 2;
         }
@@ -33,7 +40,7 @@ internal static class Program
 
     private static async Task BuildThumbnailsAsync(string root, int concurrency, int limit)
     {
-        var index = UeLibraryIndexReader.Load(root);
+        var index = AssetLibraryIndexReader.Load(root);
         concurrency = Math.Clamp(concurrency, 1, 24);
         var viewerSafeCache = new ViewerSafeGltfCache(index.Root);
         using var thumbnails = new ThumbnailService(index.Root, viewerSafeCache, concurrency);
@@ -45,7 +52,7 @@ internal static class Program
         var failed = 0;
         var startedAt = DateTime.UtcNow;
 
-        Console.WriteLine($"Building UE thumbnails: root={index.Root}");
+        Console.WriteLine($"Building asset thumbnails: root={index.Root}");
         Console.WriteLine($"Models={models.Length}, concurrency={concurrency}, renderer={thumbnails.RendererLabel}");
 
         var workers = Enumerable.Range(0, concurrency)
@@ -95,10 +102,33 @@ internal static class Program
         Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
     }
 
+    private static void ValidateLibrary(string root)
+    {
+        var index = AssetLibraryIndexReader.Load(root);
+        var payload = new
+        {
+            root = index.Root,
+            library = index.Manifest.LibraryName,
+            sourceTool = index.Manifest.SourceTool,
+            capabilities = index.Manifest.Capabilities,
+            models = index.Models.Count,
+            modelsWithAnimations = index.Models.Count(x => x.AnimationCount > 0),
+            animations = index.Models.Sum(x => x.AnimationCount),
+            animationUsages = index.AnimationUsages.Count,
+            animationGroups = index.AnimationGroups.Count,
+            textures = index.Textures.Count,
+            materials = index.Materials.Count,
+            usableAnimations = index.AnimationsByModel.Values.SelectMany(x => x).Count(x => x.IsUsableCandidate),
+            source = "library_index.db"
+        };
+        Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
     private static void PrintUsage()
     {
-        Console.WriteLine("UE5LibraryBrowser.Cli");
+        Console.WriteLine("AssetLibraryBrowser.Cli");
         Console.WriteLine("Usage:");
         Console.WriteLine("  build-thumbnails <libraryRoot> [concurrency=4] [limit=0]");
+        Console.WriteLine("  validate-library <libraryRoot>");
     }
 }

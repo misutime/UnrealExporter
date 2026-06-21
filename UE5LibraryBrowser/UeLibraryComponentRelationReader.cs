@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using Microsoft.Data.Sqlite;
 
 namespace UE5LibraryBrowser;
@@ -93,7 +94,7 @@ internal static class UeLibraryComponentRelationReader
                 TargetPath = ReadString(reader, 7),
                 TargetName = ReadString(reader, 8),
                 TargetAssetKind = ReadString(reader, 9),
-                TargetAssetOutput = UeLibraryIndexReader.ResolveLibraryPath(root, ReadString(reader, 10)),
+                TargetAssetOutput = AssetLibraryIndexReader.ResolveLibraryPath(root, ReadString(reader, 10)),
                 MatchStatus = ReadString(reader, 11),
                 MatchReason = ReadString(reader, 12),
                 SocketName = ReadString(reader, 13)

@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
@@ -33,10 +34,10 @@ internal sealed class ThumbnailService : IDisposable
 
     public string RendererLabel => HasF3d ? "OpenGL worker + F3D fallback" : "OpenGL worker";
 
-    public bool IsCached(UeLibraryModel model)
+    public bool IsCached(AssetLibraryModel model)
         => File.Exists(GetCachePath(model));
 
-    public async Task<ThumbnailResult> GetThumbnailAsync(UeLibraryModel model, CancellationToken cancellationToken)
+    public async Task<ThumbnailResult> GetThumbnailAsync(AssetLibraryModel model, CancellationToken cancellationToken)
     {
         var cachePath = GetCachePath(model);
         if (File.Exists(cachePath))
@@ -54,7 +55,7 @@ internal sealed class ThumbnailService : IDisposable
         }
     }
 
-    private async Task<ThumbnailResult> RenderThumbnailAsync(UeLibraryModel model, string cachePath, CancellationToken cancellationToken)
+    private async Task<ThumbnailResult> RenderThumbnailAsync(AssetLibraryModel model, string cachePath, CancellationToken cancellationToken)
     {
         var modelPath = _viewerSafeCache.GetViewerSafeModelPath(model.Output);
         var persistentError = "";
@@ -94,7 +95,7 @@ internal sealed class ThumbnailService : IDisposable
         return new ThumbnailResult(BuildPlaceholder(model), false, false, reason);
     }
 
-    private string GetCachePath(UeLibraryModel model)
+    private string GetCachePath(AssetLibraryModel model)
     {
         var sourceStamp = File.Exists(model.Output) ? File.GetLastWriteTimeUtc(model.Output).Ticks.ToString() : "missing";
         return Path.Combine(_cacheRoot, Hash(ThumbnailCacheVersion + "|" + model.Output + "|" + sourceStamp) + ".png");
@@ -160,7 +161,7 @@ internal sealed class ThumbnailService : IDisposable
         return new Bitmap(loaded);
     }
 
-    private static Image BuildPlaceholder(UeLibraryModel model)
+    private static Image BuildPlaceholder(AssetLibraryModel model)
     {
         var bitmap = new Bitmap(220, 150);
         using var g = Graphics.FromImage(bitmap);

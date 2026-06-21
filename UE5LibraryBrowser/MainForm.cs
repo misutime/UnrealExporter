@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -47,7 +48,7 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _assetFilterDebounce = new() { Interval = FilterDebounceMs };
     private readonly System.Windows.Forms.Timer _componentFilterDebounce = new() { Interval = FilterDebounceMs };
     private readonly StatusStrip _statusStrip = new();
-    private readonly ToolStripStatusLabel _statusLabel = new("请选择 UE5 素材库");
+    private readonly ToolStripStatusLabel _statusLabel = new("请选择统一素材库");
     private readonly TabControl _mainTabs = new();
     private readonly TabPage _modelsPage = new("模型");
     private readonly TabPage _globalAnimationsPage = new("全局动画");
@@ -85,19 +86,19 @@ internal sealed class MainForm : Form
     private readonly TextBox _assetDetails = new();
     private readonly TextBox _componentDetails = new();
     private readonly Image _placeholder = BuildPlaceholderImage();
-    private readonly List<UeLibraryModel> _visibleModels = [];
+    private readonly List<AssetLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Image> _modelThumbnailImages = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _modelThumbnailDisplayRequests = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
-    private readonly List<UeLibraryAsset> _visibleAssets = [];
+    private readonly List<AssetLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
+    private readonly List<AssetLibraryAsset> _visibleAssets = [];
     private readonly List<UeLibraryComponentSummary> _componentSummaries = [];
     private readonly List<UeLibraryComponentSummary> _visibleComponentSummaries = [];
     private CancellationTokenSource? _componentLoadCts;
     private readonly RecentLibraryStore _recentStore = new();
 
-    private UeLibraryIndex? _index;
-    private UeLibraryCurationStore? _curationStore;
+    private AssetLibraryIndex? _index;
+    private AssetLibraryCurationStore? _curationStore;
     private ThumbnailService? _thumbnails;
     private PreviewComposer? _previewComposer;
     private ViewerSafeGltfCache? _viewerSafeCache;
@@ -123,7 +124,7 @@ internal sealed class MainForm : Form
     public MainForm(string? initialRoot)
     {
         _initialRoot = initialRoot;
-        Text = "UE5 Library Browser";
+        Text = "Asset Library Browser";
         LoadAppIcon();
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1500, 860);
@@ -985,18 +986,19 @@ internal sealed class MainForm : Form
             _thumbnails?.Dispose();
             ClearModelThumbnailImages();
 
-            var index = await Task.Run(() => UeLibraryIndexReader.Load(root));
+            var index = await Task.Run(() => AssetLibraryIndexReader.Load(root));
             _root = index.Root;
             _index = index;
-            _curationStore = new UeLibraryCurationStore(_root);
+            _curationStore = new AssetLibraryCurationStore(_root);
             _viewerSafeCache = new ViewerSafeGltfCache(_root);
             _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
-            _previewComposer = new PreviewComposer(_root, _viewerSafeCache);
+            _previewComposer = new PreviewComposer(index, _viewerSafeCache);
 
             _recentStore.Add(_root);
             RebuildRecentMenu();
+            ApplyLibraryCapabilities();
             RebuildModelKindFilter();
-            _statusLabel.Text = $"已打开: {_root}";
+            _statusLabel.Text = $"已打开: {index.Manifest.LibraryName} ({index.Manifest.SourceTool})  {_root}";
             RebuildModelGrid();
             RebuildGlobalAnimationList();
             RebuildAssetGrid();
@@ -1015,6 +1017,32 @@ internal sealed class MainForm : Form
         finally
         {
             UseWaitCursor = false;
+        }
+    }
+
+    private void ApplyLibraryCapabilities()
+    {
+        var animationsEnabled = _index?.Capabilities.Animations == true;
+        var globalTabPresent = _mainTabs.TabPages.Contains(_globalAnimationsPage);
+        if (animationsEnabled && !globalTabPresent)
+        {
+            _mainTabs.TabPages.Insert(Math.Min(1, _mainTabs.TabPages.Count), _globalAnimationsPage);
+        }
+        else if (!animationsEnabled && globalTabPresent)
+        {
+            _mainTabs.TabPages.Remove(_globalAnimationsPage);
+        }
+
+        _animationFilter.Enabled = animationsEnabled;
+        _animationGrid.Enabled = animationsEnabled;
+        if (!animationsEnabled)
+        {
+            _animationGrid.Rows.Clear();
+            _visibleGlobalAnimationGroups.Clear();
+            _globalAnimationList.VirtualListSize = 0;
+            _globalAnimationModelsGrid.Rows.Clear();
+            _globalAnimationDetails.Clear();
+            _globalAnimationHeader.Text = "全局动画: 当前素材库未声明独立动画";
         }
     }
 
@@ -1054,7 +1082,7 @@ internal sealed class MainForm : Form
             RequestThumbnailRangeForVisibleItems(0, Math.Min(_visibleModels.Count - 1, ThumbnailVirtualPrefetchAfter));
     }
 
-    private Image GetModelImage(UeLibraryModel model)
+    private Image GetModelImage(AssetLibraryModel model)
     {
         return _modelThumbnailImages.TryGetValue(model.Output, out var image)
             ? image
@@ -1068,7 +1096,7 @@ internal sealed class MainForm : Form
         _modelThumbnailImages.Clear();
     }
 
-    private IReadOnlyList<UeLibraryModel> BuildThumbnailItems(IReadOnlyList<UeLibraryModel> items)
+    private IReadOnlyList<AssetLibraryModel> BuildThumbnailItems(IReadOnlyList<AssetLibraryModel> items)
     {
         if (_thumbnails == null || items.Count == 0)
             return [];
@@ -1079,7 +1107,7 @@ internal sealed class MainForm : Form
             .ToArray();
     }
 
-    private IOrderedEnumerable<UeLibraryModel> SortModels(IEnumerable<UeLibraryModel> models)
+    private IOrderedEnumerable<AssetLibraryModel> SortModels(IEnumerable<AssetLibraryModel> models)
     {
         var sort = _modelSortBox.SelectedItem as string ?? "推荐优先";
         return sort switch
@@ -1128,7 +1156,7 @@ internal sealed class MainForm : Form
         };
     }
 
-    private static IOrderedEnumerable<UeLibraryModel> SortModelsByRecommendation(IEnumerable<UeLibraryModel> models)
+    private static IOrderedEnumerable<AssetLibraryModel> SortModelsByRecommendation(IEnumerable<AssetLibraryModel> models)
         => models
             .OrderByDescending(x => x.TrustedAnimationCount)
             .ThenByDescending(x => x.CompatibleAnimationCount)
@@ -1136,7 +1164,7 @@ internal sealed class MainForm : Form
             .ThenByDescending(x => x.AnimationCount)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase);
 
-    private void RebuildAnimationGrid(UeLibraryModel? model)
+    private void RebuildAnimationGrid(AssetLibraryModel? model)
     {
         _animationGrid.Rows.Clear();
         if (_index == null || model == null)
@@ -1146,7 +1174,14 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var key = UeLibraryIndexReader.MakeLibraryRelative(_root, model.Output);
+        if (!_index.Capabilities.Animations)
+        {
+            _animationHeader.Text = $"模型详情: {model.Name}";
+            _details.Text = BuildModelDetails(model);
+            return;
+        }
+
+        var key = AssetLibraryIndexReader.MakeLibraryRelative(_root, model.Output);
         _index.AnimationsByModel.TryGetValue(key, out var animations);
         animations ??= [];
 
@@ -1188,7 +1223,7 @@ internal sealed class MainForm : Form
 
     private void RebuildGlobalAnimationList()
     {
-        if (_index == null)
+        if (_index == null || !_index.Capabilities.Animations)
         {
             _globalAnimationHeader.Text = "全局动画";
             _globalAnimationList.VirtualListSize = 0;
@@ -1458,7 +1493,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void StartThumbnailQueue(IReadOnlyList<UeLibraryModel> items)
+    private void StartThumbnailQueue(IReadOnlyList<AssetLibraryModel> items)
     {
         _thumbnailCts?.Cancel();
         _thumbnailCts = new CancellationTokenSource();
@@ -1556,7 +1591,7 @@ internal sealed class MainForm : Form
     }
 
     private async Task LoadThumbnailsAsync(
-        UeLibraryModel[] items,
+        AssetLibraryModel[] items,
         ThumbnailService thumbnails,
         CancellationToken cancellationToken,
         int generation)
@@ -1621,7 +1656,7 @@ internal sealed class MainForm : Form
     }
 
     private async Task LoadOneThumbnailAsync(
-        UeLibraryModel model,
+        AssetLibraryModel model,
         ThumbnailService thumbnails,
         CancellationToken cancellationToken,
         int generation)
@@ -1755,6 +1790,12 @@ internal sealed class MainForm : Form
 
     private async Task GenerateAndOpenSelectedAnimationAsync()
     {
+        if (_index?.Capabilities.CanComposeAnimationPreview != true)
+        {
+            MessageBox.Show(this, "当前素材库没有声明动画预览合成器。", "动画不可直接预览", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
         var model = GetSelectedModel();
         var animation = GetSelectedAnimation();
         if (model == null || animation == null || _previewComposer == null)
@@ -1830,7 +1871,7 @@ internal sealed class MainForm : Form
         _componentDetails.Text = summary == null ? "" : BuildComponentSummaryDetails(summary);
     }
 
-    private UeLibraryModel? GetSelectedModel()
+    private AssetLibraryModel? GetSelectedModel()
     {
         var index = _modelList.SelectedIndex;
         if (index < 0)
@@ -1839,10 +1880,10 @@ internal sealed class MainForm : Form
         return index >= 0 && index < _visibleModels.Count ? _visibleModels[index] : null;
     }
 
-    private UeLibraryAnimation? GetSelectedAnimation()
-        => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as UeLibraryAnimation;
+    private AssetLibraryAnimation? GetSelectedAnimation()
+        => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as AssetLibraryAnimation;
 
-    private UeLibraryAnimationGroup? GetSelectedGlobalAnimationGroup()
+    private AssetLibraryAnimationGroup? GetSelectedGlobalAnimationGroup()
     {
         if (_globalAnimationList.SelectedIndices.Count == 0)
             return null;
@@ -1851,12 +1892,12 @@ internal sealed class MainForm : Form
         return index >= 0 && index < _visibleGlobalAnimationGroups.Count ? _visibleGlobalAnimationGroups[index] : null;
     }
 
-    private UeLibraryAnimationUsage? GetSelectedGlobalAnimationUsage()
+    private AssetLibraryAnimationUsage? GetSelectedGlobalAnimationUsage()
         => _globalAnimationModelsGrid.SelectedRows.Count == 0
             ? null
-            : _globalAnimationModelsGrid.SelectedRows[0].Tag as UeLibraryAnimationUsage;
+            : _globalAnimationModelsGrid.SelectedRows[0].Tag as AssetLibraryAnimationUsage;
 
-    private UeLibraryAsset? GetSelectedAsset()
+    private AssetLibraryAsset? GetSelectedAsset()
     {
         if (_assetList.SelectedIndices.Count == 0)
             return null;
@@ -2016,6 +2057,12 @@ internal sealed class MainForm : Form
 
     private async Task GenerateAndOpenSelectedGlobalAnimationPreviewAsync()
     {
+        if (_index?.Capabilities.CanComposeAnimationPreview != true)
+        {
+            MessageBox.Show(this, "当前素材库没有声明动画预览合成器。", "动画不可直接预览", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
         var usage = GetSelectedGlobalAnimationUsage();
         if (usage == null)
         {
@@ -2098,7 +2145,7 @@ internal sealed class MainForm : Form
         grid.Rows[hit.RowIndex].Selected = true;
     }
 
-    private string BuildModelCardText(UeLibraryModel model)
+    private string BuildModelCardText(AssetLibraryModel model)
     {
         var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
         if (_curationStore?.IsFavoriteModel(model) == true)
@@ -2106,7 +2153,7 @@ internal sealed class MainForm : Form
         return $"{name}{Environment.NewLine}动画 {model.AnimationCount}";
     }
 
-    private bool MatchesModelKindFilter(UeLibraryModel model)
+    private bool MatchesModelKindFilter(AssetLibraryModel model)
     {
         var kind = _modelKindBox.SelectedItem as string ?? "All";
         if (string.Equals(kind, "All", StringComparison.OrdinalIgnoreCase))
@@ -2116,7 +2163,7 @@ internal sealed class MainForm : Form
         return string.Equals(modelKind, kind, StringComparison.OrdinalIgnoreCase);
     }
 
-    private bool MatchesModelQualityFilter(UeLibraryModel model)
+    private bool MatchesModelQualityFilter(AssetLibraryModel model)
     {
         var quality = _modelQualityBox.SelectedItem as string ?? "全部质量";
         return quality switch
@@ -2138,7 +2185,7 @@ internal sealed class MainForm : Form
         };
     }
 
-    private bool MatchesCurationFilter(UeLibraryModel model)
+    private bool MatchesCurationFilter(AssetLibraryModel model)
     {
         if (_hideIgnoredButton.Checked && _curationStore?.IsIgnored(model) == true)
             return false;
@@ -2147,7 +2194,7 @@ internal sealed class MainForm : Form
         return true;
     }
 
-    private bool MatchesThumbnailStateFilter(UeLibraryModel model)
+    private bool MatchesThumbnailStateFilter(AssetLibraryModel model)
     {
         var state = _thumbnailStateBox.SelectedItem as string ?? "全部";
         if (string.Equals(state, "全部", StringComparison.OrdinalIgnoreCase) || _thumbnails == null)
@@ -2162,7 +2209,7 @@ internal sealed class MainForm : Form
         };
     }
 
-    private static bool MatchesModelFilter(UeLibraryModel model, SearchQuery filter)
+    private static bool MatchesModelFilter(AssetLibraryModel model, SearchQuery filter)
         => filter.Matches(
             model.Name,
             model.Output,
@@ -2173,7 +2220,7 @@ internal sealed class MainForm : Form
             model.SourceType,
             model.ValidationStatus);
 
-    private static bool MatchesAnimationFilter(UeLibraryAnimation animation, SearchQuery filter)
+    private static bool MatchesAnimationFilter(AssetLibraryAnimation animation, SearchQuery filter)
         => filter.Matches(
             animation.Name,
             animation.Output,
@@ -2187,7 +2234,7 @@ internal sealed class MainForm : Form
             animation.ValidationReason,
             animation.EvidenceSummary);
 
-    private static bool MatchesGlobalAnimationFilter(UeLibraryAnimationGroup group, SearchQuery filter)
+    private static bool MatchesGlobalAnimationFilter(AssetLibraryAnimationGroup group, SearchQuery filter)
     {
         var animation = group.Representative;
         return filter.Matches(
@@ -2207,7 +2254,7 @@ internal sealed class MainForm : Form
             }.Concat(group.Usages.SelectMany(x => new[] { x.Model.Name, x.Model.Output })));
     }
 
-    private static bool MatchesAssetFilter(UeLibraryAsset asset, SearchQuery filter)
+    private static bool MatchesAssetFilter(AssetLibraryAsset asset, SearchQuery filter)
         => filter.Matches(
             asset.Name,
             asset.Kind,
@@ -2228,10 +2275,10 @@ internal sealed class MainForm : Form
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
 
-    private static bool HasModelSkeleton(UeLibraryModel model)
+    private static bool HasModelSkeleton(AssetLibraryModel model)
         => model.HasSkin || model.BoneCount > 0 || !string.IsNullOrWhiteSpace(model.SkeletonPath);
 
-    private static bool HasModelIssue(UeLibraryModel model)
+    private static bool HasModelIssue(AssetLibraryModel model)
         => model.MaterialCount <= 0
            || !HasModelSkeleton(model)
            || model.ReviewAnimationCount > 0
@@ -2245,7 +2292,7 @@ internal sealed class MainForm : Form
             cell.ToolTipText = text;
     }
 
-    private static string ShortSkeleton(UeLibraryModel model)
+    private static string ShortSkeleton(AssetLibraryModel model)
     {
         var value = !string.IsNullOrWhiteSpace(model.SkeletonName)
             ? model.SkeletonName
@@ -2256,7 +2303,7 @@ internal sealed class MainForm : Form
         return name.Length <= 36 ? name : name[..33] + "...";
     }
 
-    private string BuildModelDetails(UeLibraryModel model)
+    private string BuildModelDetails(AssetLibraryModel model)
         => $"""
            Model: {model.Name}
            File: {model.Output}
@@ -2271,7 +2318,7 @@ internal sealed class MainForm : Form
            Ignored: {_curationStore?.IsIgnored(model) == true}
            """;
 
-    private string BuildAnimationDetails(UeLibraryModel model, UeLibraryAnimation animation)
+    private string BuildAnimationDetails(AssetLibraryModel model, AssetLibraryAnimation animation)
         => $"""
            Model: {model.Name}
            Model file: {model.Output}
@@ -2302,7 +2349,7 @@ internal sealed class MainForm : Form
            Favorite: {_curationStore?.IsFavoriteAnimation(animation) == true}
            """;
 
-    private string BuildGlobalAnimationGroupDetails(UeLibraryAnimationGroup group)
+    private string BuildGlobalAnimationGroupDetails(AssetLibraryAnimationGroup group)
     {
         var animation = group.Representative;
         return $"""
@@ -2328,7 +2375,7 @@ internal sealed class MainForm : Form
                """;
     }
 
-    private string BuildAssetCardText(UeLibraryAsset asset)
+    private string BuildAssetCardText(AssetLibraryAsset asset)
     {
         var name = asset.Name.Length <= 24 ? asset.Name : asset.Name[..21] + "...";
         if (string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase))
@@ -2339,7 +2386,7 @@ internal sealed class MainForm : Form
         return $"{name}{Environment.NewLine}{asset.ResourceKind}{Environment.NewLine}{shared} {size}";
     }
 
-    private string BuildAssetDetails(UeLibraryAsset asset)
+    private string BuildAssetDetails(AssetLibraryAsset asset)
         => string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase)
             ? $"""
                Material: {asset.Name}
@@ -2402,7 +2449,7 @@ internal sealed class MainForm : Form
            Socket: {relation.SocketName}
            """;
 
-    private string GetAssetImageKey(UeLibraryAsset asset)
+    private string GetAssetImageKey(AssetLibraryAsset asset)
     {
         if (string.Equals(asset.Kind, "Material", StringComparison.OrdinalIgnoreCase))
             return "__material";
@@ -2484,7 +2531,7 @@ internal sealed class MainForm : Form
         return $"{value:0.##} {units[unit]}";
     }
 
-    private static string DisplayUsageEvidence(UeLibraryAnimation animation)
+    private static string DisplayUsageEvidence(AssetLibraryAnimation animation)
     {
         if (animation.IsExplicitUsage)
             return "显式使用";
@@ -2493,7 +2540,7 @@ internal sealed class MainForm : Form
         return string.IsNullOrWhiteSpace(animation.UsageEvidence) ? "未知" : animation.UsageEvidence;
     }
 
-    private static string DisplayRecommendedUse(UeLibraryAnimation animation)
+    private static string DisplayRecommendedUse(AssetLibraryAnimation animation)
         => animation.RecommendedUse switch
         {
             "defaultTrusted" => animation.IsPreviewable ? "默认可信" : "默认可信(不可预览)",
@@ -2504,7 +2551,7 @@ internal sealed class MainForm : Form
             _ => string.IsNullOrWhiteSpace(animation.RecommendedUse) ? "未知" : animation.RecommendedUse
         };
 
-    private static string DisplayRelationshipKind(UeLibraryAnimation animation)
+    private static string DisplayRelationshipKind(AssetLibraryAnimation animation)
         => animation.RelationshipKind switch
         {
             "deterministicUsage" => "确定使用",
@@ -2516,7 +2563,7 @@ internal sealed class MainForm : Form
 
     private readonly record struct AnimationDisplay(string Match, string Status, Color BadgeBackColor, Color BadgeForeColor);
 
-    private static AnimationDisplay GetAnimationDisplay(UeLibraryAnimation animation)
+    private static AnimationDisplay GetAnimationDisplay(AssetLibraryAnimation animation)
     {
         if (string.Equals(animation.ValidationStatus, "error", StringComparison.OrdinalIgnoreCase)
             || string.Equals(animation.RecommendedUse, "notUsable", StringComparison.OrdinalIgnoreCase))

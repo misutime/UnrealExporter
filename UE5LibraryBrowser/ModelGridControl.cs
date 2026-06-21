@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 namespace UE5LibraryBrowser;
 
 using System.ComponentModel;
@@ -7,7 +8,7 @@ internal sealed class ModelGridControl : UserControl
     private const int CellPadding = 8;
     private readonly VScrollBar _scroll = new() { Dock = DockStyle.Right };
     private readonly ToolTip _tooltip = new();
-    private IReadOnlyList<UeLibraryModel> _items = Array.Empty<UeLibraryModel>();
+    private IReadOnlyList<AssetLibraryModel> _items = Array.Empty<AssetLibraryModel>();
     private int _hoverIndex = -1;
     private int _selectedIndex = -1;
 
@@ -42,19 +43,19 @@ internal sealed class ModelGridControl : UserControl
     public int SelectedIndex => _selectedIndex;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Func<UeLibraryModel, Image>? ImageProvider { get; set; }
+    public Func<AssetLibraryModel, Image>? ImageProvider { get; set; }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Func<UeLibraryModel, string>? TextProvider { get; set; }
+    public Func<AssetLibraryModel, string>? TextProvider { get; set; }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Func<UeLibraryModel, string>? TooltipProvider { get; set; }
+    public Func<AssetLibraryModel, string>? TooltipProvider { get; set; }
 
     public event EventHandler? SelectedIndexChanged;
     public event EventHandler? ItemActivated;
     public event Action<int, int>? VisibleRangeNeeded;
 
-    public void SetItems(IReadOnlyList<UeLibraryModel> items, bool selectFirst = true)
+    public void SetItems(IReadOnlyList<AssetLibraryModel> items, bool selectFirst = true)
     {
         _items = items;
         _selectedIndex = selectFirst && _items.Count > 0 ? 0 : -1;

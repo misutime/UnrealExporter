@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,19 +10,33 @@ internal sealed record PreviewResult(bool Success, string OutputPath, string Rep
 internal sealed class PreviewComposer
 {
     private const string PreviewCacheVersion = "preview-v3-conservative-trs-no-scale";
+    private readonly AssetLibraryIndex _index;
     private readonly string _libraryRoot;
     private readonly string _cacheRoot;
     private readonly ViewerSafeGltfCache _viewerSafeCache;
 
-    public PreviewComposer(string libraryRoot, ViewerSafeGltfCache viewerSafeCache)
+    public PreviewComposer(AssetLibraryIndex index, ViewerSafeGltfCache viewerSafeCache)
     {
-        _libraryRoot = libraryRoot;
-        _cacheRoot = Path.Combine(libraryRoot, ".ue5_browser_cache", "animation_previews");
+        _index = index;
+        _libraryRoot = index.Root;
+        _cacheRoot = Path.Combine(_libraryRoot, ".asset_browser_cache", "animation_previews");
         _viewerSafeCache = viewerSafeCache;
         Directory.CreateDirectory(_cacheRoot);
     }
 
-    public async Task<PreviewResult> EnsurePreviewAsync(UeLibraryModel model, UeLibraryAnimation animation, CancellationToken cancellationToken)
+    public async Task<PreviewResult> EnsurePreviewAsync(AssetLibraryModel model, AssetLibraryAnimation animation, CancellationToken cancellationToken)
+    {
+        if (!_index.Capabilities.CanComposeAnimationPreview)
+            return new PreviewResult(false, "", "", "当前素材库没有声明动画预览合成器。");
+
+        var composer = _index.Capabilities.AnimationPreviewComposer ?? "";
+        if (composer.Contains("AnimeStudio", StringComparison.OrdinalIgnoreCase))
+            return await EnsureAnimeStudioPreviewAsync(model, animation, cancellationToken);
+
+        return await EnsureUnrealPreviewAsync(model, animation, cancellationToken);
+    }
+
+    private async Task<PreviewResult> EnsureUnrealPreviewAsync(AssetLibraryModel model, AssetLibraryAnimation animation, CancellationToken cancellationToken)
     {
         var modelPath = _viewerSafeCache.GetViewerSafeModelPath(model.Output);
         if (!File.Exists(modelPath))
@@ -31,7 +46,7 @@ internal sealed class PreviewComposer
         if (!animation.IsPreviewable)
             return new PreviewResult(false, "", "", "这个动画不是最高可信可预览候选，或是容器/metadata 动画。");
 
-        var directory = Path.Combine(_cacheRoot, Hash(PreviewCacheVersion + "|" + modelPath + "|" + animation.Output));
+        var directory = Path.Combine(_cacheRoot, Hash(PreviewCacheVersion + "|unreal|" + modelPath + "|" + animation.Output));
         Directory.CreateDirectory(directory);
         var output = Path.Combine(directory, $"{SafeName(model.Name)}__{SafeName(animation.Name)}.preview.glb");
         var report = Path.Combine(directory, "preview_validation.db");
@@ -65,6 +80,60 @@ internal sealed class PreviewComposer
         start.ArgumentList.Add("--report-db");
         start.ArgumentList.Add(report);
 
+        return await RunPreviewProcessAsync(start, output, report, cancellationToken);
+    }
+
+    private async Task<PreviewResult> EnsureAnimeStudioPreviewAsync(AssetLibraryModel model, AssetLibraryAnimation animation, CancellationToken cancellationToken)
+    {
+        if (!File.Exists(model.Output))
+            return new PreviewResult(false, "", "", "模型文件不存在。");
+        if (!File.Exists(animation.Output))
+            return new PreviewResult(false, "", "", "动画 sidecar 文件不存在。");
+        if (!animation.IsPreviewable)
+            return new PreviewResult(false, "", "", "这个动画不是可预览候选。");
+
+        var directory = Path.Combine(_cacheRoot, Hash(PreviewCacheVersion + "|animestudio|" + model.Output + "|" + animation.Output));
+        Directory.CreateDirectory(directory);
+        var output = Path.Combine(directory, $"{SafeName(model.Name)}__{SafeName(animation.Name)}.preview.gltf");
+        var report = Path.Combine(directory, "preview_report.json");
+        if (File.Exists(output))
+            return new PreviewResult(true, output, report, "使用缓存 preview。");
+
+        var project = ToolLocator.FindAnimeStudioCliProject();
+        if (project == null)
+            return new PreviewResult(false, output, report, "没有找到 AnimeStudio.CLI 项目，无法合成 preview。");
+
+        var start = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = Path.GetDirectoryName(Path.GetDirectoryName(project)) ?? _libraryRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("run");
+        start.ArgumentList.Add("--project");
+        start.ArgumentList.Add(project);
+        start.ArgumentList.Add("--framework");
+        start.ArgumentList.Add("net9.0-windows");
+        start.ArgumentList.Add("--");
+        start.ArgumentList.Add("compose-preview");
+        start.ArgumentList.Add("--library-root");
+        start.ArgumentList.Add(_libraryRoot);
+        start.ArgumentList.Add("--model");
+        start.ArgumentList.Add(model.Output);
+        start.ArgumentList.Add("--animation");
+        start.ArgumentList.Add(animation.Output);
+        start.ArgumentList.Add("--output");
+        start.ArgumentList.Add(output);
+        start.ArgumentList.Add("--report");
+        start.ArgumentList.Add(report);
+
+        return await RunPreviewProcessAsync(start, output, report, cancellationToken);
+    }
+
+    private static async Task<PreviewResult> RunPreviewProcessAsync(ProcessStartInfo start, string output, string report, CancellationToken cancellationToken)
+    {
         using var process = Process.Start(start);
         if (process == null)
             return new PreviewResult(false, output, report, "无法启动 dotnet。");
@@ -109,7 +178,6 @@ internal sealed class PreviewComposer
         }
 
         var start = new ProcessStartInfo(f3d) { UseShellExecute = false };
-        start.ArgumentList.Add("--blending=ddp");
         start.ArgumentList.Add("--tone-mapping");
         start.ArgumentList.Add("--hdri-ambient");
         start.ArgumentList.Add("--anti-aliasing=fxaa");

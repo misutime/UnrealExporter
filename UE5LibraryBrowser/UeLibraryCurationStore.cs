@@ -1,8 +1,9 @@
+using AssetLibrary.Core;
 using System.Text.Json;
 
 namespace UE5LibraryBrowser;
 
-internal sealed class UeLibraryCurationStore
+internal sealed class AssetLibraryCurationStore
 {
     private readonly string _root;
     private readonly string _path;
@@ -10,7 +11,7 @@ internal sealed class UeLibraryCurationStore
     private readonly HashSet<string> _favoriteModelKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _favoriteAnimationKeys = new(StringComparer.OrdinalIgnoreCase);
 
-    public UeLibraryCurationStore(string root)
+    public AssetLibraryCurationStore(string root)
     {
         _root = Path.GetFullPath(root);
         var browserDir = Path.Combine(_root, ".ue5_browser_cache");
@@ -19,16 +20,16 @@ internal sealed class UeLibraryCurationStore
         Load();
     }
 
-    public bool IsIgnored(UeLibraryModel? model)
+    public bool IsIgnored(AssetLibraryModel? model)
         => model != null && _ignoredModelKeys.Contains(ModelKey(model));
 
-    public bool IsFavoriteModel(UeLibraryModel? model)
+    public bool IsFavoriteModel(AssetLibraryModel? model)
         => model != null && _favoriteModelKeys.Contains(ModelKey(model));
 
-    public bool IsFavoriteAnimation(UeLibraryAnimation? animation)
+    public bool IsFavoriteAnimation(AssetLibraryAnimation? animation)
         => animation != null && _favoriteAnimationKeys.Contains(AnimationKey(animation));
 
-    public void SetIgnored(UeLibraryModel? model, bool ignored)
+    public void SetIgnored(AssetLibraryModel? model, bool ignored)
     {
         if (model == null)
             return;
@@ -37,7 +38,7 @@ internal sealed class UeLibraryCurationStore
         Rewrite();
     }
 
-    public void SetFavoriteModel(UeLibraryModel? model, bool favorite)
+    public void SetFavoriteModel(AssetLibraryModel? model, bool favorite)
     {
         if (model == null)
             return;
@@ -46,7 +47,7 @@ internal sealed class UeLibraryCurationStore
         Rewrite();
     }
 
-    public void SetFavoriteAnimation(UeLibraryAnimation? animation, bool favorite)
+    public void SetFavoriteAnimation(AssetLibraryAnimation? animation, bool favorite)
     {
         if (animation == null)
             return;
@@ -126,9 +127,9 @@ internal sealed class UeLibraryCurationStore
         }));
     }
 
-    private string ModelKey(UeLibraryModel model)
-        => UeLibraryIndexReader.MakeLibraryRelative(_root, model.Output);
+    private string ModelKey(AssetLibraryModel model)
+        => AssetLibraryIndexReader.MakeLibraryRelative(_root, model.Output);
 
-    private string AnimationKey(UeLibraryAnimation animation)
-        => UeLibraryIndexReader.MakeLibraryRelative(_root, animation.Output);
+    private string AnimationKey(AssetLibraryAnimation animation)
+        => AssetLibraryIndexReader.MakeLibraryRelative(_root, animation.Output);
 }

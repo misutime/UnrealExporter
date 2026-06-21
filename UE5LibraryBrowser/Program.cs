@@ -1,3 +1,4 @@
+using AssetLibrary.Core;
 using System.Text.Json;
 using System.Runtime.InteropServices;
 
@@ -113,10 +114,13 @@ internal static class Program
 
     private static void ValidateLibrary(string root)
     {
-        var index = UeLibraryIndexReader.Load(root);
+        var index = AssetLibraryIndexReader.Load(root);
         var payload = new
         {
             root = index.Root,
+            library = index.Manifest.LibraryName,
+            sourceTool = index.Manifest.SourceTool,
+            capabilities = index.Manifest.Capabilities,
             models = index.Models.Count,
             modelsWithAnimations = index.Models.Count(x => x.AnimationCount > 0),
             animations = index.Models.Sum(x => x.AnimationCount),
@@ -132,7 +136,7 @@ internal static class Program
 
     private static async Task BuildThumbnailsAsync(string root, int concurrency, int limit)
     {
-        var index = UeLibraryIndexReader.Load(root);
+        var index = AssetLibraryIndexReader.Load(root);
         concurrency = Math.Clamp(concurrency, 1, 24);
         var viewerSafeCache = new ViewerSafeGltfCache(index.Root);
         using var thumbnails = new ThumbnailService(index.Root, viewerSafeCache, concurrency);
@@ -143,7 +147,7 @@ internal static class Program
         var cached = 0;
         var failed = 0;
 
-        Console.WriteLine($"Building UE thumbnails: root={index.Root}");
+        Console.WriteLine($"Building asset thumbnails: root={index.Root}");
         Console.WriteLine($"Models={models.Length}, concurrency={concurrency}, renderer={thumbnails.RendererLabel}");
 
         var workers = Enumerable.Range(0, concurrency)
@@ -208,11 +212,11 @@ internal static class Program
 
     private static async Task SmokePreviewAsync(string root)
     {
-        var index = UeLibraryIndexReader.Load(root);
+        var index = AssetLibraryIndexReader.Load(root);
         var pair = index.Models
             .Select(model =>
             {
-                var key = UeLibraryIndexReader.MakeLibraryRelative(index.Root, model.Output);
+                var key = AssetLibraryIndexReader.MakeLibraryRelative(index.Root, model.Output);
                 index.AnimationsByModel.TryGetValue(key, out var animations);
                 return new
                 {
@@ -226,7 +230,7 @@ internal static class Program
             throw new InvalidDataException("没有找到可预览的模型动画组合。");
 
         var viewerSafeCache = new ViewerSafeGltfCache(index.Root);
-        var composer = new PreviewComposer(index.Root, viewerSafeCache);
+        var composer = new PreviewComposer(index, viewerSafeCache);
         var result = await composer.EnsurePreviewAsync(pair.Model, pair.Animation, CancellationToken.None);
         var payload = new
         {
