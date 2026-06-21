@@ -35,7 +35,8 @@ internal sealed class MainForm : Form
     private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
     private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
     private readonly ToolStripButton _restartThumbnailsButton = new("重启缩略图");
-    private readonly ToolStripLabel _statusLabel = new("请选择 UE5 素材库");
+    private readonly StatusStrip _statusStrip = new();
+    private readonly ToolStripStatusLabel _statusLabel = new("请选择 UE5 素材库");
     private readonly TabControl _mainTabs = new();
     private readonly TabPage _modelsPage = new("模型");
     private readonly TabPage _globalAnimationsPage = new("全局动画");
@@ -159,11 +160,11 @@ internal sealed class MainForm : Form
             _thumbnailConcurrencyBox,
             _restartThumbnailsButton,
             _showFavoriteModelsButton,
-            _hideIgnoredButton,
-            new ToolStripSeparator(),
-            _statusLabel
+            _hideIgnoredButton
         ]);
         Controls.Add(_toolbar);
+        ConfigureStatusStrip();
+        Controls.Add(_statusStrip);
         RebuildRecentMenu();
 
         _mainTabs.Dock = DockStyle.Fill;
@@ -173,6 +174,8 @@ internal sealed class MainForm : Form
         _mainTabs.TabPages.Add(_componentsPage);
         Controls.Add(_mainTabs);
         _mainTabs.BringToFront();
+        _statusStrip.BringToFront();
+        _toolbar.BringToFront();
 
         var split = new SplitContainer
         {
@@ -410,6 +413,14 @@ internal sealed class MainForm : Form
         right.Controls.Add(_componentDetails, 0, 2);
     }
 
+    private void ConfigureStatusStrip()
+    {
+        _statusStrip.SizingGrip = false;
+        _statusLabel.Spring = true;
+        _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _statusStrip.Items.Add(_statusLabel);
+    }
+
     private void ConfigureToolbarFilters()
     {
         _modelKindBox.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -460,8 +471,8 @@ internal sealed class MainForm : Form
 
         _thumbnailConcurrencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _thumbnailConcurrencyBox.Width = 56;
-        _thumbnailConcurrencyBox.Items.AddRange(["1", "2", "3", "4", "6", "8", "12"]);
-        _thumbnailConcurrencyBox.SelectedItem = Math.Clamp(Environment.ProcessorCount / 4, 1, 3).ToString();
+        _thumbnailConcurrencyBox.Items.AddRange(["2", "4", "6", "8", "12", "16", "24"]);
+        _thumbnailConcurrencyBox.SelectedItem = "16";
         _thumbnailConcurrencyBox.ToolTipText = "后台缩略图渲染并发；数值越高越快，但会占用更多 CPU/GPU/内存";
 
         _restartThumbnailsButton.ToolTipText = "按当前筛选与并发设置重新启动缩略图队列";
@@ -1524,9 +1535,9 @@ internal sealed class MainForm : Form
     private int GetThumbnailConcurrency()
     {
         if (int.TryParse(_thumbnailConcurrencyBox.SelectedItem as string, out var selected))
-            return Math.Clamp(selected, 1, 12);
+            return Math.Clamp(selected, 1, 24);
 
-        return Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
+        return 16;
     }
 
     private void SafeBeginInvoke(Action action)
