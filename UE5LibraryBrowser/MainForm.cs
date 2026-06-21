@@ -58,11 +58,10 @@ internal sealed class MainForm : Form
     private readonly TextBox _globalAnimationFilter = new();
     private readonly TextBox _assetFilter = new();
     private readonly TextBox _componentFilter = new();
-    private readonly ListView _modelList = new();
+    private readonly ModelGridControl _modelList = new();
     private readonly ListView _globalAnimationList = new();
     private readonly ListView _assetList = new();
     private readonly ListView _componentSummaryList = new();
-    private readonly ImageList _modelImages = new();
     private readonly ImageList _assetImages = new();
     private readonly DataGridView _animationGrid = new();
     private readonly DataGridView _globalAnimationModelsGrid = new();
@@ -88,7 +87,7 @@ internal sealed class MainForm : Form
     private readonly Image _placeholder = BuildPlaceholderImage();
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, int> _modelImageIndices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Image> _modelThumbnailImages = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _modelThumbnailDisplayRequests = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
     private readonly List<UeLibraryAsset> _visibleAssets = [];
@@ -114,6 +113,9 @@ internal sealed class MainForm : Form
     private bool _thumbnailStatusUpdateScheduled;
     private int _pendingThumbnailStart = int.MaxValue;
     private int _pendingThumbnailEnd = -1;
+    private int _deferredThumbnailStart = int.MaxValue;
+    private int _deferredThumbnailEnd = -1;
+    private bool _thumbnailRangeDeferred;
     private string _root = "";
     private string? _initialRoot;
     private bool _suppressFilterEvents;
@@ -164,6 +166,7 @@ internal sealed class MainForm : Form
         _componentFilterDebounce.Dispose();
         _thumbnailCts?.Cancel();
         _thumbnails?.Dispose();
+        ClearModelThumbnailImages();
         base.OnFormClosing(e);
     }
 
@@ -569,29 +572,16 @@ internal sealed class MainForm : Form
 
     private void ConfigureModelList()
     {
-        _modelImages.ImageSize = new Size(168, 168);
-        _modelImages.ColorDepth = ColorDepth.Depth32Bit;
-        _modelImages.Images.Add("__placeholder", _placeholder);
-        _modelImageIndices["__placeholder"] = 0;
-
         _modelList.Dock = DockStyle.Fill;
-        _modelList.View = View.LargeIcon;
-        _modelList.LargeImageList = _modelImages;
-        _modelList.MultiSelect = false;
-        _modelList.HideSelection = false;
-        _modelList.LabelWrap = true;
-        _modelList.ShowItemToolTips = true;
-        _modelList.Sorting = SortOrder.None;
+        _modelList.CellWidth = LargeIconCellWidth;
+        _modelList.CellHeight = LargeIconCellHeight;
+        _modelList.ThumbnailSize = 168;
         _modelList.BackColor = SystemColors.Window;
         _modelList.BorderStyle = BorderStyle.FixedSingle;
-        _modelList.VirtualMode = true;
-        _modelList.RetrieveVirtualItem += ModelList_RetrieveVirtualItem;
-        _modelList.CacheVirtualItems += ModelList_CacheVirtualItems;
-        _modelList.HandleCreated += (_, _) =>
-        {
-            EnableListViewDoubleBuffer(_modelList);
-            SetLargeIconSpacing(_modelList);
-        };
+        _modelList.ImageProvider = GetModelImage;
+        _modelList.TextProvider = BuildModelCardText;
+        _modelList.TooltipProvider = BuildModelDetails;
+        _modelList.VisibleRangeNeeded += RequestThumbnailRangeForVisibleItems;
 
         _modelMenu.Items.Add("复制模型路径", null, (_, _) => CopySelectedModelPath());
         _modelMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedModelSource());
@@ -797,8 +787,7 @@ internal sealed class MainForm : Form
         _hideIgnoredButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _animationFilter.TextChanged += (_, _) => ScheduleDebounced(_animationFilterDebounce, () => RebuildAnimationGrid(GetSelectedModel()));
         _modelList.SelectedIndexChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
-        _modelList.DoubleClick += (_, _) => OpenSelectedModel();
-        _modelList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_modelList, e);
+        _modelList.ItemActivated += (_, _) => OpenSelectedModel();
         _animationGrid.SelectionChanged += (_, _) => ShowSelectedAnimationDetails();
         _animationGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedAnimationAsync();
         _animationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_animationGrid, e);
@@ -986,7 +975,7 @@ internal sealed class MainForm : Form
         {
             UseWaitCursor = true;
             _statusLabel.Text = "正在读取 library_index.db...";
-            _modelList.VirtualListSize = 0;
+            _modelList.SetItems([]);
             _visibleModels.Clear();
             _visibleModelIndices.Clear();
             _animationGrid.Rows.Clear();
@@ -994,6 +983,7 @@ internal sealed class MainForm : Form
             _thumbnailCts?.Cancel();
             _thumbnailCts = new CancellationTokenSource();
             _thumbnails?.Dispose();
+            ClearModelThumbnailImages();
 
             var index = await Task.Run(() => UeLibraryIndexReader.Load(root));
             _root = index.Root;
@@ -1042,7 +1032,6 @@ internal sealed class MainForm : Form
             .Where(MatchesThumbnailStateFilter);
         models = SortModels(models).ToList();
 
-        _modelList.BeginUpdate();
         _visibleModels.Clear();
         _visibleModelIndices.Clear();
         _visibleModels.AddRange(models);
@@ -1050,18 +1039,11 @@ internal sealed class MainForm : Form
         {
             _visibleModelIndices[_visibleModels[i].Output] = i;
         }
-        _modelList.VirtualListSize = _visibleModels.Count;
-        _modelList.EndUpdate();
+        _modelList.SetItems(_visibleModels);
 
         _modelHeader.Text = $"模型 {models.Count()}/{_index.Models.Count}";
         _animationHeader.Text = "动画";
-        if (_modelList.VirtualListSize > 0)
-        {
-            _modelList.SelectedIndices.Clear();
-            _modelList.SelectedIndices.Add(0);
-            _modelList.EnsureVisible(0);
-        }
-        else
+        if (_modelList.VirtualListSize == 0)
         {
             RebuildAnimationGrid(null);
         }
@@ -1072,32 +1054,18 @@ internal sealed class MainForm : Form
             RequestThumbnailRangeForVisibleItems(0, Math.Min(_visibleModels.Count - 1, ThumbnailVirtualPrefetchAfter));
     }
 
-    private void ModelList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    private Image GetModelImage(UeLibraryModel model)
     {
-        if (e.ItemIndex < 0 || e.ItemIndex >= _visibleModels.Count)
-        {
-            e.Item = new ListViewItem("");
-            return;
-        }
-
-        var model = _visibleModels[e.ItemIndex];
-        _modelThumbnailDisplayRequests.Add(model.Output);
-        var imageIndex = _modelImageIndices.TryGetValue(model.Output, out var cachedImageIndex)
-            ? cachedImageIndex
-            : _modelImageIndices["__placeholder"];
-        if (imageIndex == _modelImageIndices["__placeholder"])
-            RequestThumbnailRangeForVisibleItems(e.ItemIndex, e.ItemIndex);
-
-        e.Item = new ListViewItem(BuildModelCardText(model), imageIndex)
-        {
-            Tag = model,
-            ToolTipText = BuildModelDetails(model)
-        };
+        return _modelThumbnailImages.TryGetValue(model.Output, out var image)
+            ? image
+            : _placeholder;
     }
 
-    private void ModelList_CacheVirtualItems(object? sender, CacheVirtualItemsEventArgs e)
+    private void ClearModelThumbnailImages()
     {
-        RequestThumbnailRangeForVisibleItems(e.StartIndex, e.EndIndex);
+        foreach (var image in _modelThumbnailImages.Values)
+            image.Dispose();
+        _modelThumbnailImages.Clear();
     }
 
     private IReadOnlyList<UeLibraryModel> BuildThumbnailItems(IReadOnlyList<UeLibraryModel> items)
@@ -1106,7 +1074,7 @@ internal sealed class MainForm : Form
             return [];
 
         return items
-            .Where(x => !_modelImageIndices.ContainsKey(x.Output))
+            .Where(x => !_modelThumbnailImages.ContainsKey(x.Output))
             .OrderBy(x => _visibleModelIndices.TryGetValue(x.Output, out var index) ? index : int.MaxValue)
             .ToArray();
     }
@@ -1531,7 +1499,12 @@ internal sealed class MainForm : Form
         var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
         var completed = Math.Max(0, Volatile.Read(ref _thumbnailCompleted));
         if (active > 0 || completed < total)
+        {
+            _deferredThumbnailStart = Math.Min(_deferredThumbnailStart, startIndex);
+            _deferredThumbnailEnd = Math.Max(_deferredThumbnailEnd, endIndex);
+            _thumbnailRangeDeferred = true;
             return;
+        }
 
         var items = BuildThumbnailItems(requestedItems);
         if (items.Count == 0)
@@ -1624,7 +1597,27 @@ internal sealed class MainForm : Form
         }
 
         if (!cancellationToken.IsCancellationRequested && IsCurrentThumbnailQueue(generation))
+        {
             ScheduleThumbnailStatusUpdate();
+            ProcessDeferredThumbnailRange();
+        }
+    }
+
+    private void ProcessDeferredThumbnailRange()
+    {
+        SafeBeginInvoke(() =>
+        {
+            if (!_thumbnailRangeDeferred)
+                return;
+
+            var start = _deferredThumbnailStart;
+            var end = _deferredThumbnailEnd;
+            _deferredThumbnailStart = int.MaxValue;
+            _deferredThumbnailEnd = -1;
+            _thumbnailRangeDeferred = false;
+            if (start <= end)
+                QueueThumbnailRangeForVisibleItems(start, end);
+        });
     }
 
     private async Task LoadOneThumbnailAsync(
@@ -1657,11 +1650,9 @@ internal sealed class MainForm : Form
                 SafeBeginInvoke(() =>
                 {
                     var key = model.Output;
-                    if (!_modelImageIndices.ContainsKey(key))
+                    if (!_modelThumbnailImages.ContainsKey(key))
                     {
-                        var imageIndex = _modelImages.Images.Count;
-                        _modelImages.Images.Add(key, thumbnail.Image);
-                        _modelImageIndices[key] = imageIndex;
+                        _modelThumbnailImages[key] = thumbnail.Image;
                     }
                     else
                     {
@@ -1670,7 +1661,7 @@ internal sealed class MainForm : Form
 
                     if (_visibleModelIndices.TryGetValue(key, out var index) && index >= 0 && index < _modelList.VirtualListSize)
                     {
-                        _modelList.RedrawItems(index, index, true);
+                        _modelList.RefreshItem(index);
                     }
                     ScheduleThumbnailStatusUpdate();
                 });
@@ -1841,10 +1832,10 @@ internal sealed class MainForm : Form
 
     private UeLibraryModel? GetSelectedModel()
     {
-        if (_modelList.SelectedIndices.Count == 0)
+        var index = _modelList.SelectedIndex;
+        if (index < 0)
             return null;
 
-        var index = _modelList.SelectedIndices[0];
         return index >= 0 && index < _visibleModels.Count ? _visibleModels[index] : null;
     }
 

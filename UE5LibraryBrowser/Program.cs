@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Runtime.InteropServices;
 
 namespace UE5LibraryBrowser;
 
@@ -7,6 +8,9 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (IsCommandLineMode(args))
+            AttachParentConsole();
+
         if (args.Length == 3 && args[0].Equals("--render-thumbnail", StringComparison.OrdinalIgnoreCase))
         {
             using var renderer = new PersistentGltfThumbnailRenderer();
@@ -54,6 +58,25 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MainForm(args.FirstOrDefault()));
+    }
+
+    private static bool IsCommandLineMode(string[] args)
+        => args.Length > 0
+           && args[0].StartsWith("--", StringComparison.Ordinal)
+           && !args[0].Equals("--thumbnail-worker", StringComparison.OrdinalIgnoreCase);
+
+    private static void AttachParentConsole()
+    {
+        try
+        {
+            AttachConsole(-1);
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+        }
+        catch
+        {
+            // GUI launches may not have a parent console.
+        }
     }
 
     private static void RunThumbnailWorker()
@@ -232,4 +255,7 @@ internal static class Program
         public bool Success { get; set; }
         public string Error { get; set; } = "";
     }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int dwProcessId);
 }
