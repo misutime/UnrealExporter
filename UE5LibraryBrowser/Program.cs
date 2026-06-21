@@ -26,6 +26,18 @@ internal static class Program
             return;
         }
 
+        if (args.Length is 2 or 3 or 4 && args[0].Equals("--build-thumbnails", StringComparison.OrdinalIgnoreCase))
+        {
+            var concurrency = args.Length >= 3 && int.TryParse(args[2], out var parsedConcurrency)
+                ? parsedConcurrency
+                : 4;
+            var limit = args.Length == 4 && int.TryParse(args[3], out var parsedLimit)
+                ? parsedLimit
+                : 0;
+            BuildThumbnailsAsync(args[1], concurrency, limit).GetAwaiter().GetResult();
+            return;
+        }
+
         if (args.Length == 2 && args[0].Equals("--validate-components", StringComparison.OrdinalIgnoreCase))
         {
             ValidateComponents(args[1]);
@@ -93,6 +105,59 @@ internal static class Program
             source = "library_index.db"
         };
         Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static async Task BuildThumbnailsAsync(string root, int concurrency, int limit)
+    {
+        var index = UeLibraryIndexReader.Load(root);
+        concurrency = Math.Clamp(concurrency, 1, 24);
+        var viewerSafeCache = new ViewerSafeGltfCache(index.Root);
+        using var thumbnails = new ThumbnailService(index.Root, viewerSafeCache, concurrency);
+
+        var models = (limit > 0 ? index.Models.Take(limit) : index.Models).ToArray();
+        var nextIndex = -1;
+        var completed = 0;
+        var cached = 0;
+        var failed = 0;
+
+        Console.WriteLine($"Building UE thumbnails: root={index.Root}");
+        Console.WriteLine($"Models={models.Length}, concurrency={concurrency}, renderer={thumbnails.RendererLabel}");
+
+        var workers = Enumerable.Range(0, concurrency)
+            .Select(_ => Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var index = Interlocked.Increment(ref nextIndex);
+                    if (index >= models.Length)
+                        break;
+
+                    var model = models[index];
+                    try
+                    {
+                        var result = await thumbnails.GetThumbnailAsync(model, CancellationToken.None).ConfigureAwait(false);
+                        if (result.FromCache)
+                            Interlocked.Increment(ref cached);
+                        if (!result.Success)
+                            Interlocked.Increment(ref failed);
+                        result.Image.Dispose();
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref failed);
+                    }
+
+                    var done = Interlocked.Increment(ref completed);
+                    if (done % 100 == 0 || done == models.Length)
+                    {
+                        Console.WriteLine($"thumbnail progress {done}/{models.Length}, cached={Volatile.Read(ref cached)}, failed={Volatile.Read(ref failed)}");
+                    }
+                }
+            }))
+            .ToArray();
+
+        await Task.WhenAll(workers).ConfigureAwait(false);
+        Console.WriteLine($"thumbnail build finished: total={models.Length}, cached={cached}, failed={failed}");
     }
 
     private static void ValidateComponents(string root)

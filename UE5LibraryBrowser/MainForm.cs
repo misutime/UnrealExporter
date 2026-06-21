@@ -18,9 +18,9 @@ internal sealed class MainForm : Form
     private const int ThumbnailVirtualPrefetchBefore = 48;
     private const int ThumbnailVirtualPrefetchAfter = 192;
     private const int ThumbnailVirtualBatchLimit = 720;
-    private const int ThumbnailInitialPriorityCount = 360;
     private const int ThumbnailQueueBatchSize = 80;
     private const int ThumbnailQueueBatchPauseMs = 500;
+    private const int FilterDebounceMs = 300;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
     private readonly ToolStripDropDownButton _recentButton = new("最近");
@@ -41,6 +41,11 @@ internal sealed class MainForm : Form
     private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
     private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
     private readonly ToolStripButton _restartThumbnailsButton = new("重启缩略图");
+    private readonly System.Windows.Forms.Timer _modelFilterDebounce = new() { Interval = FilterDebounceMs };
+    private readonly System.Windows.Forms.Timer _animationFilterDebounce = new() { Interval = FilterDebounceMs };
+    private readonly System.Windows.Forms.Timer _globalAnimationFilterDebounce = new() { Interval = FilterDebounceMs };
+    private readonly System.Windows.Forms.Timer _assetFilterDebounce = new() { Interval = FilterDebounceMs };
+    private readonly System.Windows.Forms.Timer _componentFilterDebounce = new() { Interval = FilterDebounceMs };
     private readonly StatusStrip _statusStrip = new();
     private readonly ToolStripStatusLabel _statusLabel = new("请选择 UE5 素材库");
     private readonly TabControl _mainTabs = new();
@@ -152,6 +157,11 @@ internal sealed class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _modelFilterDebounce.Dispose();
+        _animationFilterDebounce.Dispose();
+        _globalAnimationFilterDebounce.Dispose();
+        _assetFilterDebounce.Dispose();
+        _componentFilterDebounce.Dispose();
         _thumbnailCts?.Cancel();
         _thumbnails?.Dispose();
         base.OnFormClosing(e);
@@ -771,7 +781,12 @@ internal sealed class MainForm : Form
         _openModelButton.Click += (_, _) => OpenSelectedModel();
         _openFolderButton.Click += (_, _) => OpenSelectedModelFolder();
         _clearFilterButton.Click += (_, _) => ClearActiveFilters();
-        _modelFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
+        ConfigureDebounceTimer(_modelFilterDebounce);
+        ConfigureDebounceTimer(_animationFilterDebounce);
+        ConfigureDebounceTimer(_globalAnimationFilterDebounce);
+        ConfigureDebounceTimer(_assetFilterDebounce);
+        ConfigureDebounceTimer(_componentFilterDebounce);
+        _modelFilter.TextChanged += (_, _) => ScheduleDebounced(_modelFilterDebounce, RebuildModelGrid);
         _modelKindBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _modelQualityBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _thumbnailStateBox.SelectedIndexChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
@@ -780,21 +795,21 @@ internal sealed class MainForm : Form
         _restartThumbnailsButton.Click += (_, _) => RestartThumbnailQueue();
         _showFavoriteModelsButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
         _hideIgnoredButton.CheckedChanged += (_, _) => { if (!_suppressFilterEvents) RebuildModelGrid(); };
-        _animationFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildAnimationGrid(GetSelectedModel()); };
+        _animationFilter.TextChanged += (_, _) => ScheduleDebounced(_animationFilterDebounce, () => RebuildAnimationGrid(GetSelectedModel()));
         _modelList.SelectedIndexChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
         _modelList.DoubleClick += (_, _) => OpenSelectedModel();
         _modelList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_modelList, e);
         _animationGrid.SelectionChanged += (_, _) => ShowSelectedAnimationDetails();
         _animationGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedAnimationAsync();
         _animationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_animationGrid, e);
-        _globalAnimationFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildGlobalAnimationList(); };
+        _globalAnimationFilter.TextChanged += (_, _) => ScheduleDebounced(_globalAnimationFilterDebounce, RebuildGlobalAnimationList);
         _globalAnimationList.SelectedIndexChanged += (_, _) => RebuildGlobalAnimationModelsGrid();
         _globalAnimationList.DoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
         _globalAnimationList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_globalAnimationList, e);
         _globalAnimationModelsGrid.SelectionChanged += (_, _) => ShowSelectedGlobalAnimationUsageDetails();
         _globalAnimationModelsGrid.CellDoubleClick += async (_, _) => await GenerateAndOpenSelectedGlobalAnimationPreviewAsync();
         _globalAnimationModelsGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_globalAnimationModelsGrid, e);
-        _assetFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildAssetGrid(); };
+        _assetFilter.TextChanged += (_, _) => ScheduleDebounced(_assetFilterDebounce, RebuildAssetGrid);
         _assetList.SelectedIndexChanged += (_, _) => ShowSelectedAssetDetails();
         _assetList.DoubleClick += (_, _) => OpenSelectedAsset();
         _assetList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_assetList, e);
@@ -804,7 +819,7 @@ internal sealed class MainForm : Form
             if (_mainTabs.SelectedTab == _componentsPage)
                 _ = EnsureComponentSummariesLoadedAsync();
         };
-        _componentFilter.TextChanged += (_, _) => { if (!_suppressFilterEvents) RebuildComponentSummaryGrid(); };
+        _componentFilter.TextChanged += (_, _) => ScheduleDebounced(_componentFilterDebounce, RebuildComponentSummaryGrid);
         _componentSummaryList.SelectedIndexChanged += async (_, _) => await LoadSelectedComponentRelationsAsync();
         _componentSummaryList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_componentSummaryList, e);
         _componentRelationGrid.SelectionChanged += (_, _) => ShowSelectedComponentRelationDetails();
@@ -820,6 +835,24 @@ internal sealed class MainForm : Form
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
             await OpenLibraryAsync(dialog.SelectedPath);
+    }
+
+    private static void ConfigureDebounceTimer(System.Windows.Forms.Timer timer)
+        => timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            if (timer.Tag is Action action)
+                action();
+        };
+
+    private void ScheduleDebounced(System.Windows.Forms.Timer timer, Action action)
+    {
+        if (_suppressFilterEvents)
+            return;
+
+        timer.Tag = action;
+        timer.Stop();
+        timer.Start();
     }
 
     private string ChooseInitialBrowsePath()
@@ -1034,8 +1067,9 @@ internal sealed class MainForm : Form
         }
 
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
-        MarkInitialThumbnailPriority();
-        StartThumbnailQueue(BuildThumbnailBackfillItems(_visibleModels));
+        StartThumbnailQueue([]);
+        if (_visibleModels.Count > 0)
+            RequestThumbnailRangeForVisibleItems(0, Math.Min(_visibleModels.Count - 1, ThumbnailVirtualPrefetchAfter));
     }
 
     private void ModelList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
@@ -1066,25 +1100,15 @@ internal sealed class MainForm : Form
         RequestThumbnailRangeForVisibleItems(e.StartIndex, e.EndIndex);
     }
 
-    private IReadOnlyList<UeLibraryModel> BuildThumbnailBackfillItems(IReadOnlyList<UeLibraryModel> items)
+    private IReadOnlyList<UeLibraryModel> BuildThumbnailItems(IReadOnlyList<UeLibraryModel> items)
     {
-        var thumbnails = _thumbnails;
-        if (thumbnails == null || items.Count == 0)
+        if (_thumbnails == null || items.Count == 0)
             return [];
 
         return items
-            .Where(x => !thumbnails.IsCached(x)
-                || (_modelThumbnailDisplayRequests.Contains(x.Output) && !_modelImageIndices.ContainsKey(x.Output)))
-            .OrderByDescending(x => _modelThumbnailDisplayRequests.Contains(x.Output))
-            .ThenBy(x => _visibleModelIndices.TryGetValue(x.Output, out var index) ? index : int.MaxValue)
+            .Where(x => !_modelImageIndices.ContainsKey(x.Output))
+            .OrderBy(x => _visibleModelIndices.TryGetValue(x.Output, out var index) ? index : int.MaxValue)
             .ToArray();
-    }
-
-    private void MarkInitialThumbnailPriority()
-    {
-        var count = Math.Min(_visibleModels.Count, ThumbnailInitialPriorityCount);
-        for (var i = 0; i < count; i++)
-            _modelThumbnailDisplayRequests.Add(_visibleModels[i].Output);
     }
 
     private IOrderedEnumerable<UeLibraryModel> SortModels(IEnumerable<UeLibraryModel> models)
@@ -1509,11 +1533,11 @@ internal sealed class MainForm : Form
         if (active > 0 || completed < total)
             return;
 
-        var items = BuildThumbnailBackfillItems(_visibleModels);
+        var items = BuildThumbnailItems(requestedItems);
         if (items.Count == 0)
             return;
 
-        Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
+        Interlocked.Exchange(ref _thumbnailCandidateTotal, items.Count);
         StartThumbnailQueue(items);
     }
 
@@ -1553,7 +1577,9 @@ internal sealed class MainForm : Form
         _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
 
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
-        StartThumbnailQueue(BuildThumbnailBackfillItems(_visibleModels));
+        StartThumbnailQueue([]);
+        if (_visibleModels.Count > 0)
+            RequestThumbnailRangeForVisibleItems(0, Math.Min(_visibleModels.Count - 1, ThumbnailVirtualPrefetchAfter));
     }
 
     private async Task LoadThumbnailsAsync(
