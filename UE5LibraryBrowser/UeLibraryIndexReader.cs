@@ -172,10 +172,10 @@ internal static class UeLibraryIndexReader
         var recommendedUseSelect = hasRecommendedUse ? "ra.recommended_use" : recommendedUseFallback;
         var deterministicUsageSelect = hasDeterministicUsage
             ? "ra.is_deterministic_usage"
-            : "CASE WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 1 ELSE 0 END";
+            : $"CASE WHEN ({relationshipKindSelect}) = 'deterministicUsage' THEN 1 ELSE 0 END";
         var compatibilityCandidateSelect = hasCompatibilityCandidate
             ? "ra.is_compatibility_candidate"
-            : "CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 1 ELSE 0 END";
+            : $"CASE WHEN ({relationshipKindSelect}) = 'compatibilityCandidate' THEN 1 ELSE 0 END";
 
         using var command = connection.CreateCommand();
         command.CommandText = $"""
