@@ -33,7 +33,7 @@ internal static class UEAnimationPreviewBuilder
         try
         {
             var animation = UEAnimReader.Read(animationPath);
-            var model = ModelRoot.Load(modelPath, new ReadSettings());
+            var model = LoadModelForPreview(modelPath);
             Regex? skipBonePattern = string.IsNullOrWhiteSpace(skipBoneRegex)
                 ? null
                 : new Regex(skipBoneRegex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -191,6 +191,55 @@ internal static class UEAnimationPreviewBuilder
 
     private static Vector3 SwapYZ(Vector3 value)
         => new(value.X, value.Z, value.Y);
+
+    private static ModelRoot LoadModelForPreview(string modelPath)
+    {
+        var fullPath = Path.GetFullPath(modelPath);
+        var tempPath = TryCreateBomFreeGltfSibling(fullPath);
+        try
+        {
+            return ModelRoot.Load(tempPath ?? fullPath, new ReadSettings
+            {
+                // Preview composition should accept UnrealExporter output even when
+                // strict glTF validation would reject viewer-tolerated details.
+                Validation = SharpGLTF.Validation.ValidationMode.Skip
+            });
+        }
+        finally
+        {
+            if (tempPath != null)
+            {
+                try
+                {
+                    File.Delete(tempPath);
+                }
+                catch
+                {
+                    // A stale temp glTF is harmless; future runs use a new GUID name.
+                }
+            }
+        }
+    }
+
+    private static string? TryCreateBomFreeGltfSibling(string modelPath)
+    {
+        if (!modelPath.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        using var input = File.OpenRead(modelPath);
+        if (input.Length < 3)
+            return null;
+
+        Span<byte> bom = stackalloc byte[3];
+        if (input.Read(bom) != 3 || bom[0] != 0xEF || bom[1] != 0xBB || bom[2] != 0xBF)
+            return null;
+
+        var directory = Path.GetDirectoryName(modelPath)!;
+        var tempPath = Path.Combine(directory, $"{Path.GetFileNameWithoutExtension(modelPath)}.uepreview.{Guid.NewGuid():N}.gltf");
+        using var output = File.Create(tempPath);
+        input.CopyTo(output);
+        return tempPath;
+    }
 
     // Swapping Y/Z is a handedness-changing basis reflection; quaternion W must flip too.
     private static Quaternion SwapYZ(Quaternion value)

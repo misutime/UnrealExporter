@@ -3442,7 +3442,7 @@ internal static class UELibraryPostProcessor
 
                 if (changed)
                 {
-                    File.WriteAllText(gltfPath, gltf.ToString(Formatting.Indented), Encoding.UTF8);
+                    File.WriteAllText(gltfPath, gltf.ToString(Formatting.Indented), new UTF8Encoding(false));
                     report.EmbeddedImageCount = images.Count(x => x["bufferView"] != null);
                 }
             }

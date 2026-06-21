@@ -591,6 +591,7 @@ void main()
                     {
                         var bytes = new byte[Math.Abs(data.Stride) * bitmap.Height];
                         System.Runtime.InteropServices.Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
+                        BleedTransparentPadding(bytes, bitmap.Width, bitmap.Height);
                         return new ThumbnailTexture(
                             bytes,
                             bitmap.Width,
@@ -602,6 +603,147 @@ void main()
                     {
                         bitmap.UnlockBits(data);
                     }
+                }
+
+                private static void BleedTransparentPadding(byte[] bgra, int width, int height)
+                {
+                    if (width <= 0 || height <= 0 || bgra.Length < width * height * 4)
+                    {
+                        return;
+                    }
+
+                    var fillable = new bool[width * height];
+                    var filled = new bool[width * height];
+                    var hasFillable = false;
+                    var hasSource = false;
+
+                    for (var i = 0; i < width * height; i++)
+                    {
+                        var offset = i * 4;
+                        var b = bgra[offset];
+                        var g = bgra[offset + 1];
+                        var r = bgra[offset + 2];
+                        var a = bgra[offset + 3];
+                        var nearBlack = r + g + b < 48;
+                        if (a <= 12 || (a < 220 && nearBlack))
+                        {
+                            fillable[i] = true;
+                            hasFillable = true;
+                        }
+                        else
+                        {
+                            filled[i] = true;
+                            hasSource = true;
+                        }
+                    }
+
+                    if (!hasFillable || !hasSource)
+                    {
+                        return;
+                    }
+
+                    var next = new byte[bgra.Length];
+                    for (var pass = 0; pass < 12; pass++)
+                    {
+                        var changed = false;
+                        System.Buffer.BlockCopy(bgra, 0, next, 0, bgra.Length);
+                        var nextFilled = (bool[])filled.Clone();
+
+                        for (var y = 0; y < height; y++)
+                        {
+                            for (var x = 0; x < width; x++)
+                            {
+                                var index = y * width + x;
+                                if (!fillable[index] || filled[index])
+                                {
+                                    continue;
+                                }
+
+                                if (!TryAverageNeighbors(bgra, filled, width, height, x, y, out var b, out var g, out var r))
+                                {
+                                    continue;
+                                }
+
+                                var offset = index * 4;
+                                next[offset] = b;
+                                next[offset + 1] = g;
+                                next[offset + 2] = r;
+                                next[offset + 3] = 255;
+                                nextFilled[index] = true;
+                                changed = true;
+                            }
+                        }
+
+                        if (!changed)
+                        {
+                            return;
+                        }
+
+                        System.Buffer.BlockCopy(next, 0, bgra, 0, bgra.Length);
+                        filled = nextFilled;
+                    }
+                }
+
+                private static bool TryAverageNeighbors(
+                    byte[] bgra,
+                    bool[] filled,
+                    int width,
+                    int height,
+                    int x,
+                    int y,
+                    out byte b,
+                    out byte g,
+                    out byte r)
+                {
+                    var count = 0;
+                    var sumB = 0;
+                    var sumG = 0;
+                    var sumR = 0;
+                    for (var dy = -1; dy <= 1; dy++)
+                    {
+                        var ny = y + dy;
+                        if (ny < 0 || ny >= height)
+                        {
+                            continue;
+                        }
+
+                        for (var dx = -1; dx <= 1; dx++)
+                        {
+                            if (dx == 0 && dy == 0)
+                            {
+                                continue;
+                            }
+
+                            var nx = x + dx;
+                            if (nx < 0 || nx >= width)
+                            {
+                                continue;
+                            }
+
+                            var index = ny * width + nx;
+                            if (!filled[index])
+                            {
+                                continue;
+                            }
+
+                            var offset = index * 4;
+                            sumB += bgra[offset];
+                            sumG += bgra[offset + 1];
+                            sumR += bgra[offset + 2];
+                            count++;
+                        }
+                    }
+
+                    if (count == 0)
+                    {
+                        b = g = r = 0;
+                        return false;
+                    }
+
+                    b = (byte)(sumB / count);
+                    g = (byte)(sumG / count);
+                    r = (byte)(sumR / count);
+                    return true;
                 }
 
                 public Vector4 Sample(System.Numerics.Vector2 uv)

@@ -8,7 +8,7 @@ namespace UE5LibraryBrowser;
 
 internal sealed class ThumbnailService : IDisposable
 {
-    private const string ThumbnailCacheVersion = "opengl-v1";
+    private const string ThumbnailCacheVersion = "opengl-v2-alpha-aware";
     private readonly string _cacheRoot;
     private readonly string? _f3dConsole;
     private readonly ViewerSafeGltfCache _viewerSafeCache;
@@ -115,6 +115,10 @@ internal sealed class ThumbnailService : IDisposable
             RedirectStandardError = true
         };
         start.ArgumentList.Add("--no-config");
+        start.ArgumentList.Add("--blending=ddp");
+        start.ArgumentList.Add("--tone-mapping");
+        start.ArgumentList.Add("--hdri-ambient");
+        start.ArgumentList.Add("--anti-aliasing=fxaa");
         start.ArgumentList.Add("--resolution");
         start.ArgumentList.Add("256,256");
         start.ArgumentList.Add("--background-color");
