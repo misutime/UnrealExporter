@@ -18,8 +18,9 @@ internal sealed class MainForm : Form
     private const int ThumbnailVirtualPrefetchBefore = 48;
     private const int ThumbnailVirtualPrefetchAfter = 192;
     private const int ThumbnailVirtualBatchLimit = 720;
-    private const int ThumbnailQueueBatchSize = 100;
-    private const int ThumbnailQueueBatchPauseMs = 250;
+    private const int ThumbnailInitialPriorityCount = 360;
+    private const int ThumbnailQueueBatchSize = 80;
+    private const int ThumbnailQueueBatchPauseMs = 500;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
     private readonly ToolStripDropDownButton _recentButton = new("最近");
@@ -545,8 +546,8 @@ internal sealed class MainForm : Form
 
         _thumbnailConcurrencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _thumbnailConcurrencyBox.Width = 56;
-        _thumbnailConcurrencyBox.Items.AddRange(["2", "4", "6", "8", "12", "16", "24"]);
-        _thumbnailConcurrencyBox.SelectedItem = "16";
+        _thumbnailConcurrencyBox.Items.AddRange(["2", "3", "4", "6", "8", "12", "16", "24"]);
+        _thumbnailConcurrencyBox.SelectedItem = "4";
         _thumbnailConcurrencyBox.ToolTipText = "后台缩略图渲染并发；数值越高越快，但会占用更多 CPU/GPU/内存";
 
         _restartThumbnailsButton.ToolTipText = "按当前筛选与并发设置重新启动缩略图队列";
@@ -608,11 +609,11 @@ internal sealed class MainForm : Form
         _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _animationGrid.BackgroundColor = SystemColors.Window;
 
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 64, MinimumWidth = 360 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", FillWeight = 13, MinimumWidth = 96 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 58, MinimumWidth = 320 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时间", FillWeight = 7, MinimumWidth = 70 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Match", HeaderText = "匹配", FillWeight = 10, MinimumWidth = 82 });
         _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 6, MinimumWidth = 62 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 10, MinimumWidth = 96 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 12, MinimumWidth = 92 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
@@ -1033,6 +1034,7 @@ internal sealed class MainForm : Form
         }
 
         Interlocked.Exchange(ref _thumbnailCandidateTotal, _visibleModels.Count);
+        MarkInitialThumbnailPriority();
         StartThumbnailQueue(BuildThumbnailBackfillItems(_visibleModels));
     }
 
@@ -1076,6 +1078,13 @@ internal sealed class MainForm : Form
             .OrderByDescending(x => _modelThumbnailDisplayRequests.Contains(x.Output))
             .ThenBy(x => _visibleModelIndices.TryGetValue(x.Output, out var index) ? index : int.MaxValue)
             .ToArray();
+    }
+
+    private void MarkInitialThumbnailPriority()
+    {
+        var count = Math.Min(_visibleModels.Count, ThumbnailInitialPriorityCount);
+        for (var i = 0; i < count; i++)
+            _modelThumbnailDisplayRequests.Add(_visibleModels[i].Output);
     }
 
     private IOrderedEnumerable<UeLibraryModel> SortModels(IEnumerable<UeLibraryModel> models)
@@ -1165,8 +1174,8 @@ internal sealed class MainForm : Form
             var display = GetAnimationDisplay(animation);
             var rowIndex = _animationGrid.Rows.Add(
                 displayName,
-                display.Match,
                 animation.Duration > 0 ? animation.Duration.ToString("0.###") : "",
+                display.Match,
                 animation.TrackCount,
                 display.Status);
             var row = _animationGrid.Rows[rowIndex];
@@ -1493,13 +1502,12 @@ internal sealed class MainForm : Form
             .Skip(start)
             .Take(end - start + 1)
             .ToList();
-        var hasNewPriority = requestedItems.Any(x => !_modelThumbnailDisplayRequests.Contains(x.Output));
         foreach (var item in requestedItems)
             _modelThumbnailDisplayRequests.Add(item.Output);
         var active = Math.Max(0, Volatile.Read(ref _thumbnailActive));
         var total = Math.Max(0, Volatile.Read(ref _thumbnailTotal));
         var completed = Math.Max(0, Volatile.Read(ref _thumbnailCompleted));
-        if (!hasNewPriority && (active > 0 || completed < total))
+        if (active > 0 || completed < total)
             return;
 
         var items = BuildThumbnailBackfillItems(_visibleModels);
@@ -2502,14 +2510,17 @@ internal sealed class MainForm : Form
 
         if (!animation.IsPreviewable)
         {
-            var status = animation switch
+            var match = animation switch
             {
-                { IsContainerAnimation: true } => "容器动画",
-                { TrackCount: <= 0 } => "Track 0",
-                _ when !animation.Output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) => "无独立动画",
+                { IsContainerAnimation: true } => "容器",
+                { TrackCount: <= 0 } => "无轨道",
+                _ when !animation.Output.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) => "无文件",
                 _ => "不可预览"
             };
-            return new AnimationDisplay("需上下文", status, Color.FromArgb(232, 180, 76), Color.FromArgb(36, 28, 10));
+            var status = animation.IsContainerAnimation
+                ? "需合成"
+                : "不可预览";
+            return new AnimationDisplay(match, status, Color.FromArgb(232, 180, 76), Color.FromArgb(36, 28, 10));
         }
 
         if (animation.IsDefaultTrusted
