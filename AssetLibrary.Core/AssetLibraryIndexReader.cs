@@ -10,14 +10,14 @@ public static class AssetLibraryIndexReader
         if (!Directory.Exists(root))
             throw new DirectoryNotFoundException($"素材库目录不存在: {root}");
 
-        var dbPath = Path.Combine(root, "library_index.db");
+        var dbPath = Path.Combine(root, AssetLibrarySchema.IndexFileName);
         if (!File.Exists(dbPath))
             throw new FileNotFoundException("没有找到 library_index.db。请先运行导出工具生成统一素材库索引。", dbPath);
 
         SQLitePCL.Batteries_V2.Init();
         using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         connection.Open();
-        RequireTable(connection, "assets");
+        RequireTable(connection, AssetLibrarySchema.Tables.Assets);
 
         var hasAnimationTables = HasTable(connection, "model_animation_relations")
             && HasTable(connection, "relation_animations");
@@ -354,12 +354,12 @@ public static class AssetLibraryIndexReader
     private static Dictionary<string, ModelValidationRow> LoadModelValidation(string root, SqliteConnection connection)
     {
         var result = new Dictionary<string, ModelValidationRow>(StringComparer.OrdinalIgnoreCase);
-        if (!HasTable(connection, "model_validation"))
+        if (!HasTable(connection, AssetLibrarySchema.Tables.ModelValidation))
             return result;
 
         using var command = connection.CreateCommand();
         command.CommandText = $"""
-            SELECT {ColumnExpr(connection, "model_validation", "path", "''")},
+            SELECT {ColumnExpr(connection, "model_validation", "output", ColumnExpr(connection, "model_validation", "path", "''"))},
                    {ColumnExpr(connection, "model_validation", "status", "''")},
                    {ColumnExpr(connection, "model_validation", "material_count", "0")},
                    {ColumnExpr(connection, "model_validation", "texture_count", "0")},

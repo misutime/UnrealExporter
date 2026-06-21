@@ -15,7 +15,7 @@ public sealed class AssetLibraryManifest
 
     public static AssetLibraryManifest LoadOrDefault(string root, bool hasAnimationTables)
     {
-        var path = Path.Combine(root, "asset_library.json");
+        var path = Path.Combine(root, AssetLibrarySchema.ManifestFileName);
         if (File.Exists(path))
         {
             try
