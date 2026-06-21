@@ -704,7 +704,7 @@ internal static class UELibraryPostProcessor
         {
             try
             {
-                var info = BuildMaterialInfo(root, path, JObject.Parse(File.ReadAllText(path)));
+                var info = BuildMaterialInfo(root, path, ReadMaterialJsonObject(path));
                 if (!result.ContainsKey(info.Name))
                     result[info.Name] = info;
             }
@@ -717,10 +717,40 @@ internal static class UELibraryPostProcessor
         return result;
     }
 
+    private static JObject ReadMaterialJsonObject(string path)
+    {
+        var token = JToken.Parse(File.ReadAllText(path));
+        if (token is JObject obj)
+            return obj;
+
+        if (token is JArray array)
+        {
+            var materialObject = array
+                .OfType<JObject>()
+                .FirstOrDefault(IsMaterialExportObject);
+            if (materialObject != null)
+                return materialObject;
+        }
+
+        throw new JsonException($"Expected material JSON object or array containing a material object, got {token.Type}.");
+    }
+
+    private static bool IsMaterialExportObject(JObject obj)
+    {
+        var type = (string?)obj["Type"];
+        var cls = (string?)obj["Class"];
+        return ContainsMaterialToken(type) || ContainsMaterialToken(cls);
+    }
+
+    private static bool ContainsMaterialToken(string? value)
+        => !string.IsNullOrWhiteSpace(value) &&
+           value.Contains("Material", StringComparison.OrdinalIgnoreCase);
+
     private static MaterialInfo BuildMaterialInfo(string root, string path, JObject obj)
     {
         var textures = obj["Textures"] as JObject;
         var parameters = obj["Parameters"] as JObject;
+        var properties = obj["Properties"] as JObject;
         var colors = parameters?["Colors"] as JObject;
         var scalars = parameters?["Scalars"] as JObject;
         var switches = parameters?["Switches"] as JObject;
@@ -732,15 +762,51 @@ internal static class UELibraryPostProcessor
             RelativePath = MakeRelative(root, path),
             SizeBytes = fileInfo.Exists ? fileInfo.Length : 0,
             LastWriteUtcTicks = fileInfo.Exists ? fileInfo.LastWriteTimeUtc.Ticks : 0,
-            TextureSlotCount = textures?.Properties().Count() ?? 0,
-            ColorCount = colors?.Properties().Count() ?? 0,
-            ScalarCount = scalars?.Properties().Count() ?? 0,
-            SwitchCount = switches?.Properties().Count() ?? 0,
-            BlendMode = parameters?["BlendMode"]?.ToString(),
-            ShadingModel = parameters?["ShadingModel"]?.ToString(),
+            TextureSlotCount = textures?.Properties().Count() ?? CountTextureSlots(properties),
+            ColorCount = colors?.Properties().Count() ?? CountArray(properties?["VectorParameterValues"]),
+            ScalarCount = scalars?.Properties().Count() ?? CountArray(properties?["ScalarParameterValues"]),
+            SwitchCount = switches?.Properties().Count() ?? CountStaticSwitches(properties),
+            BlendMode = parameters?["BlendMode"]?.ToString() ?? properties?["BlendMode"]?.ToString(),
+            ShadingModel = parameters?["ShadingModel"]?.ToString() ?? properties?["ShadingModel"]?.ToString(),
             RawJson = obj,
         };
     }
+
+    private static int CountTextureSlots(JObject? properties)
+    {
+        if (properties == null)
+            return 0;
+
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in properties["TextureStreamingData"] as JArray ?? [])
+        {
+            var name = (string?)entry?["TextureName"];
+            if (!string.IsNullOrWhiteSpace(name))
+                names.Add(name);
+        }
+
+        foreach (var entry in properties["TextureParameterValues"] as JArray ?? [])
+        {
+            var name = (string?)entry?["ParameterInfo"]?["Name"] ?? (string?)entry?["ParameterName"];
+            if (!string.IsNullOrWhiteSpace(name))
+                names.Add(name);
+        }
+
+        return names.Count;
+    }
+
+    private static int CountStaticSwitches(JObject? properties)
+    {
+        if (properties == null)
+            return 0;
+
+        var staticParameters = properties["StaticParameters"];
+        return CountArray(staticParameters?["StaticSwitchParameters"]) +
+               CountArray(properties["StaticSwitchParameterValues"]);
+    }
+
+    private static int CountArray(JToken? token)
+        => token is JArray array ? array.Count : 0;
 
     private static Dictionary<string, MaterialInfo> LoadMaterialIndexFromWorkDb(string root, string[]? expectedFiles)
     {
