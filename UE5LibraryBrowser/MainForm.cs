@@ -15,6 +15,8 @@ internal sealed class MainForm : Form
     private const int LargeIconCellHeight = 156;
     private const int MaxUnfilteredThumbnailItems = 360;
     private const int MaxFilteredThumbnailItems = 1200;
+    private const int ModelPanelPreferredWidth = 1400;
+    private const int AnimationPanelMinWidth = 900;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
     private readonly ToolStripDropDownButton _recentButton = new("最近");
@@ -106,12 +108,22 @@ internal sealed class MainForm : Form
         _initialRoot = initialRoot;
         Text = "UE5 Library Browser";
         LoadAppIcon();
-        Width = 1500;
-        Height = 920;
-        MinimumSize = new Size(1100, 700);
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new Size(1500, 860);
+        ApplyDefaultWindowBounds();
 
         BuildLayout();
         WireEvents();
+    }
+
+    private void ApplyDefaultWindowBounds()
+    {
+        var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 2240, 1220);
+        var maxWidth = Math.Max(MinimumSize.Width, area.Width - 80);
+        var maxHeight = Math.Max(MinimumSize.Height, area.Height - 80);
+        var targetWidth = Math.Min(Math.Max(2200, (int)(area.Width * 0.72)), maxWidth);
+        var targetHeight = Math.Min(Math.Max(1180, (int)(area.Height * 0.82)), maxHeight);
+        Size = new Size(targetWidth, targetHeight);
     }
 
     private void LoadAppIcon()
@@ -180,9 +192,9 @@ internal sealed class MainForm : Form
         var split = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterDistance = 760,
             Orientation = Orientation.Vertical
         };
+        ConfigureResponsiveSplit(split, ModelPanelPreferredWidth, AnimationPanelMinWidth);
         _modelsPage.Controls.Add(split);
 
         var left = new TableLayoutPanel
@@ -421,6 +433,59 @@ internal sealed class MainForm : Form
         _statusStrip.Items.Add(_statusLabel);
     }
 
+    private static void ConfigureResponsiveSplit(
+        SplitContainer split,
+        int preferredPanel1Width,
+        int minPanel2Width)
+    {
+        split.HandleCreated += (_, _) => ApplyPreferredSplit(split, preferredPanel1Width, minPanel2Width);
+        split.SizeChanged += (_, _) => EnsureSplitPanel2Width(split, minPanel2Width);
+    }
+
+    private static void ApplyPreferredSplit(
+        SplitContainer split,
+        int preferredPanel1Width,
+        int minPanel2Width)
+    {
+        if (split.Width <= 0)
+            return;
+
+        var panel1MinWidth = Math.Min(520, Math.Max(25, split.Width - minPanel2Width - split.SplitterWidth));
+        if (panel1MinWidth > 0)
+            split.Panel1MinSize = panel1MinWidth;
+        var panel2MinWidth = Math.Min(minPanel2Width, Math.Max(25, split.Width - split.Panel1MinSize - split.SplitterWidth));
+        if (panel2MinWidth > 0)
+            split.Panel2MinSize = panel2MinWidth;
+
+        var maxPanel1Width = split.Width - minPanel2Width - split.SplitterWidth;
+        if (maxPanel1Width < split.Panel1MinSize)
+            return;
+
+        SetSplitterDistance(split, Math.Clamp(preferredPanel1Width, split.Panel1MinSize, maxPanel1Width));
+    }
+
+    private static void EnsureSplitPanel2Width(SplitContainer split, int minPanel2Width)
+    {
+        if (split.Width <= 0 || split.Panel2.Width >= minPanel2Width)
+            return;
+
+        var maxPanel1Width = split.Width - minPanel2Width - split.SplitterWidth;
+        if (maxPanel1Width >= split.Panel1MinSize)
+            SetSplitterDistance(split, maxPanel1Width);
+    }
+
+    private static void SetSplitterDistance(SplitContainer split, int distance)
+    {
+        try
+        {
+            split.SplitterDistance = distance;
+        }
+        catch
+        {
+            // WinForms can reject splitter changes while the handle is still settling.
+        }
+    }
+
     private void ConfigureToolbarFilters()
     {
         _modelKindBox.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -529,18 +594,18 @@ internal sealed class MainForm : Form
         _animationGrid.ReadOnly = true;
         _animationGrid.RowHeadersVisible = false;
         _animationGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _animationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
         _animationGrid.BackgroundColor = SystemColors.Window;
 
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", FillWeight = 30 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Recommended", HeaderText = "推荐", FillWeight = 12 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relationship", HeaderText = "关系", FillWeight = 12 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Confidence", HeaderText = "置信", FillWeight = 13 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "来源", FillWeight = 11 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Validation", HeaderText = "验证", FillWeight = 12 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时长", FillWeight = 8 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", FillWeight = 8 });
-        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", FillWeight = 18 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "动画", Width = 260, MinimumWidth = 160 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Recommended", HeaderText = "推荐", Width = 86, MinimumWidth = 70 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relationship", HeaderText = "关系", Width = 92, MinimumWidth = 76 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Confidence", HeaderText = "置信", Width = 94, MinimumWidth = 78 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "来源", Width = 110, MinimumWidth = 82 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Validation", HeaderText = "验证", Width = 90, MinimumWidth = 74 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Duration", HeaderText = "时长", Width = 64, MinimumWidth = 58 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tracks", HeaderText = "Track", Width = 64, MinimumWidth = 58 });
+        _animationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "文件", Width = 360, MinimumWidth = 180 });
 
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
