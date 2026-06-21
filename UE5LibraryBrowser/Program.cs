@@ -26,6 +26,12 @@ internal static class Program
             return;
         }
 
+        if (args.Length == 2 && args[0].Equals("--validate-components", StringComparison.OrdinalIgnoreCase))
+        {
+            ValidateComponents(args[1]);
+            return;
+        }
+
         if (args.Length == 2 && args[0].Equals("--smoke-preview", StringComparison.OrdinalIgnoreCase))
         {
             SmokePreviewAsync(args[1]).GetAwaiter().GetResult();
@@ -85,6 +91,29 @@ internal static class Program
             materials = index.Materials.Count,
             usableAnimations = index.AnimationsByModel.Values.SelectMany(x => x).Count(x => x.IsUsableCandidate),
             source = "library_index.db"
+        };
+        Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static void ValidateComponents(string root)
+    {
+        root = Path.GetFullPath(root);
+        var summaries = UeLibraryComponentRelationReader.LoadSummaries(root);
+        var payload = new
+        {
+            root,
+            componentSourceSummaries = summaries.Count,
+            topSources = summaries.Take(5).Select(x => new
+            {
+                x.SourcePath,
+                x.RelationCount,
+                x.OwnerCount,
+                x.ComponentCount,
+                x.ModelReferenceCount,
+                x.MaterialReferenceCount,
+                x.TextureReferenceCount,
+                x.AnimationReferenceCount
+            })
         };
         Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
     }

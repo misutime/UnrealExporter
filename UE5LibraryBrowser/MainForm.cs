@@ -31,35 +31,47 @@ internal sealed class MainForm : Form
     private readonly TabPage _modelsPage = new("模型");
     private readonly TabPage _globalAnimationsPage = new("全局动画");
     private readonly TabPage _assetsPage = new("贴图材质");
+    private readonly TabPage _componentsPage = new("组件关系");
     private readonly TextBox _modelFilter = new();
     private readonly TextBox _animationFilter = new();
     private readonly TextBox _globalAnimationFilter = new();
     private readonly TextBox _assetFilter = new();
+    private readonly TextBox _componentFilter = new();
     private readonly ListView _modelList = new();
     private readonly ListView _globalAnimationList = new();
     private readonly ListView _assetList = new();
+    private readonly ListView _componentSummaryList = new();
     private readonly ImageList _modelImages = new();
     private readonly ImageList _assetImages = new();
     private readonly DataGridView _animationGrid = new();
     private readonly DataGridView _globalAnimationModelsGrid = new();
+    private readonly DataGridView _componentRelationGrid = new();
     private readonly ContextMenuStrip _modelMenu = new();
     private readonly ContextMenuStrip _animationMenu = new();
     private readonly ContextMenuStrip _globalAnimationMenu = new();
     private readonly ContextMenuStrip _globalAnimationModelMenu = new();
     private readonly ContextMenuStrip _assetMenu = new();
+    private readonly ContextMenuStrip _componentSummaryMenu = new();
+    private readonly ContextMenuStrip _componentRelationMenu = new();
     private readonly Label _modelHeader = new();
     private readonly Label _animationHeader = new();
     private readonly Label _globalAnimationHeader = new();
     private readonly Label _globalAnimationModelsHeader = new();
     private readonly Label _assetHeader = new();
+    private readonly Label _componentHeader = new();
+    private readonly Label _componentRelationHeader = new();
     private readonly TextBox _details = new();
     private readonly TextBox _globalAnimationDetails = new();
     private readonly TextBox _assetDetails = new();
+    private readonly TextBox _componentDetails = new();
     private readonly Image _placeholder = BuildPlaceholderImage();
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<UeLibraryAnimationGroup> _visibleGlobalAnimationGroups = [];
     private readonly List<UeLibraryAsset> _visibleAssets = [];
+    private readonly List<UeLibraryComponentSummary> _componentSummaries = [];
+    private readonly List<UeLibraryComponentSummary> _visibleComponentSummaries = [];
+    private CancellationTokenSource? _componentLoadCts;
     private readonly RecentLibraryStore _recentStore = new();
 
     private UeLibraryIndex? _index;
@@ -141,6 +153,7 @@ internal sealed class MainForm : Form
         _mainTabs.TabPages.Add(_modelsPage);
         _mainTabs.TabPages.Add(_globalAnimationsPage);
         _mainTabs.TabPages.Add(_assetsPage);
+        _mainTabs.TabPages.Add(_componentsPage);
         Controls.Add(_mainTabs);
         _mainTabs.BringToFront();
 
@@ -210,6 +223,7 @@ internal sealed class MainForm : Form
 
         BuildGlobalAnimationPage();
         BuildAssetPage();
+        BuildComponentPage();
     }
 
     private void BuildGlobalAnimationPage()
@@ -314,6 +328,68 @@ internal sealed class MainForm : Form
         _assetDetails.ScrollBars = ScrollBars.Vertical;
         _assetDetails.Font = new Font("Consolas", 9);
         split.Panel2.Controls.Add(_assetDetails);
+    }
+
+    private void BuildComponentPage()
+    {
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            SplitterDistance = 680,
+            Orientation = Orientation.Vertical
+        };
+        _componentsPage.Controls.Add(split);
+
+        var left = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 3,
+            ColumnCount = 1,
+            Padding = new Padding(8)
+        };
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        split.Panel1.Controls.Add(left);
+
+        _componentHeader.Dock = DockStyle.Fill;
+        _componentHeader.TextAlign = ContentAlignment.MiddleLeft;
+        _componentHeader.Font = new Font(Font, FontStyle.Bold);
+        left.Controls.Add(_componentHeader, 0, 0);
+
+        _componentFilter.Dock = DockStyle.Fill;
+        _componentFilter.PlaceholderText = "筛选蓝图/地图 source path...";
+        left.Controls.Add(_componentFilter, 0, 1);
+
+        ConfigureComponentSummaryList();
+        left.Controls.Add(_componentSummaryList, 0, 2);
+
+        var right = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 3,
+            ColumnCount = 1,
+            Padding = new Padding(8)
+        };
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 170));
+        split.Panel2.Controls.Add(right);
+
+        _componentRelationHeader.Dock = DockStyle.Fill;
+        _componentRelationHeader.TextAlign = ContentAlignment.MiddleLeft;
+        _componentRelationHeader.Font = new Font(Font, FontStyle.Bold);
+        right.Controls.Add(_componentRelationHeader, 0, 0);
+
+        ConfigureComponentRelationGrid();
+        right.Controls.Add(_componentRelationGrid, 0, 1);
+
+        _componentDetails.Dock = DockStyle.Fill;
+        _componentDetails.Multiline = true;
+        _componentDetails.ReadOnly = true;
+        _componentDetails.ScrollBars = ScrollBars.Vertical;
+        _componentDetails.Font = new Font("Consolas", 9);
+        right.Controls.Add(_componentDetails, 0, 2);
     }
 
     private void ConfigureToolbarFilters()
@@ -505,6 +581,57 @@ internal sealed class MainForm : Form
         _assetMenu.Items.Add("复制源资源路径", null, (_, _) => CopyText(GetSelectedAsset()?.Source));
     }
 
+    private void ConfigureComponentSummaryList()
+    {
+        _componentSummaryList.Dock = DockStyle.Fill;
+        _componentSummaryList.View = View.Details;
+        _componentSummaryList.FullRowSelect = true;
+        _componentSummaryList.HideSelection = false;
+        _componentSummaryList.MultiSelect = false;
+        _componentSummaryList.VirtualMode = true;
+        _componentSummaryList.Columns.Add("Source", 330);
+        _componentSummaryList.Columns.Add("关系", 58);
+        _componentSummaryList.Columns.Add("Owner", 58);
+        _componentSummaryList.Columns.Add("组件", 58);
+        _componentSummaryList.Columns.Add("模型", 58);
+        _componentSummaryList.Columns.Add("材质", 58);
+        _componentSummaryList.Columns.Add("贴图", 58);
+        _componentSummaryList.Columns.Add("动画", 58);
+        _componentSummaryList.RetrieveVirtualItem += ComponentSummaryList_RetrieveVirtualItem;
+        _componentSummaryList.HandleCreated += (_, _) => EnableListViewDoubleBuffer(_componentSummaryList);
+        _componentSummaryList.ContextMenuStrip = _componentSummaryMenu;
+
+        _componentSummaryMenu.Items.Add("复制 Source Path", null, (_, _) => CopyText(GetSelectedComponentSummary()?.SourcePath));
+    }
+
+    private void ConfigureComponentRelationGrid()
+    {
+        _componentRelationGrid.Dock = DockStyle.Fill;
+        _componentRelationGrid.AllowUserToAddRows = false;
+        _componentRelationGrid.AllowUserToDeleteRows = false;
+        _componentRelationGrid.AllowUserToResizeRows = false;
+        _componentRelationGrid.MultiSelect = false;
+        _componentRelationGrid.ReadOnly = true;
+        _componentRelationGrid.RowHeadersVisible = false;
+        _componentRelationGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _componentRelationGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _componentRelationGrid.BackgroundColor = SystemColors.Window;
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Kind", HeaderText = "目标", FillWeight = 10 });
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Relation", HeaderText = "关系", FillWeight = 14 });
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Target", HeaderText = "目标名", FillWeight = 22 });
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", FillWeight = 12 });
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Component", HeaderText = "组件", FillWeight = 18 });
+        _componentRelationGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Output", HeaderText = "输出", FillWeight = 30 });
+        _componentRelationGrid.ContextMenuStrip = _componentRelationMenu;
+
+        _componentRelationMenu.Items.Add("打开目标文件", null, (_, _) => OpenSelectedComponentTarget());
+        _componentRelationMenu.Items.Add("打开目标目录", null, (_, _) => OpenSelectedComponentTargetFolder());
+        _componentRelationMenu.Items.Add(new ToolStripSeparator());
+        _componentRelationMenu.Items.Add("复制目标输出路径", null, (_, _) => CopyText(GetSelectedComponentRelation()?.TargetAssetOutput));
+        _componentRelationMenu.Items.Add("复制目标资源路径", null, (_, _) => CopyText(GetSelectedComponentRelation()?.TargetPath));
+        _componentRelationMenu.Items.Add("复制 Owner 路径", null, (_, _) => CopyText(GetSelectedComponentRelation()?.OwnerObjectPath));
+    }
+
     private void WireEvents()
     {
         _openButton.Click += async (_, _) => await ChooseAndOpenLibraryAsync();
@@ -539,6 +666,16 @@ internal sealed class MainForm : Form
         _assetList.SelectedIndexChanged += (_, _) => ShowSelectedAssetDetails();
         _assetList.DoubleClick += (_, _) => OpenSelectedAsset();
         _assetList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_assetList, e);
+        _mainTabs.SelectedIndexChanged += (_, _) =>
+        {
+            if (_mainTabs.SelectedTab == _componentsPage)
+                _ = EnsureComponentSummariesLoadedAsync();
+        };
+        _componentFilter.TextChanged += (_, _) => RebuildComponentSummaryGrid();
+        _componentSummaryList.SelectedIndexChanged += async (_, _) => await LoadSelectedComponentRelationsAsync();
+        _componentSummaryList.MouseDown += (_, e) => SelectListViewItemOnRightClick(_componentSummaryList, e);
+        _componentRelationGrid.SelectionChanged += (_, _) => ShowSelectedComponentRelationDetails();
+        _componentRelationGrid.MouseDown += (_, e) => SelectGridRowOnRightClick(_componentRelationGrid, e);
     }
 
     private async Task ChooseAndOpenLibraryAsync()
@@ -625,6 +762,12 @@ internal sealed class MainForm : Form
             RebuildModelGrid();
             RebuildGlobalAnimationList();
             RebuildAssetGrid();
+            _componentSummaries.Clear();
+            _visibleComponentSummaries.Clear();
+            _componentSummaryList.VirtualListSize = 0;
+            _componentRelationGrid.Rows.Clear();
+            _componentHeader.Text = "组件关系";
+            _componentRelationHeader.Text = "关系明细";
         }
         catch (Exception ex)
         {
@@ -911,6 +1054,126 @@ internal sealed class MainForm : Form
         e.Item = item;
     }
 
+    private async Task EnsureComponentSummariesLoadedAsync()
+    {
+        if (_index == null || string.IsNullOrWhiteSpace(_root) || _componentSummaries.Count > 0)
+            return;
+
+        _componentLoadCts?.Cancel();
+        _componentLoadCts = new CancellationTokenSource();
+        var token = _componentLoadCts.Token;
+        _componentHeader.Text = "组件关系: 正在后台读取 component_asset_relations...";
+        try
+        {
+            var summaries = await Task.Run(() => UeLibraryComponentRelationReader.LoadSummaries(_root), token);
+            if (token.IsCancellationRequested)
+                return;
+
+            _componentSummaries.Clear();
+            _componentSummaries.AddRange(summaries);
+            RebuildComponentSummaryGrid();
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                _componentHeader.Text = "组件关系读取失败";
+                _componentDetails.Text = ex.Message;
+            }
+        }
+    }
+
+    private void RebuildComponentSummaryGrid()
+    {
+        var filter = _componentFilter.Text.Trim();
+        var summaries = _componentSummaries
+            .Where(x => MatchesComponentSummaryFilter(x, filter))
+            .OrderByDescending(x => x.RelationCount)
+            .ThenBy(x => x.SourcePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _visibleComponentSummaries.Clear();
+        _visibleComponentSummaries.AddRange(summaries);
+        _componentSummaryList.VirtualListSize = _visibleComponentSummaries.Count;
+        _componentHeader.Text = _componentSummaries.Count == 0
+            ? "组件关系"
+            : $"组件关系 {_visibleComponentSummaries.Count}/{_componentSummaries.Count}  注: 仅汇总有导出目标的模型/材质/贴图/动画关系";
+        if (_componentSummaryList.VirtualListSize > 0)
+        {
+            _componentSummaryList.SelectedIndices.Clear();
+            _componentSummaryList.SelectedIndices.Add(0);
+        }
+        else
+        {
+            _componentRelationGrid.Rows.Clear();
+            _componentDetails.Clear();
+        }
+        _componentSummaryList.Refresh();
+    }
+
+    private void ComponentSummaryList_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    {
+        if (e.ItemIndex < 0 || e.ItemIndex >= _visibleComponentSummaries.Count)
+        {
+            e.Item = new ListViewItem("");
+            return;
+        }
+
+        var summary = _visibleComponentSummaries[e.ItemIndex];
+        var item = new ListViewItem(summary.Name);
+        item.SubItems.Add(summary.RelationCount.ToString());
+        item.SubItems.Add(summary.OwnerCount.ToString());
+        item.SubItems.Add(summary.ComponentCount.ToString());
+        item.SubItems.Add(summary.ModelReferenceCount.ToString());
+        item.SubItems.Add(summary.MaterialReferenceCount.ToString());
+        item.SubItems.Add(summary.TextureReferenceCount.ToString());
+        item.SubItems.Add(summary.AnimationReferenceCount.ToString());
+        item.Tag = summary;
+        item.ToolTipText = BuildComponentSummaryDetails(summary);
+        e.Item = item;
+    }
+
+    private async Task LoadSelectedComponentRelationsAsync()
+    {
+        var summary = GetSelectedComponentSummary();
+        if (summary == null || string.IsNullOrWhiteSpace(_root))
+            return;
+
+        _componentRelationHeader.Text = $"关系明细: 正在读取 {summary.Name}...";
+        _componentRelationGrid.Rows.Clear();
+        try
+        {
+            var sourcePath = summary.SourcePath;
+            var relations = await Task.Run(() => UeLibraryComponentRelationReader.LoadRelationsForSource(_root, sourcePath));
+            if (!string.Equals(GetSelectedComponentSummary()?.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            foreach (var relation in relations)
+            {
+                var rowIndex = _componentRelationGrid.Rows.Add(
+                    relation.TargetAssetKind,
+                    relation.RelationType,
+                    string.IsNullOrWhiteSpace(relation.TargetName) ? relation.TargetPath : relation.TargetName,
+                    relation.MatchStatus,
+                    string.IsNullOrWhiteSpace(relation.ComponentName) ? relation.ComponentType : relation.ComponentName,
+                    relation.TargetAssetOutput);
+                var row = _componentRelationGrid.Rows[rowIndex];
+                row.Tag = relation;
+                SetRowTooltip(row, BuildComponentRelationDetails(relation));
+            }
+
+            _componentRelationHeader.Text = $"关系明细: {summary.Name}  显示 {relations.Count} / 总关系 {summary.RelationCount}";
+            if (_componentRelationGrid.Rows.Count > 0)
+                _componentRelationGrid.Rows[0].Selected = true;
+            ShowSelectedComponentRelationDetails();
+        }
+        catch (Exception ex)
+        {
+            _componentRelationHeader.Text = "关系明细读取失败";
+            _componentDetails.Text = ex.Message;
+        }
+    }
+
     private void StartThumbnailQueue(IReadOnlyList<UeLibraryModel> items)
     {
         _thumbnailCts?.Cancel();
@@ -1114,6 +1377,19 @@ internal sealed class MainForm : Form
         _assetDetails.Text = asset == null ? "" : BuildAssetDetails(asset);
     }
 
+    private void ShowSelectedComponentRelationDetails()
+    {
+        var relation = GetSelectedComponentRelation();
+        if (relation != null)
+        {
+            _componentDetails.Text = BuildComponentRelationDetails(relation);
+            return;
+        }
+
+        var summary = GetSelectedComponentSummary();
+        _componentDetails.Text = summary == null ? "" : BuildComponentSummaryDetails(summary);
+    }
+
     private UeLibraryModel? GetSelectedModel()
     {
         if (_modelList.SelectedIndices.Count == 0)
@@ -1148,6 +1424,20 @@ internal sealed class MainForm : Form
         var index = _assetList.SelectedIndices[0];
         return index >= 0 && index < _visibleAssets.Count ? _visibleAssets[index] : null;
     }
+
+    private UeLibraryComponentSummary? GetSelectedComponentSummary()
+    {
+        if (_componentSummaryList.SelectedIndices.Count == 0)
+            return null;
+
+        var index = _componentSummaryList.SelectedIndices[0];
+        return index >= 0 && index < _visibleComponentSummaries.Count ? _visibleComponentSummaries[index] : null;
+    }
+
+    private UeLibraryComponentRelation? GetSelectedComponentRelation()
+        => _componentRelationGrid.SelectedRows.Count == 0
+            ? null
+            : _componentRelationGrid.SelectedRows[0].Tag as UeLibraryComponentRelation;
 
     private void RebuildModelKindFilter()
     {
@@ -1218,6 +1508,23 @@ internal sealed class MainForm : Form
             return;
         var path = File.Exists(asset.Output) ? asset.Output : File.Exists(asset.SharedTexture) ? asset.SharedTexture : "";
         var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
+    }
+
+    private void OpenSelectedComponentTarget()
+    {
+        var relation = GetSelectedComponentRelation();
+        if (relation?.TargetAssetOutput is { Length: > 0 } path && File.Exists(path))
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+    }
+
+    private void OpenSelectedComponentTargetFolder()
+    {
+        var relation = GetSelectedComponentRelation();
+        if (relation == null)
+            return;
+        var directory = Path.GetDirectoryName(relation.TargetAssetOutput);
         if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
             Process.Start(new ProcessStartInfo(directory) { UseShellExecute = true });
     }
@@ -1482,6 +1789,15 @@ internal sealed class MainForm : Form
             || Contains(asset.ShadingModel, filter);
     }
 
+    private static bool MatchesComponentSummaryFilter(UeLibraryComponentSummary summary, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return true;
+
+        return Contains(summary.SourcePath, filter)
+            || Contains(summary.Name, filter);
+    }
+
     private static bool Contains(string value, string filter)
         => value?.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -1616,6 +1932,37 @@ internal sealed class MainForm : Form
                Link error: {asset.LinkError}
                Validation: {asset.ValidationStatus}
                """;
+
+    private static string BuildComponentSummaryDetails(UeLibraryComponentSummary summary)
+        => $"""
+           Source: {summary.SourcePath}
+           Relations: {summary.RelationCount}
+           Owners: {summary.OwnerCount}
+           Components: {summary.ComponentCount}
+           Models: {summary.ModelReferenceCount}
+           Materials: {summary.MaterialReferenceCount}
+           Textures: {summary.TextureReferenceCount}
+           Animations: {summary.AnimationReferenceCount}
+           Missing/nonmatched: {summary.MissingReferenceCount}
+           """;
+
+    private static string BuildComponentRelationDetails(UeLibraryComponentRelation relation)
+        => $"""
+           Owner: {relation.OwnerObjectPath}
+           Owner type: {relation.OwnerType}
+           Component: {relation.ComponentObjectPath}
+           Component type: {relation.ComponentType}
+           Component name: {relation.ComponentName}
+           Relation source: {relation.RelationSource}
+           Relation type: {relation.RelationType}
+           Target kind: {relation.TargetAssetKind}
+           Target path: {relation.TargetPath}
+           Target name: {relation.TargetName}
+           Target output: {relation.TargetAssetOutput}
+           Match status: {relation.MatchStatus}
+           Match reason: {relation.MatchReason}
+           Socket: {relation.SocketName}
+           """;
 
     private string GetAssetImageKey(UeLibraryAsset asset)
     {
