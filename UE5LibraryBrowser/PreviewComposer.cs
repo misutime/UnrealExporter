@@ -8,6 +8,7 @@ internal sealed record PreviewResult(bool Success, string OutputPath, string Rep
 
 internal sealed class PreviewComposer
 {
+    private const string PreviewCacheVersion = "preview-v3-conservative-trs-no-scale";
     private readonly string _libraryRoot;
     private readonly string _cacheRoot;
     private readonly ViewerSafeGltfCache _viewerSafeCache;
@@ -30,7 +31,7 @@ internal sealed class PreviewComposer
         if (!animation.IsPreviewable)
             return new PreviewResult(false, "", "", "这个动画不是最高可信可预览候选，或是容器/metadata 动画。");
 
-        var directory = Path.Combine(_cacheRoot, Hash(modelPath + "|" + animation.Output));
+        var directory = Path.Combine(_cacheRoot, Hash(PreviewCacheVersion + "|" + modelPath + "|" + animation.Output));
         Directory.CreateDirectory(directory);
         var output = Path.Combine(directory, $"{SafeName(model.Name)}__{SafeName(animation.Name)}.preview.glb");
         var report = Path.Combine(directory, "preview_validation.db");
@@ -108,6 +109,10 @@ internal sealed class PreviewComposer
         }
 
         var start = new ProcessStartInfo(f3d) { UseShellExecute = false };
+        start.ArgumentList.Add("--blending=ddp");
+        start.ArgumentList.Add("--tone-mapping");
+        start.ArgumentList.Add("--hdri-ambient");
+        start.ArgumentList.Add("--anti-aliasing=fxaa");
         start.ArgumentList.Add(path);
         Process.Start(start);
     }

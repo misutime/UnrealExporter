@@ -60,8 +60,10 @@ internal static class UEAnimationPreviewBuilder
             var writtenChannels = 0;
             var retargetedTranslationTracks = 0;
             var skippedStaticTranslationTracks = 0;
+            var skippedNonRootTranslationTracks = 0;
             var retargetedRotationTracks = 0;
             var skippedStaticRotationTracks = 0;
+            var skippedScaleTracks = 0;
             var skippedByRegexTracks = 0;
             var missingBones = new List<string>();
             foreach (var track in animation.Tracks)
@@ -81,17 +83,24 @@ internal static class UEAnimationPreviewBuilder
                 matchedTracks++;
                 if (track.Positions.Count > 0)
                 {
-                    var translation = BuildTranslationKeyMap(track, node, animation.FramesPerSecond);
-                    if (translation.Keys.Count > 0)
+                    if (ShouldWriteTranslationChannel(track.BoneName))
                     {
-                        gltfAnimation.CreateTranslationChannel(node, translation.Keys, linear: true);
-                        writtenChannels++;
-                    }
+                        var translation = BuildTranslationKeyMap(track, node, animation.FramesPerSecond);
+                        if (translation.Keys.Count > 0)
+                        {
+                            gltfAnimation.CreateTranslationChannel(node, translation.Keys, linear: true);
+                            writtenChannels++;
+                        }
 
-                    if (translation.Retargeted)
-                        retargetedTranslationTracks++;
-                    if (translation.SkippedStatic)
-                        skippedStaticTranslationTracks++;
+                        if (translation.Retargeted)
+                            retargetedTranslationTracks++;
+                        if (translation.SkippedStatic)
+                            skippedStaticTranslationTracks++;
+                    }
+                    else
+                    {
+                        skippedNonRootTranslationTracks++;
+                    }
                 }
 
                 if (track.Rotations.Count > 0)
@@ -114,18 +123,22 @@ internal static class UEAnimationPreviewBuilder
 
                 if (track.Scales.Count > 0)
                 {
-                    gltfAnimation.CreateScaleChannel(
-                        node,
-                        BuildKeyMap(track.Scales, animation.FramesPerSecond, x => x),
-                        linear: true);
-                    writtenChannels++;
+                    // UE .ueanim tracks are authored against the source Skeleton and often contain
+                    // per-bone ref-pose scale keys. Writing them blindly into a standalone glTF
+                    // preview can collapse or tear skinned meshes. Keep previews conservative until
+                    // we can apply the engine's exact retarget/AnimBP context.
+                    skippedScaleTracks++;
                 }
             }
 
             model.SaveGLB(outputPath, new WriteSettings());
             UnrealExporter.SanitizeGlbForPreview(outputPath);
             var anyRetarget = retargetedTranslationTracks > 0 || retargetedRotationTracks > 0;
-            var anyAdjustedOrSkipped = anyRetarget || skippedStaticTranslationTracks > 0 || skippedStaticRotationTracks > 0;
+            var anyAdjustedOrSkipped = anyRetarget
+                                       || skippedStaticTranslationTracks > 0
+                                       || skippedNonRootTranslationTracks > 0
+                                       || skippedStaticRotationTracks > 0
+                                       || skippedScaleTracks > 0;
             var heavyTranslationRetarget = matchedTracks > 0 && retargetedTranslationTracks > matchedTracks * 0.5f;
             var status = matchedTracks > 0 && writtenChannels > 0 && File.Exists(outputPath)
                 ? missingBones.Count == 0 && !anyAdjustedOrSkipped && !heavyTranslationRetarget ? "ok" : "warning"
@@ -150,8 +163,10 @@ internal static class UEAnimationPreviewBuilder
                 writtenChannels,
                 retargetedTranslationTracks,
                 skippedStaticTranslationTracks,
+                skippedNonRootTranslationTracks,
                 retargetedRotationTracks,
                 skippedStaticRotationTracks,
+                skippedScaleTracks,
                 skippedByRegexTracks,
                 skipBoneRegex,
                 anyRetarget,
@@ -169,7 +184,7 @@ internal static class UEAnimationPreviewBuilder
             });
 
             Console.WriteLine($"=> {outputPath}");
-            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, retargetedRotations={retargetedRotationTracks}, skippedStaticRotations={skippedStaticRotationTracks}, skippedByRegex={skippedByRegexTracks}");
+            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, skippedNonRootTranslations={skippedNonRootTranslationTracks}, retargetedRotations={retargetedRotationTracks}, skippedStaticRotations={skippedStaticRotationTracks}, skippedScales={skippedScaleTracks}, skippedByRegex={skippedByRegexTracks}");
             return status == "error" ? 2 : 0;
         }
         catch (Exception ex)
@@ -191,6 +206,22 @@ internal static class UEAnimationPreviewBuilder
 
     private static Vector3 SwapYZ(Vector3 value)
         => new(value.X, value.Z, value.Y);
+
+    private static bool ShouldWriteTranslationChannel(string boneName)
+    {
+        if (string.IsNullOrWhiteSpace(boneName))
+            return false;
+
+        return boneName.Equals("root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Armature", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Bip001", StringComparison.OrdinalIgnoreCase)
+               || boneName.EndsWith("_root", StringComparison.OrdinalIgnoreCase)
+               || boneName.EndsWith("-root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Contains("ik_", StringComparison.OrdinalIgnoreCase)
+               || boneName.Contains("_ik", StringComparison.OrdinalIgnoreCase)
+               || boneName.StartsWith("wq_root", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static ModelRoot LoadModelForPreview(string modelPath)
     {

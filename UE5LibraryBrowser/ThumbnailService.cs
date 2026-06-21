@@ -114,7 +114,6 @@ internal sealed class ThumbnailService : IDisposable
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
-        start.ArgumentList.Add("--no-config");
         start.ArgumentList.Add("--blending=ddp");
         start.ArgumentList.Add("--tone-mapping");
         start.ArgumentList.Add("--hdri-ambient");
