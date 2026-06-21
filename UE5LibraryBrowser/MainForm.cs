@@ -16,9 +16,15 @@ internal sealed class MainForm : Form
     private const int MaxFilteredThumbnailItems = 1200;
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton = new("打开素材库");
+    private readonly ToolStripDropDownButton _recentButton = new("最近");
     private readonly ToolStripButton _refreshButton = new("刷新");
     private readonly ToolStripButton _openModelButton = new("打开模型");
     private readonly ToolStripButton _openFolderButton = new("打开目录");
+    private readonly ToolStripComboBox _modelKindBox = new();
+    private readonly ToolStripComboBox _modelQualityBox = new();
+    private readonly ToolStripComboBox _thumbnailStateBox = new();
+    private readonly ToolStripButton _showFavoriteModelsButton = new("只看收藏");
+    private readonly ToolStripButton _hideIgnoredButton = new("隐藏忽略");
     private readonly ToolStripLabel _statusLabel = new("请选择 UE5 素材库");
     private readonly TextBox _modelFilter = new();
     private readonly TextBox _animationFilter = new();
@@ -33,8 +39,10 @@ internal sealed class MainForm : Form
     private readonly Image _placeholder = BuildPlaceholderImage();
     private readonly List<UeLibraryModel> _visibleModels = [];
     private readonly Dictionary<string, int> _visibleModelIndices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly RecentLibraryStore _recentStore = new();
 
     private UeLibraryIndex? _index;
+    private UeLibraryCurationStore? _curationStore;
     private ThumbnailService? _thumbnails;
     private PreviewComposer? _previewComposer;
     private ViewerSafeGltfCache? _viewerSafeCache;
@@ -85,8 +93,28 @@ internal sealed class MainForm : Form
     private void BuildLayout()
     {
         _toolbar.GripStyle = ToolStripGripStyle.Hidden;
-        _toolbar.Items.AddRange([_openButton, _refreshButton, new ToolStripSeparator(), _openModelButton, _openFolderButton, new ToolStripSeparator(), _statusLabel]);
+        ConfigureToolbarFilters();
+        _toolbar.Items.AddRange([
+            _openButton,
+            _recentButton,
+            _refreshButton,
+            new ToolStripSeparator(),
+            _openModelButton,
+            _openFolderButton,
+            new ToolStripSeparator(),
+            new ToolStripLabel("类型"),
+            _modelKindBox,
+            new ToolStripLabel("质量"),
+            _modelQualityBox,
+            new ToolStripLabel("缩略图"),
+            _thumbnailStateBox,
+            _showFavoriteModelsButton,
+            _hideIgnoredButton,
+            new ToolStripSeparator(),
+            _statusLabel
+        ]);
         Controls.Add(_toolbar);
+        RebuildRecentMenu();
 
         var split = new SplitContainer
         {
@@ -154,6 +182,41 @@ internal sealed class MainForm : Form
         right.Controls.Add(_details, 0, 3);
     }
 
+    private void ConfigureToolbarFilters()
+    {
+        _modelKindBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _modelKindBox.Width = 130;
+        _modelKindBox.Items.Add("All");
+        _modelKindBox.SelectedIndex = 0;
+
+        _modelQualityBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _modelQualityBox.Width = 145;
+        _modelQualityBox.Items.AddRange([
+            "全部质量",
+            "有可信动画",
+            "有兼容动画",
+            "可预览动画",
+            "需复查动画",
+            "有骨骼",
+            "无骨骼",
+            "有材质",
+            "缺材质",
+            "验证OK",
+            "验证警告/问题",
+            "Player/NPC"
+        ]);
+        _modelQualityBox.SelectedIndex = 0;
+
+        _thumbnailStateBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _thumbnailStateBox.Width = 110;
+        _thumbnailStateBox.Items.AddRange(["全部", "已有", "未生成"]);
+        _thumbnailStateBox.SelectedIndex = 0;
+
+        _showFavoriteModelsButton.CheckOnClick = true;
+        _hideIgnoredButton.CheckOnClick = true;
+        _hideIgnoredButton.Checked = true;
+    }
+
     private void ConfigureModelList()
     {
         _modelImages.ImageSize = new Size(168, 118);
@@ -180,6 +243,11 @@ internal sealed class MainForm : Form
         _modelMenu.Items.Add("复制模型路径", null, (_, _) => CopySelectedModelPath());
         _modelMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedModelSource());
         _modelMenu.Items.Add("复制 Skeleton 路径", null, (_, _) => CopySelectedModelSkeleton());
+        _modelMenu.Items.Add(new ToolStripSeparator());
+        _modelMenu.Items.Add("收藏模型", null, (_, _) => SetSelectedModelFavorite(true));
+        _modelMenu.Items.Add("取消收藏", null, (_, _) => SetSelectedModelFavorite(false));
+        _modelMenu.Items.Add("忽略模型", null, (_, _) => SetSelectedModelIgnored(true));
+        _modelMenu.Items.Add("取消忽略", null, (_, _) => SetSelectedModelIgnored(false));
         _modelMenu.Items.Add(new ToolStripSeparator());
         _modelMenu.Items.Add("用 F3D 打开", null, (_, _) => OpenSelectedModel());
         _modelMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedModelFolder());
@@ -212,6 +280,9 @@ internal sealed class MainForm : Form
         _animationMenu.Items.Add("复制动画路径", null, (_, _) => CopySelectedAnimationPath());
         _animationMenu.Items.Add("复制源资源路径", null, (_, _) => CopySelectedAnimationSource());
         _animationMenu.Items.Add(new ToolStripSeparator());
+        _animationMenu.Items.Add("收藏动画", null, (_, _) => SetSelectedAnimationFavorite(true));
+        _animationMenu.Items.Add("取消收藏", null, (_, _) => SetSelectedAnimationFavorite(false));
+        _animationMenu.Items.Add(new ToolStripSeparator());
         _animationMenu.Items.Add("生成并打开 preview", null, async (_, _) => await GenerateAndOpenSelectedAnimationAsync());
         _animationGrid.ContextMenuStrip = _animationMenu;
     }
@@ -227,6 +298,11 @@ internal sealed class MainForm : Form
         _openModelButton.Click += (_, _) => OpenSelectedModel();
         _openFolderButton.Click += (_, _) => OpenSelectedModelFolder();
         _modelFilter.TextChanged += (_, _) => RebuildModelGrid();
+        _modelKindBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
+        _modelQualityBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
+        _thumbnailStateBox.SelectedIndexChanged += (_, _) => RebuildModelGrid();
+        _showFavoriteModelsButton.CheckedChanged += (_, _) => RebuildModelGrid();
+        _hideIgnoredButton.CheckedChanged += (_, _) => RebuildModelGrid();
         _animationFilter.TextChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
         _modelList.SelectedIndexChanged += (_, _) => RebuildAnimationGrid(GetSelectedModel());
         _modelList.DoubleClick += (_, _) => OpenSelectedModel();
@@ -241,10 +317,53 @@ internal sealed class MainForm : Form
         using var dialog = new FolderBrowserDialog
         {
             Description = "选择 UnrealExporter 生成的 UE5 素材库根目录",
-            SelectedPath = Directory.Exists(_root) ? _root : @"F:\UE-Assets"
+            SelectedPath = ChooseInitialBrowsePath()
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
             await OpenLibraryAsync(dialog.SelectedPath);
+    }
+
+    private string ChooseInitialBrowsePath()
+    {
+        if (Directory.Exists(_root))
+            return _root;
+
+        var dDriveAssets = @"D:\UE5-Assets";
+        if (Directory.Exists(dDriveAssets))
+            return dDriveAssets;
+
+        var recent = _recentStore.Load().FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(recent) && Directory.Exists(recent))
+            return recent;
+
+        return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    }
+
+    private void RebuildRecentMenu()
+    {
+        _recentButton.DropDownItems.Clear();
+        var recentPaths = _recentStore.Load().ToList();
+        if (recentPaths.Count == 0)
+        {
+            _recentButton.DropDownItems.Add(new ToolStripMenuItem("暂无最近素材库") { Enabled = false });
+            return;
+        }
+
+        foreach (var path in recentPaths)
+        {
+            var item = new ToolStripMenuItem(BuildRecentLabel(path))
+            {
+                ToolTipText = path
+            };
+            item.Click += async (_, _) => await OpenLibraryAsync(path);
+            _recentButton.DropDownItems.Add(item);
+        }
+    }
+
+    private static string BuildRecentLabel(string path)
+    {
+        var name = Path.GetFileName(path);
+        return string.IsNullOrWhiteSpace(name) ? path : $"{name}  ({path})";
     }
 
     private async Task OpenLibraryAsync(string root)
@@ -253,7 +372,9 @@ internal sealed class MainForm : Form
         {
             UseWaitCursor = true;
             _statusLabel.Text = "正在读取 library_index.db...";
-            _modelList.Items.Clear();
+            _modelList.VirtualListSize = 0;
+            _visibleModels.Clear();
+            _visibleModelIndices.Clear();
             _animationGrid.Rows.Clear();
             _details.Clear();
             _thumbnailCts?.Cancel();
@@ -263,10 +384,14 @@ internal sealed class MainForm : Form
             var index = await Task.Run(() => UeLibraryIndexReader.Load(root));
             _root = index.Root;
             _index = index;
+            _curationStore = new UeLibraryCurationStore(_root);
             _viewerSafeCache = new ViewerSafeGltfCache(_root);
             _thumbnails = new ThumbnailService(_root, _viewerSafeCache, GetThumbnailConcurrency());
             _previewComposer = new PreviewComposer(_root, _viewerSafeCache);
 
+            _recentStore.Add(_root);
+            RebuildRecentMenu();
+            RebuildModelKindFilter();
             _statusLabel.Text = $"已打开: {_root}";
             RebuildModelGrid();
         }
@@ -289,6 +414,10 @@ internal sealed class MainForm : Form
         var filter = _modelFilter.Text.Trim();
         var models = _index.Models
             .Where(x => MatchesModelFilter(x, filter))
+            .Where(MatchesModelKindFilter)
+            .Where(MatchesModelQualityFilter)
+            .Where(MatchesCurationFilter)
+            .Where(MatchesThumbnailStateFilter)
             .OrderByDescending(x => x.TrustedAnimationCount)
             .ThenByDescending(x => x.CompatibleAnimationCount)
             .ThenByDescending(x => x.UsableAnimationCount)
@@ -373,8 +502,11 @@ internal sealed class MainForm : Form
 
         foreach (var animation in visible)
         {
+            var displayName = _curationStore?.IsFavoriteAnimation(animation) == true
+                ? "[*] " + animation.Name
+                : animation.Name;
             var rowIndex = _animationGrid.Rows.Add(
-                animation.Name,
+                displayName,
                 DisplayRecommendedUse(animation),
                 DisplayRelationshipKind(animation),
                 string.IsNullOrWhiteSpace(animation.ConfidenceTier) ? DisplayUsageEvidence(animation) : animation.ConfidenceTier,
@@ -592,6 +724,24 @@ internal sealed class MainForm : Form
     private UeLibraryAnimation? GetSelectedAnimation()
         => _animationGrid.SelectedRows.Count == 0 ? null : _animationGrid.SelectedRows[0].Tag as UeLibraryAnimation;
 
+    private void RebuildModelKindFilter()
+    {
+        var selected = _modelKindBox.SelectedItem as string ?? "All";
+        _modelKindBox.Items.Clear();
+        _modelKindBox.Items.Add("All");
+        if (_index != null)
+        {
+            foreach (var kind in _index.Models
+                .Select(x => string.IsNullOrWhiteSpace(x.DisplayKind) ? "Unknown" : x.DisplayKind)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                _modelKindBox.Items.Add(kind);
+            }
+        }
+        _modelKindBox.SelectedItem = _modelKindBox.Items.Contains(selected) ? selected : "All";
+    }
+
     private void OpenSelectedModel()
     {
         var model = GetSelectedModel();
@@ -623,6 +773,24 @@ internal sealed class MainForm : Form
 
     private void CopySelectedAnimationSource()
         => CopyText(GetSelectedAnimation()?.Source);
+
+    private void SetSelectedModelFavorite(bool favorite)
+    {
+        _curationStore?.SetFavoriteModel(GetSelectedModel(), favorite);
+        RebuildModelGrid();
+    }
+
+    private void SetSelectedModelIgnored(bool ignored)
+    {
+        _curationStore?.SetIgnored(GetSelectedModel(), ignored);
+        RebuildModelGrid();
+    }
+
+    private void SetSelectedAnimationFavorite(bool favorite)
+    {
+        _curationStore?.SetFavoriteAnimation(GetSelectedAnimation(), favorite);
+        RebuildAnimationGrid(GetSelectedModel());
+    }
 
     private static void CopyText(string? text)
     {
@@ -665,10 +833,68 @@ internal sealed class MainForm : Form
         grid.Rows[hit.RowIndex].Selected = true;
     }
 
-    private static string BuildModelCardText(UeLibraryModel model)
+    private string BuildModelCardText(UeLibraryModel model)
     {
         var name = model.Name.Length <= 24 ? model.Name : model.Name[..21] + "...";
+        if (_curationStore?.IsFavoriteModel(model) == true)
+            name = "[*] " + name;
         return $"{name}{Environment.NewLine}可信 {model.TrustedAnimationCount} 兼容 {model.CompatibleAnimationCount}{Environment.NewLine}预览 {model.UsableAnimationCount} 总 {model.AnimationCount}";
+    }
+
+    private bool MatchesModelKindFilter(UeLibraryModel model)
+    {
+        var kind = _modelKindBox.SelectedItem as string ?? "All";
+        if (string.Equals(kind, "All", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var modelKind = string.IsNullOrWhiteSpace(model.DisplayKind) ? "Unknown" : model.DisplayKind;
+        return string.Equals(modelKind, kind, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool MatchesModelQualityFilter(UeLibraryModel model)
+    {
+        var quality = _modelQualityBox.SelectedItem as string ?? "全部质量";
+        return quality switch
+        {
+            "有可信动画" => model.TrustedAnimationCount > 0,
+            "有兼容动画" => model.CompatibleAnimationCount > 0,
+            "可预览动画" => model.UsableAnimationCount > 0,
+            "需复查动画" => model.ReviewAnimationCount > 0,
+            "有骨骼" => model.HasSkin || model.BoneCount > 0 || !string.IsNullOrWhiteSpace(model.SkeletonPath),
+            "无骨骼" => !model.HasSkin && model.BoneCount <= 0 && string.IsNullOrWhiteSpace(model.SkeletonPath),
+            "有材质" => model.MaterialCount > 0,
+            "缺材质" => model.MaterialCount <= 0,
+            "验证OK" => Contains(model.ValidationStatus, "ok") || Contains(model.ValidationStatus, "pass"),
+            "验证警告/问题" => !string.IsNullOrWhiteSpace(model.ValidationStatus)
+                && !Contains(model.ValidationStatus, "ok")
+                && !Contains(model.ValidationStatus, "pass"),
+            "Player/NPC" => Contains(model.Output, "/Player/") || Contains(model.Output, "\\Player\\") || Contains(model.Output, "/Npc/") || Contains(model.Output, "\\Npc\\"),
+            _ => true
+        };
+    }
+
+    private bool MatchesCurationFilter(UeLibraryModel model)
+    {
+        if (_hideIgnoredButton.Checked && _curationStore?.IsIgnored(model) == true)
+            return false;
+        if (_showFavoriteModelsButton.Checked && _curationStore?.IsFavoriteModel(model) != true)
+            return false;
+        return true;
+    }
+
+    private bool MatchesThumbnailStateFilter(UeLibraryModel model)
+    {
+        var state = _thumbnailStateBox.SelectedItem as string ?? "全部";
+        if (string.Equals(state, "全部", StringComparison.OrdinalIgnoreCase) || _thumbnails == null)
+            return true;
+
+        var cached = _thumbnails.IsCached(model);
+        return state switch
+        {
+            "已有" => cached,
+            "未生成" => !cached,
+            _ => true
+        };
     }
 
     private static bool MatchesModelFilter(UeLibraryModel model, string filter)
@@ -721,7 +947,7 @@ internal sealed class MainForm : Form
         return name.Length <= 36 ? name : name[..33] + "...";
     }
 
-    private static string BuildModelDetails(UeLibraryModel model)
+    private string BuildModelDetails(UeLibraryModel model)
         => $"""
            Model: {model.Name}
            File: {model.Output}
@@ -732,9 +958,11 @@ internal sealed class MainForm : Form
            Materials: {model.MaterialCount}
            Animations: trusted={model.TrustedAnimationCount}, compatible={model.CompatibleAnimationCount}, previewable={model.UsableAnimationCount}, total={model.AnimationCount}
            Validation: {model.ValidationStatus}
+           Favorite: {_curationStore?.IsFavoriteModel(model) == true}
+           Ignored: {_curationStore?.IsIgnored(model) == true}
            """;
 
-    private static string BuildAnimationDetails(UeLibraryModel model, UeLibraryAnimation animation)
+    private string BuildAnimationDetails(UeLibraryModel model, UeLibraryAnimation animation)
         => $"""
            Model: {model.Name}
            Model file: {model.Output}
@@ -762,6 +990,7 @@ internal sealed class MainForm : Form
            Hierarchy compatible: {animation.HierarchyCompatible}
            Container animation: {animation.IsContainerAnimation}
            Previewable: {animation.IsPreviewable}
+           Favorite: {_curationStore?.IsFavoriteAnimation(animation) == true}
            """;
 
     private static string DisplayUsageEvidence(UeLibraryAnimation animation)
