@@ -4,15 +4,20 @@
 
 ## 当前结论
 
-UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也能让 GLB 保留 skin/joint。对 Batman 与 NTE 的真实输出检查显示，模型数量和静态结构基础可用，但原导出缺少素材库级索引、模型/动画关系、动画导出、共享贴图库和验证报告，因此还不能等价于 AnimeStudio 的“模型 + 贴图 + 骨骼 + 动画”完整素材库。
+UnrealExporter 当前已经完成 UE 素材库的 SQLite-first 主链路：模型、贴图、材质、骨骼、动画导出事件、确定性关系、验证结果和健康/验收摘要都应优先进入 `library_index.db` / `export_events.db` / `library_work.db`，JSON/JSONL 只作为兼容或人工排查视图。最新 NTE 库 `F:\UE5-Assets\nte-all-assets` 已包含大规模 `assets`、`model_validation`、`model_animation_relations`、`relation_animations`、`animation_validation`、`animation_bindings`、`library_reports` 等表；浏览器和验收脚本应以 SQLite 为准。
 
-本轮已把一部分能力接入导出主链路：导出时写 `export_manifest.jsonl`、`asset_catalog.jsonl`、`animation_bindings.jsonl`，支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`model_animations.json`、`animation_validation.json`、`model_validation.json`、`skeletons.json`、`texture_links.jsonl`、`material_texture_slots.jsonl`、`shared_texture_gltf_links.jsonl`、`component_asset_relations.jsonl`、`component_groups.json`、`auto_referenced_exports.jsonl`、`LIBRARY_README.md`。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图按 `missingExportedTexture`、`unresolvedTexturePackage`、`nonExportableTexture` 细分，不能把运行时渲染目标、曲线/数据贴图误判成普通贴图缺失；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、Mesh/Skeleton socket、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用。`skeletons.json` 已把 glTF skin 预览骨架和 UE Skeleton 原始路径、源索引骨架对象、同 Skeleton 动画列表合并输出。蓝图、组件、Level/Actor 实例层面开始记录 ComponentTemplate、SCS、继承组件覆盖、导出组件、关卡 Actor、Actor 组件属性和 cooked 蓝图/CDO 属性里的显式资源 PPtr；素材库侧会把这些关系提升为可查询的组件关系和组合 group，并记录模型、材质、动画等引用的已导出数量和缺口明细，用于后续组合模型、挂点、任务道具和动画蓝图关系重建。导出主链路新增 `autoExportReferencedAssets` 开关，开启后会把源索引中的显式组件/蓝图引用转成额外导出候选，优先补齐任务道具和组合模型引用的模型、材质、贴图与动画；`auto_referenced_exports.jsonl` 会记录自动补导计划、源包匹配、显式配置覆盖和导出结果，便于追踪缺口根因。
+当前 UE 独立动画资产格式是 `.ueanim`，不是独立 glTF 动画文件。`.ueanim` 保留 UEFORMAT 动画 metadata、bone position/rotation/scale tracks 和曲线；模型仍以 glTF/GLB 为主。浏览器 preview 或正式 `--export-ue-animation-glb` 合成时，工具才会把 `.ueanim` track 写入目标模型 GLB 的 glTF node TRS channels。正式合成 GLB 属于“模型 + 单动画”资产，不能反过来替代独立 `.ueanim` 或关系索引。
+
+`player_046_male` 的 ARPG formal GLB 候选池已经验证：从源模型和源 `.ueanim` 生成 97 个正式 GLB，0 个导出失败，1 个 container/零 track 动画跳过；正式导出报告显示没有缺失 track、没有跳过 scale、没有跳过非 root translation。抽查正式 GLB 内部动画通道为 glTF `translation` / `rotation` / `scale`，每类 272 条，插值为 `LINEAR`。这证明 formal GLB 的动画数据是 glTF TRS；但独立动画库仍是 `.ueanim`。
+
+已接入主链路的能力包括：支持 `glb/gltf` 模型输出和 `ueanim/psa` 动画导出入口，模型 catalog 记录 UE Skeleton 原始引用和骨骼名，索引重建会合并而不是覆盖源关系，并生成 `library_index.db`、`ue_source_index.db`、`export_events.db` 和必要的 `library_work.db` 中间表。`export_manifest`、`asset_catalog`、`animation_bindings`、`auto_referenced_exports`、模型验证、骨架分组、动画验证、模型动画关系、健康报告和验收报告默认写入 SQLite；同名 JSON/JSONL 文件只是显式 `--debug-json` 或旧库兼容的人读视图。贴图可统一复制到 `Textures/_Shared` 并用硬链接复用，catalog 和 SQLite 中也会保留每张贴图的 sha256、共享路径和硬链接状态；材质 slot 会关联到 UE 贴图对象、已导出贴图和共享贴图，未导出的贴图按 `missingExportedTexture`、`unresolvedTexturePackage`、`nonExportableTexture` 细分，不能把运行时渲染目标、曲线/数据贴图误判成普通贴图缺失；文本 glTF 会在关系明确时把 image URI 改写到共享贴图。源索引已记录材质到贴图槽的真实 UE 关系，包含直接参数、解析参数和原始引用三类来源；也记录 SkeletalMesh/USkeleton 的骨骼层级、Mesh/Skeleton socket、AnimSequence track 到骨骼的映射、AnimNotify 事件、FloatCurve 曲线，以及 Montage/Composite segment、slot、section 与子动画引用。骨架分组、模型覆盖、组件关系、组件组和包对象映射默认进入 `library_index.db` 的显式表。导出主链路支持 `autoExportReferencedAssets`，可把源索引中的显式组件/蓝图引用转成额外导出候选，优先补齐任务道具和组合模型引用的模型、材质、贴图与动画；自动补导计划、源包匹配、显式配置覆盖和导出结果同样以 SQLite 表为主。
 
 ## 完整实现目标
 
 1. 模型导出
    - 默认导出 StaticMesh 与 SkeletalMesh 为 GLB/glTF。
    - SkeletalMesh 必须保留 skin、joint、骨骼名、材质槽和 UE Skeleton 引用。
+   - 正式模型资产不得为了查看器兼容性压缩、删除或重排 skin joint palette；F3D/OpenGL worker 等预览器限制只能通过浏览器缓存或 viewer-safe preview 处理，不能影响正式资产。
    - StaticMesh 也要进入素材库，不因“没有骨骼”被排除；建筑、环境、道具、车辆都属于有效 3D 游戏素材。
    - 模型 catalog 必须记录 UE 源包路径、对象路径、输出路径、资源分类、材质数量、UE 原始材质槽、骨骼数量、bbox 和验证状态。
 
@@ -34,6 +39,7 @@ UnrealExporter 已经能导出大量 UE 模型、贴图和材质 sidecar，也�
    - 导出时必须写 `export_events.db.animation_bindings`，记录动画源路径、对象路径、Skeleton、SkeletonGuid、时长、帧数、track 数、track 对应骨骼索引、压缩类型和导出状态；`animation_bindings.jsonl` 仅作为人工排查视图。
    - ACL 压缩动画需要 native ACL 支持；如果 DLL 缺少 `nAllocate/nReadACLData`，必须明确标记 blocked，不能吞异常或伪装成功。
    - 动画是否推荐给模型，只能基于 UE Skeleton 引用、SkeletonGuid、兼容骨架和验证结果，不能按文件名前缀强绑。
+   - 浏览器双击动画生成的是 preview，不等于正式合成动画资产。未来右键“导出动画/导出合成 glTF”必须走正式导出路径，保持骨骼、skin、bind pose、动画通道和材质贴图关系完整；不得复用任何只为 preview/viewer-safe 做的兼容性压缩或降级逻辑。
 
 5. 模型动画关系
    - `model_animations.json` 按 UE Skeleton、组件引用、AnimBlueprint、DataAsset/AssetRegistry 等确定性或结构兼容证据建立保守匹配，并回填 `animation_validation.json` 的覆盖率和层级验证结果；Montage/Composite 这类容器动画必须保留 segment、section、子动画引用和子动画导出完整度，不能只报一个无 track 的 warning。

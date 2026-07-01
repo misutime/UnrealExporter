@@ -77,7 +77,7 @@ public class UnrealExporter
         // For Oodle to work from outside of project directory
         Directory.SetCurrentDirectory(RootDir);
 
-        if (TryRunPostProcessCommand(args) || TryRunMaterializeAnimationMetadataCommand(args) || TryRunTaskModelQualityCommand(args) || TryRunUEAnimationPreviewCommand(args))
+        if (TryRunPostProcessCommand(args) || TryRunRefreshAnimationRelationsCommand(args) || TryRunMaterializeAnimationMetadataCommand(args) || TryRunTaskModelQualityCommand(args) || TryRunUEAnimationPreviewCommand(args))
             return;
 
         double trueStart = Now();
@@ -197,8 +197,12 @@ public class UnrealExporter
         if (args.Length == 0)
             return false;
 
+        var formalExport =
+            args[0].Equals("--export-ue-animation-glb", StringComparison.OrdinalIgnoreCase)
+            || args[0].Equals("export-ue-animation-glb", StringComparison.OrdinalIgnoreCase);
         if (
-            !args[0].Equals("--preview-ue-animation", StringComparison.OrdinalIgnoreCase)
+            !formalExport
+            && !args[0].Equals("--preview-ue-animation", StringComparison.OrdinalIgnoreCase)
             && !args[0].Equals("preview-ue-animation", StringComparison.OrdinalIgnoreCase)
         )
             return false;
@@ -213,12 +217,35 @@ public class UnrealExporter
             string.IsNullOrWhiteSpace(animation) ||
             string.IsNullOrWhiteSpace(output))
         {
-            Console.WriteLine("ERROR: --preview-ue-animation requires --model <model.glb> --animation <anim.ueanim> --output <preview.glb> [--report-db <preview_validation.db>] [--report <debug.json>].");
+            Console.WriteLine("ERROR: animation composition requires --model <model.glb> --animation <anim.ueanim> --output <out.glb> [--report-db <validation.db>] [--report <debug.json>].");
             Environment.ExitCode = 2;
             return true;
         }
 
-        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report, reportDb, skipBoneRegex);
+        Environment.ExitCode = UEAnimationPreviewBuilder.Run(model, animation, output, report, reportDb, skipBoneRegex, formalExport);
+        return true;
+    }
+
+    private static bool TryRunRefreshAnimationRelationsCommand(string[] args)
+    {
+        if (args.Length == 0)
+            return false;
+
+        if (
+            !args[0].Equals("--refresh-animation-relations", StringComparison.OrdinalIgnoreCase)
+            && !args[0].Equals("refresh-animation-relations", StringComparison.OrdinalIgnoreCase)
+        )
+            return false;
+
+        if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
+        {
+            Console.WriteLine("ERROR: --refresh-animation-relations requires an exported library root path.");
+            Console.WriteLine("Usage: dotnet run --project UnrealExporter -- --refresh-animation-relations <outputDir> [--debug-json]");
+            return true;
+        }
+
+        var writeDebugJson = args.Any(x => x.Equals("--debug-json", StringComparison.OrdinalIgnoreCase));
+        UELibraryPostProcessor.RefreshAnimationRelations(args[1], writeDebugJson);
         return true;
     }
 
@@ -3892,6 +3919,7 @@ public class UnrealExporter
                 .Select(x => (x["targets"] as JArray)?.Count ?? 0)
                 .Distinct()
                 .ToArray();
+            changed |= NormalizeMorphTargetExtras(mesh);
             bool extrasIsString = mesh["extras"]?.Type == JTokenType.String;
             bool inconsistentTargets = targetCounts.Length > 1;
             if (!extrasIsString && !inconsistentTargets)
@@ -3912,6 +3940,30 @@ public class UnrealExporter
         }
 
         return changed;
+    }
+
+    private static bool NormalizeMorphTargetExtras(JObject mesh)
+    {
+        if (mesh["extras"]?.Type != JTokenType.String)
+            return false;
+
+        var text = mesh["extras"]?.Value<string>();
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        try
+        {
+            var parsed = JObject.Parse(text);
+            if (parsed["targetNames"] is not JArray)
+                return false;
+
+            mesh["extras"] = parsed;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void RemoveWeightAnimationChannels(JObject gltf, JObject mesh)

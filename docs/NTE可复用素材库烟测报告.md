@@ -69,7 +69,7 @@ dotnet run --project UnrealExporter -- --preview-ue-animation --model "F:\UE-Ass
 Blender/F3D 截帧验证：
 
 ```powershell
-& "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" --background --python tools\blender_visual_validate.py -- --summary "F:\UE-Assets\nte-visual-validation\blender\summary.json" --case npc018_loop "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_cytoL_loop.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\npc018_loop" --case npc018_start "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_pxcy_start.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\npc018_start" --case fish "F:\UE-Assets\nte-reusable-library-smoke\_preview\SK_Fish_41_skin__SK_Fish_41_Anim.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\fish" --case boss06_act01 "F:\UE-Assets\nte-character-smoke\_preview\Boss_06_skin__mon_h_act_01.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\boss06_act01"
+& "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" --background --python "D:\misutime\HumanoidRetargeter\tools\blender_visual_validate.py" -- --summary "F:\UE-Assets\nte-visual-validation\blender\summary.json" --case npc018_loop "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_cytoL_loop.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\npc018_loop" --case npc018_start "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_pxcy_start.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\npc018_start" --case fish "F:\UE-Assets\nte-reusable-library-smoke\_preview\SK_Fish_41_skin__SK_Fish_41_Anim.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\fish" --case boss06_act01 "F:\UE-Assets\nte-character-smoke\_preview\Boss_06_skin__mon_h_act_01.preview.glb" "F:\UE-Assets\nte-visual-validation\blender\boss06_act01"
 
 & "C:\Program Files\F3D\bin\f3d-console.exe" --output "F:\UE-Assets\nte-visual-validation\f3d\npc018_loop\npc018_loop_t0.png" --resolution 960,720 --animation-time 0 --animation-indices 0 "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_cytoL_loop.preview.glb"
 & "C:\Program Files\F3D\bin\f3d-console.exe" --output "F:\UE-Assets\nte-visual-validation\f3d\npc018_loop\npc018_loop_t1.png" --resolution 960,720 --animation-time 1 --animation-indices 0 "F:\UE-Assets\nte-visual-validation\NPC_018_skin__NPC018_B_cytoL_loop.preview.glb"
@@ -336,8 +336,8 @@ Blender 视觉复验：
 
 - `CUE4Parse/CUE4Parse-Conversion/Meshes/glTF/Gltf.cs`：骨骼 glTF 导出 `SwapYZ(FQuat)` 从 `(x,z,y,w)` 改为 `(x,z,y,-w)`。
 - `UnrealExporter/UEAnimationPreviewBuilder.cs`：`.ueanim` 合成 preview 的 rotation channel 使用同一换基。
-- `tools/blender_visual_validate.py`：近景截图使用 trimmed bbox 取景，避免少量头发/衣摆离群点把人物缩成远景；结构检查仍保留完整 bbox 和顶点离群统计。
-- `tools/blender_pose_diagnose.py`：新增顶点位移、材质、顶点组、骨骼位移诊断，用于定位异常是否来自主骨架、附件/头发/衣摆或 skin 权重。
+- `D:\misutime\HumanoidRetargeter\tools\blender_visual_validate.py`：近景截图使用 trimmed bbox 取景，避免少量头发/衣摆离群点把人物缩成远景；结构检查仍保留完整 bbox 和顶点离群统计。
+- `D:\misutime\HumanoidRetargeter\tools\blender_pose_diagnose.py`：新增顶点位移、材质、顶点组、骨骼位移诊断，用于定位异常是否来自主骨架、附件/头发/衣摆或 skin 权重。
 
 复验输出：
 

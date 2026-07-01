@@ -101,6 +101,11 @@ Create multiple JSONs in the `configs` folder, naming them something easy for yo
 
 团队操作流程见 [UE 游戏素材提取流程](docs/UE游戏素材提取流程.md)。常用项目命令见 [常用导出命令](docs/常用导出命令.md)。
 
+相关后处理项目已经拆分：
+
+- `D:\misutime\AssetLibraryBrowser`：读取 `asset_library.json` / `library_index.db` 的通用素材浏览器。
+- `D:\misutime\HumanoidRetargeter`：处理已导出模型/动画素材的 ARPG Humanoid 标准化、重定向和视觉门禁工具链。
+
 ### Neverness To Everness asset export
 
 本仓库当前已经放了几份本地 NTE 配置，运行命令时使用配置文件名，不需要带 `.json` 后缀。
@@ -129,15 +134,14 @@ dotnet run --project UnrealExporter nte-all-assets
 
 The GLB exporter embeds common material textures into the GLB so viewers and DCC tools can display the model immediately. It also keeps the Unreal material path and texture slot paths in `material.extras.textureSlots`, and still writes sidecar material JSON / texture files when material export is enabled.
 
-For a Unity-oriented pipeline, prefer:
+For a Unity-oriented pipeline, use this exporter as the Unreal asset extraction stage:
 
 ```text
-UnrealExporter -> GLB models with embedded preview textures + sidecar PNG/material JSON
-Blender/Assimp -> optional GLB to FBX batch conversion
-Unity Editor script -> rebuild Unity materials from material JSON / textureSlots
+UnrealExporter -> GLB models, .ueanim animations, textures, material sidecars, library_index.db
+HumanoidRetargeter -> optional already-exported asset standardization / Unity or Godot helper packages
 ```
 
-FBX is not written directly by this exporter at the moment. If FBX is required, export GLB first and convert it in Blender or Assimp.
+Unity/Godot post-processing scripts are maintained in `D:\misutime\HumanoidRetargeter`, not in this Unreal extraction project.
 
 #### [Config List](#config-list)
 If you pass the config list flag `--list`, the program will prompt you to select the configs you wish to use, listing the `gameTitle` for each object in the config. **This is enabled by default in the binary executable** unless an argument is passed.

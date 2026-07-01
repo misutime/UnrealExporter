@@ -3,7 +3,7 @@
     "gameTitle": "NevernessToEverness",
     "version": "5.6",
     "paksDir": "C:\\Program Files\\Neverness To Everness\\Client\\WindowsNoEditor\\HT\\Content\\Paks",
-    "outputDir": "D:\\UE5-Assets\\nte-all-assets",
+    "outputDir": "F:\\UE5-Assets\\nte-all-assets",
     "aes": "0x370E80AA7DCA90A938A4D85013C5A16129AB3079902532B3325CA5B72B740FC7",
     "mappingsFile": "D:\\misutime\\UnrealExporter\\mappings\\NevernessToEverness.usmap",
     "logOutputs": true,

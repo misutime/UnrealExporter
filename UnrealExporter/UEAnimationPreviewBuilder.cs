@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
@@ -10,19 +11,24 @@ namespace UnrealExporter;
 
 internal static class UEAnimationPreviewBuilder
 {
+    private const float TranslationAnimationEpsilon = 0.0001f;
+    private const float RotationAnimationEpsilonRadians = 0.01f;
+    private const float MorphAnimationEpsilon = 0.0001f;
+
     public static int Run(
         string modelPath,
         string animationPath,
         string outputPath,
         string? reportPath = null,
         string? reportDbPath = null,
-        string? skipBoneRegex = null)
+        string? skipBoneRegex = null,
+        bool formalExport = false)
     {
         var fullOutputPath = Path.GetFullPath(outputPath);
         reportPath = string.IsNullOrWhiteSpace(reportPath) ? null : Path.GetFullPath(reportPath);
         reportDbPath = string.IsNullOrWhiteSpace(reportDbPath) ? null : Path.GetFullPath(reportDbPath);
         if (reportPath == null && reportDbPath == null)
-            reportDbPath = Path.ChangeExtension(fullOutputPath, ".preview_validation.db");
+            reportDbPath = Path.ChangeExtension(fullOutputPath, formalExport ? ".animation_export.db" : ".preview_validation.db");
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullOutputPath)!);
         if (reportPath != null)
@@ -45,8 +51,9 @@ internal static class UEAnimationPreviewBuilder
             var gltfAnimation = model.CreateAnimation(animation.Name);
             gltfAnimation.Extras = JsonContent.Parse(JsonConvert.SerializeObject(new
             {
-                unrealExporterPreview = new
+                unrealExporter = new
                 {
+                    mode = formalExport ? "formalAnimationExport" : "preview",
                     source = "UEAnim",
                     model = Path.GetFullPath(modelPath),
                     animation = Path.GetFullPath(animationPath),
@@ -58,6 +65,7 @@ internal static class UEAnimationPreviewBuilder
 
             var matchedTracks = 0;
             var writtenChannels = 0;
+            var animatedTransformChannels = 0;
             var retargetedTranslationTracks = 0;
             var skippedStaticTranslationTracks = 0;
             var skippedNonRootTranslationTracks = 0;
@@ -83,13 +91,21 @@ internal static class UEAnimationPreviewBuilder
                 matchedTracks++;
                 if (track.Positions.Count > 0)
                 {
-                    if (ShouldWriteTranslationChannel(track.BoneName))
+                    if (formalExport || ShouldWriteTranslationChannel(track.BoneName))
                     {
-                        var translation = BuildTranslationKeyMap(track, node, animation.FramesPerSecond);
-                        if (translation.Keys.Count > 0)
+                        var translation = formalExport
+                            ? BuildFormalTranslationKeyMap(track, animation.FramesPerSecond)
+                            : BuildTranslationKeyMap(track, node, animation.FramesPerSecond);
+                        if (translation.Keys.Count > 0 && (formalExport || IsAnimatedTranslation(translation.Keys)))
                         {
                             gltfAnimation.CreateTranslationChannel(node, translation.Keys, linear: true);
                             writtenChannels++;
+                            if (IsAnimatedTranslation(translation.Keys))
+                                animatedTransformChannels++;
+                        }
+                        else if (!formalExport && translation.Keys.Count > 0)
+                        {
+                            skippedStaticTranslationTracks++;
                         }
 
                         if (translation.Retargeted)
@@ -105,14 +121,22 @@ internal static class UEAnimationPreviewBuilder
 
                 if (track.Rotations.Count > 0)
                 {
-                    var rotation = BuildRotationKeyMap(track, node, animation.FramesPerSecond);
-                    if (rotation.Keys.Count > 0)
+                    var rotation = formalExport
+                        ? BuildFormalRotationKeyMap(track, animation.FramesPerSecond)
+                        : BuildRotationKeyMap(track, node, animation.FramesPerSecond);
+                    if (rotation.Keys.Count > 0 && (formalExport || IsAnimatedRotation(rotation.Keys)))
                     {
                         gltfAnimation.CreateRotationChannel(
                             node,
                             rotation.Keys,
                             linear: true);
                         writtenChannels++;
+                        if (IsAnimatedRotation(rotation.Keys))
+                            animatedTransformChannels++;
+                    }
+                    else if (!formalExport && rotation.Keys.Count > 0)
+                    {
+                        skippedStaticRotationTracks++;
                     }
 
                     if (rotation.Retargeted)
@@ -123,30 +147,66 @@ internal static class UEAnimationPreviewBuilder
 
                 if (track.Scales.Count > 0)
                 {
-                    // UE .ueanim tracks are authored against the source Skeleton and often contain
-                    // per-bone ref-pose scale keys. Writing them blindly into a standalone glTF
-                    // preview can collapse or tear skinned meshes. Keep previews conservative until
-                    // we can apply the engine's exact retarget/AnimBP context.
-                    skippedScaleTracks++;
+                    if (formalExport)
+                    {
+                        var scaleKeys = BuildFormalScaleKeyMap(track, animation.FramesPerSecond);
+                        if (scaleKeys.Count > 0)
+                        {
+                            gltfAnimation.CreateScaleChannel(node, scaleKeys, linear: true);
+                            writtenChannels++;
+                            if (IsAnimatedScale(scaleKeys))
+                                animatedTransformChannels++;
+                        }
+                    }
+                    else
+                    {
+                        // UE .ueanim tracks are authored against the source Skeleton and often contain
+                        // per-bone ref-pose scale keys. Writing them blindly into a standalone glTF
+                        // preview can collapse or tear skinned meshes. Keep previews conservative until
+                        // we can apply the engine's exact retarget/AnimBP context.
+                        skippedScaleTracks++;
+                    }
                 }
             }
 
-            model.SaveGLB(outputPath, new WriteSettings());
-            UnrealExporter.SanitizeGlbForPreview(outputPath);
+            var morphCurveResult = CreateMorphCurveChannels(gltfAnimation, model, modelPath, animation);
+            writtenChannels += morphCurveResult.WrittenChannels;
+            var hasActualMotion = formalExport
+                ? writtenChannels > 0
+                : animatedTransformChannels > 0 || morphCurveResult.WrittenChannels > 0;
+            if (hasActualMotion)
+            {
+                model.SaveGLB(outputPath, new WriteSettings());
+                if (!formalExport)
+                    UnrealExporter.SanitizeGlbForPreview(outputPath);
+            }
+            else if (File.Exists(outputPath))
+            {
+                File.Delete(outputPath);
+            }
+
             var anyRetarget = retargetedTranslationTracks > 0 || retargetedRotationTracks > 0;
             var anyAdjustedOrSkipped = anyRetarget
                                        || skippedStaticTranslationTracks > 0
                                        || skippedNonRootTranslationTracks > 0
                                        || skippedStaticRotationTracks > 0
-                                       || skippedScaleTracks > 0;
+                                       || skippedScaleTracks > 0
+                                       || morphCurveResult.UnmappedAnimatedCurves > 0
+                                       || morphCurveResult.IncompatibleMorphMeshes > 0;
             var heavyTranslationRetarget = matchedTracks > 0 && retargetedTranslationTracks > matchedTracks * 0.5f;
-            var status = matchedTracks > 0 && writtenChannels > 0 && File.Exists(outputPath)
+            var status = hasActualMotion && File.Exists(outputPath)
                 ? missingBones.Count == 0 && !anyAdjustedOrSkipped && !heavyTranslationRetarget ? "ok" : "warning"
                 : "error";
+            var noActualMotionReason = hasActualMotion
+                ? null
+                : morphCurveResult.AnimatedCurveCount > 0
+                    ? "Animation contains animated UE curves, but none mapped to valid morph targets on this model; transform tracks were static/noise."
+                    : "Animation transform tracks were static/noise and no animated UE curves were present.";
             WriteReport(reportPath, reportDbPath, new
             {
                 status,
-                gltf = fullOutputPath,
+                mode = formalExport ? "formalAnimationExport" : "preview",
+                gltf = File.Exists(outputPath) ? fullOutputPath : null,
                 report = reportPath,
                 reportDb = reportDbPath,
                 model = Path.GetFullPath(modelPath),
@@ -158,9 +218,17 @@ internal static class UEAnimationPreviewBuilder
                     ? animation.FrameCount / animation.FramesPerSecond
                     : 0,
                 trackCount = animation.Tracks.Count,
+                curveCount = animation.Curves.Count,
                 matchedTracks,
                 missingTrackCount = missingBones.Count,
                 writtenChannels,
+                animatedTransformChannels,
+                writtenMorphChannels = morphCurveResult.WrittenChannels,
+                animatedCurveCount = morphCurveResult.AnimatedCurveCount,
+                matchedMorphCurves = morphCurveResult.MatchedAnimatedCurves,
+                unmappedMorphCurves = morphCurveResult.UnmappedAnimatedCurves,
+                incompatibleMorphMeshes = morphCurveResult.IncompatibleMorphMeshes,
+                noActualMotionReason,
                 retargetedTranslationTracks,
                 skippedStaticTranslationTracks,
                 skippedNonRootTranslationTracks,
@@ -174,8 +242,12 @@ internal static class UEAnimationPreviewBuilder
                 heavyTranslationRetarget,
                 visualAcceptance = new
                 {
-                    status = anyAdjustedOrSkipped || missingBones.Count > 0 ? "notAccepted" : "requiresManualReview",
-                    reason = anyAdjustedOrSkipped
+                    status = status == "error" || anyAdjustedOrSkipped || missingBones.Count > 0 ? "notAccepted" : "requiresManualReview",
+                    reason = status == "error"
+                        ? noActualMotionReason
+                        : formalExport
+                        ? "Formal export preserved transform channels from the UEAnim clip. Visual/gameplay acceptance still requires importer-side review."
+                        : anyAdjustedOrSkipped
                         ? "Preview generation applied or skipped uncertain transform channels. This can prove a diagnostic preview was generated, but cannot prove humanoid animation correctness."
                         : "Preview generated without automatic retargeting, but humanoid animation correctness still requires manual rest/mid/end visual review.",
                     requiresScreenshots = new[] { "restPose", "animationStart", "animationMiddle", "animationEnd" }
@@ -183,8 +255,9 @@ internal static class UEAnimationPreviewBuilder
                 missingBones = missingBones.Take(64).ToArray(),
             });
 
-            Console.WriteLine($"=> {outputPath}");
-            Console.WriteLine($"UE animation preview: {status}, matchedTracks={matchedTracks}, channels={writtenChannels}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, skippedNonRootTranslations={skippedNonRootTranslationTracks}, retargetedRotations={retargetedRotationTracks}, skippedStaticRotations={skippedStaticRotationTracks}, skippedScales={skippedScaleTracks}, skippedByRegex={skippedByRegexTracks}");
+            if (File.Exists(outputPath))
+                Console.WriteLine($"=> {outputPath}");
+            Console.WriteLine($"UE animation {(formalExport ? "export" : "preview")}: {status}, matchedTracks={matchedTracks}, transformChannels={animatedTransformChannels}, morphChannels={morphCurveResult.WrittenChannels}, curves={animation.Curves.Count}, matchedMorphCurves={morphCurveResult.MatchedAnimatedCurves}, unmappedMorphCurves={morphCurveResult.UnmappedAnimatedCurves}, missingBones={missingBones.Count}, retargetedTranslations={retargetedTranslationTracks}, skippedStaticTranslations={skippedStaticTranslationTracks}, skippedNonRootTranslations={skippedNonRootTranslationTracks}, retargetedRotations={retargetedRotationTracks}, skippedStaticRotations={skippedStaticRotationTracks}, skippedScales={skippedScaleTracks}, skippedByRegex={skippedByRegexTracks}");
             return status == "error" ? 2 : 0;
         }
         catch (Exception ex)
@@ -221,6 +294,312 @@ internal static class UEAnimationPreviewBuilder
                || boneName.Contains("ik_", StringComparison.OrdinalIgnoreCase)
                || boneName.Contains("_ik", StringComparison.OrdinalIgnoreCase)
                || boneName.StartsWith("wq_root", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static MorphCurvePreviewResult CreateMorphCurveChannels(Animation gltfAnimation, ModelRoot model, string modelPath, UEAnimData animation)
+    {
+        var animatedCurves = animation.Curves
+            .Where(curve => IsAnimatedScalar(curve.Keys))
+            .GroupBy(curve => NormalizeMorphName(curve.Name), StringComparer.OrdinalIgnoreCase)
+            .Where(group => !string.IsNullOrWhiteSpace(group.Key))
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        if (animatedCurves.Count == 0)
+            return new MorphCurvePreviewResult(0, 0, 0, 0, 0);
+
+        var targetNamesByMesh = ReadMorphTargetNamesByMeshIndex(modelPath);
+        var matchedCurveNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var writtenChannels = 0;
+        var incompatibleMeshes = 0;
+
+        foreach (var node in model.LogicalNodes)
+        {
+            var mesh = node.Mesh;
+            if (mesh == null)
+                continue;
+
+            var targetCount = GetConsistentMorphTargetCount(mesh);
+            if (targetCount <= 0)
+            {
+                if (mesh.Primitives.Any(x => x.MorphTargetsCount > 0))
+                    incompatibleMeshes++;
+                continue;
+            }
+
+            if (!targetNamesByMesh.TryGetValue(mesh.LogicalIndex, out var targetNames) || targetNames.Length == 0)
+                continue;
+
+            var curveBindings = new List<MorphCurveBinding>();
+            for (var targetIndex = 0; targetIndex < Math.Min(targetNames.Length, targetCount); targetIndex++)
+            {
+                var normalized = NormalizeMorphName(targetNames[targetIndex]);
+                if (animatedCurves.TryGetValue(normalized, out var curve))
+                    curveBindings.Add(new MorphCurveBinding(targetIndex, normalized, curve));
+            }
+
+            if (curveBindings.Count == 0)
+                continue;
+
+            var keyMap = BuildMorphKeyMap(node, mesh, curveBindings, targetCount, animation.FramesPerSecond);
+            if (!IsAnimatedMorphKeyMap(keyMap))
+                continue;
+
+            gltfAnimation.CreateMorphChannel(node, keyMap, targetCount, linear: true);
+            writtenChannels++;
+            foreach (var binding in curveBindings)
+                matchedCurveNames.Add(binding.NormalizedName);
+        }
+
+        return new MorphCurvePreviewResult(
+            animatedCurves.Count,
+            matchedCurveNames.Count,
+            animatedCurves.Count - matchedCurveNames.Count,
+            writtenChannels,
+            incompatibleMeshes);
+    }
+
+    private static Dictionary<float, float[]> BuildMorphKeyMap(
+        Node node,
+        Mesh mesh,
+        IReadOnlyList<MorphCurveBinding> curveBindings,
+        int targetCount,
+        float framesPerSecond)
+    {
+        var times = curveBindings
+            .SelectMany(binding => binding.Curve.Keys.Select(key => key.Time(framesPerSecond)))
+            .Distinct()
+            .OrderBy(x => x)
+            .ToArray();
+        var baseWeights = ReadBaseMorphWeights(node, mesh, targetCount);
+        var result = new Dictionary<float, float[]>();
+        foreach (var time in times)
+        {
+            var weights = (float[])baseWeights.Clone();
+            foreach (var binding in curveBindings)
+                weights[binding.TargetIndex] = Math.Clamp(SampleCurve(binding.Curve, time, framesPerSecond), 0f, 1f);
+            result[time] = weights;
+        }
+
+        return result;
+    }
+
+    private static float[] ReadBaseMorphWeights(Node node, Mesh mesh, int targetCount)
+    {
+        var result = new float[targetCount];
+        var weights = node.GetMorphWeights();
+        if (weights.Count == 0)
+            weights = mesh.GetMorphWeights();
+
+        for (var i = 0; i < Math.Min(targetCount, weights.Count); i++)
+            result[i] = weights[i];
+        return result;
+    }
+
+    private static float SampleCurve(UEAnimCurve curve, float time, float framesPerSecond)
+    {
+        if (curve.Keys.Count == 0)
+            return 0;
+
+        var keys = curve.Keys
+            .Select(key => (Time: key.Time(framesPerSecond), key.Value))
+            .OrderBy(key => key.Time)
+            .ToArray();
+        if (time <= keys[0].Time)
+            return keys[0].Value;
+        if (time >= keys[^1].Time)
+            return keys[^1].Value;
+
+        for (var i = 1; i < keys.Length; i++)
+        {
+            if (time > keys[i].Time)
+                continue;
+
+            var previous = keys[i - 1];
+            var next = keys[i];
+            var span = next.Time - previous.Time;
+            if (span <= 0)
+                return next.Value;
+
+            var amount = (time - previous.Time) / span;
+            return previous.Value + (next.Value - previous.Value) * amount;
+        }
+
+        return keys[^1].Value;
+    }
+
+    private static int GetConsistentMorphTargetCount(Mesh mesh)
+    {
+        var counts = mesh.Primitives
+            .Select(x => x.MorphTargetsCount)
+            .Distinct()
+            .ToArray();
+        return counts.Length == 1 ? counts[0] : 0;
+    }
+
+    private static bool IsAnimatedTranslation(IReadOnlyDictionary<float, Vector3> keys)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Key).First().Value;
+        return keys.Values.Any(value => Vector3.Distance(value, first) > TranslationAnimationEpsilon);
+    }
+
+    private static bool IsAnimatedScale(IReadOnlyDictionary<float, Vector3> keys)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Key).First().Value;
+        return keys.Values.Any(value => Vector3.Distance(value, first) > TranslationAnimationEpsilon);
+    }
+
+    private static bool IsAnimatedRotation(IReadOnlyDictionary<float, Quaternion> keys)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = Quaternion.Normalize(keys.OrderBy(x => x.Key).First().Value);
+        foreach (var value in keys.Values)
+        {
+            var current = Quaternion.Normalize(value);
+            var dot = MathF.Abs(Quaternion.Dot(first, current));
+            dot = Math.Clamp(dot, -1f, 1f);
+            var angle = 2f * MathF.Acos(dot);
+            if (angle > RotationAnimationEpsilonRadians)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsAnimatedScalar(IReadOnlyList<UEAnimKey<float>> keys)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Frame).First().Value;
+        return keys.Any(key => MathF.Abs(key.Value - first) > MorphAnimationEpsilon);
+    }
+
+    private static bool IsAnimatedMorphKeyMap(IReadOnlyDictionary<float, float[]> keys)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Key).First().Value;
+        foreach (var weights in keys.Values)
+        {
+            for (var i = 0; i < Math.Min(first.Length, weights.Length); i++)
+            {
+                if (MathF.Abs(weights[i] - first[i]) > MorphAnimationEpsilon)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string NormalizeMorphName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (char.IsLetterOrDigit(c))
+                builder.Append(char.ToLowerInvariant(c));
+        }
+
+        return builder.ToString();
+    }
+
+    private static Dictionary<int, string[]> ReadMorphTargetNamesByMeshIndex(string modelPath)
+    {
+        try
+        {
+            var json = ReadGltfJson(modelPath);
+            if (string.IsNullOrWhiteSpace(json))
+                return [];
+
+            var root = JObject.Parse(json);
+            var result = new Dictionary<int, string[]>();
+            if (root["meshes"] is not JArray meshes)
+                return result;
+
+            for (var i = 0; i < meshes.Count; i++)
+            {
+                if (meshes[i] is not JObject mesh)
+                    continue;
+
+                var names = ReadTargetNames(mesh["extras"]);
+                if (names.Length > 0)
+                    result[i] = names;
+            }
+
+            return result;
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string[] ReadTargetNames(JToken? extras)
+    {
+        if (extras == null)
+            return [];
+
+        JObject? extrasObject = extras as JObject;
+        if (extras.Type == JTokenType.String)
+        {
+            var text = extras.Value<string>();
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                try
+                {
+                    extrasObject = JObject.Parse(text);
+                }
+                catch
+                {
+                    return [];
+                }
+            }
+        }
+
+        return extrasObject?["targetNames"] is JArray targetNames
+            ? targetNames.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToArray()
+            : [];
+    }
+
+    private static string ReadGltfJson(string path)
+    {
+        if (path.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase))
+            return File.ReadAllText(path, Encoding.UTF8);
+
+        if (!path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
+            return "";
+
+        var data = File.ReadAllBytes(path);
+        if (data.Length < 20 || Encoding.ASCII.GetString(data, 0, 4) != "glTF")
+            return "";
+
+        var offset = 12;
+        while (offset + 8 <= data.Length)
+        {
+            var chunkLength = BitConverter.ToInt32(data, offset);
+            var chunkType = BitConverter.ToUInt32(data, offset + 4);
+            offset += 8;
+            if (chunkLength < 0 || offset + chunkLength > data.Length)
+                return "";
+
+            if (chunkType == 0x4E4F534A)
+                return Encoding.UTF8.GetString(data, offset, chunkLength).TrimEnd('\0', ' ', '\r', '\n', '\t');
+
+            offset += chunkLength;
+        }
+
+        return "";
     }
 
     private static ModelRoot LoadModelForPreview(string modelPath)
@@ -324,6 +703,15 @@ internal static class UEAnimationPreviewBuilder
 
         return new RotationKeyMap(directKeys, Retargeted: false, SkippedStatic: false);
     }
+
+    private static TranslationKeyMap BuildFormalTranslationKeyMap(UEAnimTrack track, float framesPerSecond)
+        => new(BuildKeyMap(track.Positions, framesPerSecond, x => SwapYZ(x) * 0.01f), Retargeted: false, SkippedStatic: false);
+
+    private static RotationKeyMap BuildFormalRotationKeyMap(UEAnimTrack track, float framesPerSecond)
+        => new(BuildKeyMap(track.Rotations, framesPerSecond, SwapYZ), Retargeted: false, SkippedStatic: false);
+
+    private static Dictionary<float, Vector3> BuildFormalScaleKeyMap(UEAnimTrack track, float framesPerSecond)
+        => BuildKeyMap(track.Scales, framesPerSecond, SwapYZ);
 
     private static bool IsRotationCompatibleWithRest(Quaternion first, Quaternion rest)
     {
@@ -454,3 +842,15 @@ internal readonly record struct RotationKeyMap(
     Dictionary<float, Quaternion> Keys,
     bool Retargeted,
     bool SkippedStatic);
+
+internal readonly record struct MorphCurveBinding(
+    int TargetIndex,
+    string NormalizedName,
+    UEAnimCurve Curve);
+
+internal readonly record struct MorphCurvePreviewResult(
+    int AnimatedCurveCount,
+    int MatchedAnimatedCurves,
+    int UnmappedAnimatedCurves,
+    int WrittenChannels,
+    int IncompatibleMorphMeshes);

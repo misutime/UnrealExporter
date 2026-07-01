@@ -58,6 +58,10 @@ internal static class UEAnimReader
                     for (var i = 0; i < count; i++)
                         result.Tracks.Add(ReadTrack(payloadReader));
                     break;
+                case "CURVES":
+                    for (var i = 0; i < count; i++)
+                        result.Curves.Add(ReadCurve(payloadReader));
+                    break;
             }
 
             payloadReader.BaseStream.Position = chunkEnd;
@@ -82,6 +86,16 @@ internal static class UEAnimReader
             track.Scales.Add(new UEAnimKey<Vector3>(reader.ReadInt32(), ReadVector3(reader)));
 
         return track;
+    }
+
+    private static UEAnimCurve ReadCurve(BinaryReader reader)
+    {
+        var curve = new UEAnimCurve(ReadFString(reader));
+        var keyCount = reader.ReadInt32();
+        for (var i = 0; i < keyCount; i++)
+            curve.Keys.Add(new UEAnimKey<float>(reader.ReadInt32(), reader.ReadSingle()));
+
+        return curve;
     }
 
     private static byte[] Decompress(byte[] data, string compression, int expectedSize)
@@ -127,6 +141,7 @@ internal sealed class UEAnimData
     public int FrameCount { get; set; }
     public float FramesPerSecond { get; set; } = 30;
     public List<UEAnimTrack> Tracks { get; } = [];
+    public List<UEAnimCurve> Curves { get; } = [];
 }
 
 internal sealed class UEAnimTrack
@@ -146,4 +161,15 @@ internal readonly record struct UEAnimKey<T>(int Frame, T Value)
 {
     public float Time(float framesPerSecond)
         => framesPerSecond > 0 ? Frame / framesPerSecond : Frame / 30f;
+}
+
+internal sealed class UEAnimCurve
+{
+    public UEAnimCurve(string name)
+    {
+        Name = name;
+    }
+
+    public string Name { get; }
+    public List<UEAnimKey<float>> Keys { get; } = [];
 }

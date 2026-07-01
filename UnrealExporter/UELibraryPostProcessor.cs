@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -102,6 +103,291 @@ internal static class UELibraryPostProcessor
         RunStage("写素材库说明", () => WriteLibraryReadme(root, reports, materialIndex.Values, componentAssetRelations, packageObjectMaps));
 
         Console.WriteLine($"UE Library postprocess finished: {root}");
+    }
+
+    public static void RefreshAnimationRelations(string libraryRoot, bool writeDebugJson = false)
+    {
+        if (string.IsNullOrWhiteSpace(libraryRoot))
+            throw new ArgumentException("Library root is required.", nameof(libraryRoot));
+
+        var root = Path.GetFullPath(libraryRoot);
+        var dbPath = Path.Combine(root, "library_index.db");
+        if (!File.Exists(dbPath))
+            throw new FileNotFoundException("library_index.db is required to refresh animation relations.", dbPath);
+
+        Console.WriteLine($"UE animation relation refresh root: {root}");
+        SQLitePCL.Batteries_V2.Init();
+        var sourceIndex = RunStage("读取UE源索引", () => LoadSourceIndex(root));
+        List<JObject> catalogRows;
+        ComponentAssetRelationLink[] componentAssetRelations;
+        using (var readConnection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly"))
+        {
+            readConnection.Open();
+            catalogRows = LoadCatalogRowsForAnimationRefresh(root, readConnection);
+            componentAssetRelations = LoadComponentRelationsForAnimationRefresh(readConnection);
+        }
+
+        Console.WriteLine($"Animation relation refresh inputs: catalogRows={catalogRows.Count}, componentRelations={componentAssetRelations.Length}");
+        var animationValidation = RunStage("刷新动画可见性验证", () => WriteAnimationValidation(root, catalogRows, sourceIndex, componentAssetRelations, writeDebugJson));
+        var modelAnimationRelations = RunStage("刷新模型动画关系", () => WriteModelAnimationRelations(root, catalogRows, animationValidation, writeDebugJson));
+
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        DropAnimationRelationTables(connection, transaction);
+        CreateAnimationRelationTables(connection, transaction);
+        InsertModelAnimationRelations(connection, transaction, modelAnimationRelations);
+        InsertAnimationValidation(connection, transaction, animationValidation);
+        CreateAnimationRelationIndexes(connection, transaction);
+        transaction.Commit();
+        FinalizeSqliteOutput(connection);
+        Console.WriteLine($"UE animation relation refresh finished: {root}");
+    }
+
+    private static List<JObject> LoadCatalogRowsForAnimationRefresh(string root, SqliteConnection connection)
+    {
+        if (!TableExists(connection, "assets") || !TableColumnExists(connection, "assets", "raw_json"))
+            throw new InvalidDataException("library_index.db.assets.raw_json is required to refresh animation relations.");
+
+        var hasStatusColumn = TableColumnExists(connection, "assets", "status");
+        var hasValidationStatusColumn = TableColumnExists(connection, "assets", "validation_status");
+        var statusExpr = hasStatusColumn ? "status" : "NULL";
+        var validationStatusExpr = hasValidationStatusColumn ? "validation_status" : "NULL";
+        using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT kind, name, source, output, skeleton_path, skeleton_name,
+                   {statusExpr},
+                   {validationStatusExpr},
+                   raw_json
+            FROM assets
+            WHERE kind IN ('Model', 'Animation')
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<JObject>();
+        while (reader.Read())
+        {
+            JObject row;
+            try
+            {
+                row = JObject.Parse(GetString(reader, 8) ?? "{}");
+            }
+            catch
+            {
+                row = new JObject();
+            }
+
+            row["kind"] = GetString(reader, 0);
+            row["name"] = GetString(reader, 1);
+            row["source"] = GetString(reader, 2);
+            row["output"] = NormalizeLibraryOutput(root, GetString(reader, 3));
+            row["skeletonPath"] = GetString(reader, 4);
+            row["skeletonName"] = GetString(reader, 5);
+            if (hasStatusColumn)
+                row["status"] = GetString(reader, 6);
+            if (hasValidationStatusColumn)
+                row["validationStatus"] = GetString(reader, 7);
+            result.Add(row);
+        }
+
+        return result;
+    }
+
+    private static ComponentAssetRelationLink[] LoadComponentRelationsForAnimationRefresh(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "component_asset_relations"))
+            return [];
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT owner_object_path, owner_type, component_object_path, component_type,
+                   component_name, component_variable_name, relation_source, relation_type,
+                   target_path, target_name, target_asset_name, target_asset_kind, target_asset_output,
+                   match_status, match_reason, socket_name, parent_component_path,
+                   location_x, location_y, location_z,
+                   rotation_pitch, rotation_yaw, rotation_roll,
+                   scale_x, scale_y, scale_z,
+                   source_path
+            FROM component_asset_relations
+            ORDER BY id;
+            """;
+        using var reader = command.ExecuteReader();
+        var result = new List<ComponentAssetRelationLink>();
+        while (reader.Read())
+            result.Add(ReadComponentAssetRelationLink(reader));
+        return result.ToArray();
+    }
+
+    private static void DropAnimationRelationTables(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        Execute(connection, transaction, "DROP TABLE IF EXISTS relation_animation_sections;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS relation_animation_segments;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS relation_animation_evidence;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS relation_animations;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS model_animation_relations;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS animation_validation_missing_track_bones;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS animation_validation_hierarchy_mismatches;");
+        Execute(connection, transaction, "DROP TABLE IF EXISTS animation_validation;");
+    }
+
+    private static void CreateAnimationRelationTables(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        Execute(connection, transaction, """
+            CREATE TABLE model_animation_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                model_name TEXT,
+                model_source TEXT,
+                skeleton_path TEXT,
+                skeleton_name TEXT,
+                confidence TEXT NOT NULL,
+                animation_count INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_id INTEGER NOT NULL,
+                name TEXT,
+                source TEXT,
+                output TEXT,
+                status TEXT,
+                relation_source TEXT,
+                usage_evidence TEXT,
+                is_explicit_usage INTEGER NOT NULL,
+                is_skeleton_compatible INTEGER NOT NULL,
+                validation_status TEXT,
+                validation_category TEXT,
+                validation_reason TEXT,
+                duration REAL,
+                frame_count INTEGER,
+                track_count INTEGER,
+                track_coverage REAL,
+                hierarchy_compatible INTEGER NOT NULL,
+                is_container_animation INTEGER NOT NULL,
+                preview_visible_motion INTEGER NOT NULL,
+                preview_animated_transform_track_count INTEGER NOT NULL,
+                preview_animated_curve_count INTEGER NOT NULL,
+                preview_matched_morph_curve_count INTEGER NOT NULL,
+                preview_unmapped_morph_curve_count INTEGER NOT NULL,
+                preview_incompatible_morph_mesh_count INTEGER NOT NULL,
+                is_usable_candidate INTEGER NOT NULL,
+                confidence_tier TEXT,
+                relationship_kind TEXT,
+                recommended_use TEXT,
+                evidence_summary TEXT NOT NULL,
+                is_deterministic_usage INTEGER NOT NULL,
+                is_compatibility_candidate INTEGER NOT NULL,
+                segment_count INTEGER NOT NULL,
+                referenced_animation_count INTEGER NOT NULL,
+                exported_referenced_animation_count INTEGER NOT NULL,
+                missing_referenced_animation_count INTEGER NOT NULL,
+                section_count INTEGER NOT NULL,
+                FOREIGN KEY (relation_id) REFERENCES model_animation_relations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                step_index INTEGER NOT NULL,
+                evidence_step TEXT NOT NULL,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL,
+                slot_name TEXT,
+                referenced_animation_path TEXT,
+                referenced_animation_name TEXT,
+                start_pos REAL,
+                anim_start_time REAL,
+                anim_end_time REAL,
+                play_rate REAL,
+                looping_count INTEGER,
+                length REAL,
+                relation_source TEXT,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE relation_animation_sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relation_animation_id INTEGER NOT NULL,
+                section_index INTEGER NOT NULL,
+                section_name TEXT,
+                next_section_name TEXT,
+                slot_index INTEGER,
+                segment_index INTEGER,
+                segment_begin_time REAL,
+                link_method TEXT,
+                cached_link_method TEXT,
+                FOREIGN KEY (relation_animation_id) REFERENCES relation_animations(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                animation TEXT NOT NULL,
+                skeleton_path TEXT,
+                status TEXT NOT NULL,
+                candidate_reason TEXT,
+                validation_category TEXT,
+                reason TEXT,
+                track_source TEXT,
+                model_bone_count INTEGER NOT NULL,
+                animation_track_count INTEGER NOT NULL,
+                matched_track_bones INTEGER NOT NULL,
+                track_coverage REAL NOT NULL,
+                hierarchy_compatible INTEGER NOT NULL,
+                is_container_animation INTEGER NOT NULL,
+                preview_visible_motion INTEGER NOT NULL,
+                preview_animated_transform_track_count INTEGER NOT NULL,
+                preview_animated_curve_count INTEGER NOT NULL,
+                preview_matched_morph_curve_count INTEGER NOT NULL,
+                preview_unmapped_morph_curve_count INTEGER NOT NULL,
+                preview_incompatible_morph_mesh_count INTEGER NOT NULL
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation_missing_track_bones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                animation_validation_id INTEGER NOT NULL,
+                bone_index INTEGER NOT NULL,
+                bone_name TEXT NOT NULL,
+                FOREIGN KEY (animation_validation_id) REFERENCES animation_validation(id)
+            );
+            """);
+        Execute(connection, transaction, """
+            CREATE TABLE animation_validation_hierarchy_mismatches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                animation_validation_id INTEGER NOT NULL,
+                mismatch_index INTEGER NOT NULL,
+                mismatch TEXT NOT NULL,
+                FOREIGN KEY (animation_validation_id) REFERENCES animation_validation(id)
+            );
+            """);
+    }
+
+    private static void CreateAnimationRelationIndexes(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        Execute(connection, transaction, "CREATE INDEX idx_relations_skeleton ON model_animation_relations(skeleton_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_status ON relation_animations(validation_status, validation_category);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_usage ON relation_animations(usage_evidence, is_explicit_usage, is_skeleton_compatible);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_confidence ON relation_animations(confidence_tier, is_deterministic_usage, is_compatibility_candidate);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animations_recommended ON relation_animations(relationship_kind, recommended_use);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_evidence_animation ON relation_animation_evidence(relation_animation_id, step_index);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_segments_ref ON relation_animation_segments(referenced_animation_path);");
+        Execute(connection, transaction, "CREATE INDEX idx_relation_animation_sections_name ON relation_animation_sections(section_name);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_pair ON animation_validation(model, animation);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_status ON animation_validation(status);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_track_source ON animation_validation(track_source);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_missing_bones ON animation_validation_missing_track_bones(bone_name, animation_validation_id);");
+        Execute(connection, transaction, "CREATE INDEX idx_animation_validation_hierarchy_mismatches ON animation_validation_hierarchy_mismatches(mismatch, animation_validation_id);");
     }
 
     private static void WriteAssetLibraryManifest(string root)
@@ -259,7 +545,7 @@ internal static class UELibraryPostProcessor
         {
             using var transaction = connection.BeginTransaction();
             foreach (var (id, row) in updates)
-                UpdateAnimationMetadataSqliteRow(connection, transaction, tableName, id, row);
+                UpdateAnimationMetadataSqliteRow(connection, transaction, root, tableName, id, row);
             transaction.Commit();
         }
 
@@ -269,6 +555,7 @@ internal static class UELibraryPostProcessor
     private static void UpdateAnimationMetadataSqliteRow(
         SqliteConnection connection,
         SqliteTransaction transaction,
+        string root,
         string tableName,
         long id,
         JObject row)
@@ -305,7 +592,7 @@ internal static class UELibraryPostProcessor
         }
 
         Add(command, "$status", (string?)row["status"]);
-        Add(command, "$output", (string?)row["output"]);
+        Add(command, "$output", NormalizeLibraryOutput(root, (string?)row["output"]));
         Add(command, "$rawJson", row.ToString(Formatting.None));
         Add(command, "$id", id);
         command.ExecuteNonQuery();
@@ -1558,6 +1845,7 @@ internal static class UELibraryPostProcessor
         {
             try
             {
+                NormalizeCatalogRowPaths(root, row);
                 if (IsCatalogCacheRow(root, row))
                     continue;
 
@@ -1595,10 +1883,24 @@ internal static class UELibraryPostProcessor
         }
 
         return result.Values
+            .Select(row =>
+            {
+                NormalizeCatalogRowPaths(root, row);
+                return row;
+            })
             .Where(x => !IsCatalogCacheRow(root, x))
             .OrderBy(x => (string?)x["kind"], StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => (string?)x["output"] ?? (string?)x["source"], StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static void NormalizeCatalogRowPaths(string root, JObject row)
+    {
+        if (row.TryGetValue("output", out var output) && output.Type != JTokenType.Null)
+            row["output"] = NormalizeLibraryOutput(root, (string?)output);
+
+        if (row.TryGetValue("sharedOutput", out var sharedOutput) && sharedOutput.Type != JTokenType.Null)
+            row["sharedOutput"] = NormalizeLibraryOutput(root, (string?)sharedOutput);
     }
 
     private static bool IsCatalogCacheRow(string root, JObject row)
@@ -1626,7 +1928,7 @@ internal static class UELibraryPostProcessor
         var output = ((string?)row["output"] ?? (string?)row["source"] ?? (string?)row["name"] ?? "").Replace('\\', '/');
         if (!string.IsNullOrWhiteSpace(output))
         {
-            var fullPath = Path.IsPathRooted(output) ? Path.GetFullPath(output) : Path.GetFullPath(Path.Combine(root, output));
+            var fullPath = ResolveCatalogFile(root, output);
             output = MakeRelative(root, fullPath).Replace('\\', '/').ToLowerInvariant();
         }
 
@@ -4153,6 +4455,7 @@ internal static class UELibraryPostProcessor
                 warning = validations.Count(x => x.Status == "warning"),
                 error = validations.Count(x => x.Status == "error"),
                 containerAnimations = validations.Count(x => x.IsContainerAnimation),
+                previewNoVisibleMotion = validations.Count(x => !x.PreviewVisibleMotion),
             }),
             ["detailFile"] = "animation_validation.jsonl",
         };
@@ -4205,6 +4508,12 @@ internal static class UELibraryPostProcessor
             trackCoverage = x.TrackCoverage,
             hierarchyCompatible = x.HierarchyCompatible,
             isContainerAnimation = x.IsContainerAnimation,
+            previewVisibleMotion = x.PreviewVisibleMotion,
+            previewAnimatedTransformTrackCount = x.PreviewAnimatedTransformTrackCount,
+            previewAnimatedCurveCount = x.PreviewAnimatedCurveCount,
+            previewMatchedMorphCurveCount = x.PreviewMatchedMorphCurveCount,
+            previewUnmappedMorphCurveCount = x.PreviewUnmappedMorphCurveCount,
+            previewIncompatibleMorphMeshCount = x.PreviewIncompatibleMorphMeshCount,
             referencedAnimationCount = x.ReferencedAnimations.Length,
             exportedReferencedAnimationCount = x.ExportedReferencedAnimations.Length,
             missingReferencedAnimationCount = x.MissingReferencedAnimations.Length,
@@ -4238,9 +4547,22 @@ internal static class UELibraryPostProcessor
         var modelBoneCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
         var animationTrackCache = new Dictionary<string, SourceAnimationTrack[]>(StringComparer.OrdinalIgnoreCase);
         var skeletonLookupCache = new Dictionary<string, ModelBoneLookup>(StringComparer.OrdinalIgnoreCase);
+        var animationPreviewCache = new Dictionary<string, UEAnimPreviewMotionData>(StringComparer.OrdinalIgnoreCase);
+        var modelPreviewMorphTargetCache = new Dictionary<string, PreviewMorphTargetMesh[]>(StringComparer.OrdinalIgnoreCase);
         var exportedAnimationLookup = BuildExportedAnimationReferenceLookup(allAnimations);
         foreach (var candidate in candidates)
-            result.Add(ValidateAnimationPair(root, candidate.Model, candidate.Animation, exportedAnimationLookup, sourceIndex, candidate.Reason, modelBoneCache, animationTrackCache, skeletonLookupCache));
+            result.Add(ValidateAnimationPair(
+                root,
+                candidate.Model,
+                candidate.Animation,
+                exportedAnimationLookup,
+                sourceIndex,
+                candidate.Reason,
+                modelBoneCache,
+                animationTrackCache,
+                skeletonLookupCache,
+                animationPreviewCache,
+                modelPreviewMorphTargetCache));
 
         return result
             .OrderBy(x => x.ModelOutput, StringComparer.OrdinalIgnoreCase)
@@ -4768,7 +5090,9 @@ internal static class UELibraryPostProcessor
         string candidateReason = "",
         Dictionary<string, ModelBoneLookup>? modelBoneCache = null,
         Dictionary<string, SourceAnimationTrack[]>? animationTrackCache = null,
-        Dictionary<string, ModelBoneLookup>? skeletonLookupCache = null)
+        Dictionary<string, ModelBoneLookup>? skeletonLookupCache = null,
+        Dictionary<string, UEAnimPreviewMotionData>? animationPreviewCache = null,
+        Dictionary<string, PreviewMorphTargetMesh[]>? modelPreviewMorphTargetCache = null)
     {
         var skeletonPath = (string?)model["skeletonPath"];
         var modelKey = NormalizeCatalogOutput((string?)model["output"] ?? (string?)model["source"]);
@@ -4792,6 +5116,7 @@ internal static class UELibraryPostProcessor
         var trackCoverage = namedTrackCount == 0 ? 0 : Math.Round((double)matchedTrackBones / namedTrackCount, 4);
         var hierarchyMismatches = CompareHierarchy(modelBones, animationTracks, sourceIndex, skeletonPath, skeletonLookupCache);
         var isContainerAnimation = IsContainerAnimation(animation);
+        var previewMotion = ValidatePreviewMotion(root, model, animation, modelBones, modelKey, animationKey, animationPreviewCache, modelPreviewMorphTargetCache);
         var referencedAnimations = BuildReferencedAnimationPaths(animation);
         var exportedReferencedAnimations = FindExportedReferencedAnimations(referencedAnimations, exportedAnimationLookup);
         var missingReferencedAnimations = referencedAnimations
@@ -4864,6 +5189,13 @@ internal static class UELibraryPostProcessor
             reason = "动画和模型的部分重叠骨骼父级不一致，需要人工复核。";
         }
 
+        if (status != "error" && !previewMotion.HasVisibleMotion)
+        {
+            status = "error";
+            validationCategory = previewMotion.ValidationCategory;
+            reason = previewMotion.Reason;
+        }
+
         return new AnimationValidationEntry
         {
             PairKey = BuildPairKey(model, animation),
@@ -4887,6 +5219,12 @@ internal static class UELibraryPostProcessor
             TrackCoverage = trackCoverage,
             HierarchyCompatible = hierarchyMismatches.Length == 0,
             IsContainerAnimation = isContainerAnimation,
+            PreviewVisibleMotion = previewMotion.HasVisibleMotion,
+            PreviewAnimatedTransformTrackCount = previewMotion.AnimatedTransformTrackCount,
+            PreviewAnimatedCurveCount = previewMotion.AnimatedCurveCount,
+            PreviewMatchedMorphCurveCount = previewMotion.MatchedMorphCurveCount,
+            PreviewUnmappedMorphCurveCount = previewMotion.UnmappedMorphCurveCount,
+            PreviewIncompatibleMorphMeshCount = previewMotion.IncompatibleMorphMeshCount,
             ReferencedAnimations = referencedAnimations,
             ExportedReferencedAnimations = exportedReferencedAnimations,
             MissingReferencedAnimations = missingReferencedAnimations,
@@ -4912,6 +5250,288 @@ internal static class UELibraryPostProcessor
         }
 
         return lookup;
+    }
+
+    private static PreviewMotionValidation ValidatePreviewMotion(
+        string root,
+        JObject model,
+        JObject animation,
+        ModelBoneLookup modelBones,
+        string modelKey,
+        string animationKey,
+        Dictionary<string, UEAnimPreviewMotionData>? animationPreviewCache,
+        Dictionary<string, PreviewMorphTargetMesh[]>? modelPreviewMorphTargetCache)
+    {
+        var previewData = GetOrBuildUEAnimPreviewMotionData(root, animation, animationKey, animationPreviewCache);
+        if (!previewData.ReadOk)
+            return PreviewMotionValidation.Error(previewData.ErrorCategory, previewData.ErrorReason);
+
+        var animatedTransformTracks = previewData.AnimatedTransformBones.Count(modelBones.ByName.ContainsKey);
+
+        var morphTargets = GetOrBuildPreviewMorphTargets(root, model, modelKey, modelPreviewMorphTargetCache);
+        var morph = ValidatePreviewMorphCurves(previewData.AnimatedMorphCurves, morphTargets);
+        if (animatedTransformTracks > 0 || morph.MatchedAnimatedCurves > 0)
+        {
+            return new PreviewMotionValidation
+            {
+                HasVisibleMotion = true,
+                ValidationCategory = "previewMotion",
+                Reason = "动画包含能映射到该模型的可见 transform 或 morph 曲线。",
+                AnimatedTransformTrackCount = animatedTransformTracks,
+                AnimatedCurveCount = morph.AnimatedCurves,
+                MatchedMorphCurveCount = morph.MatchedAnimatedCurves,
+                UnmappedMorphCurveCount = morph.UnmappedAnimatedCurves,
+                IncompatibleMorphMeshCount = morph.IncompatibleMorphMeshes,
+            };
+        }
+
+        var category = morph.AnimatedCurves > 0 ? "previewCurvesUnmapped" : "previewNoMotion";
+        var reason = morph.AnimatedCurves > 0
+            ? "动画只有曲线/静态骨骼数据，但曲线无法映射到该模型有效 morph target；生成预览会是静态画面。"
+            : "动画没有能映射到该模型的可见 transform 或 morph 曲线；生成预览会是静态画面。";
+        return new PreviewMotionValidation
+        {
+            HasVisibleMotion = false,
+            ValidationCategory = category,
+            Reason = reason,
+            AnimatedTransformTrackCount = animatedTransformTracks,
+            AnimatedCurveCount = morph.AnimatedCurves,
+            MatchedMorphCurveCount = morph.MatchedAnimatedCurves,
+            UnmappedMorphCurveCount = morph.UnmappedAnimatedCurves,
+            IncompatibleMorphMeshCount = morph.IncompatibleMorphMeshes,
+        };
+    }
+
+    private static UEAnimPreviewMotionData GetOrBuildUEAnimPreviewMotionData(
+        string root,
+        JObject animation,
+        string animationKey,
+        Dictionary<string, UEAnimPreviewMotionData>? cache)
+    {
+        if (cache != null && !string.IsNullOrWhiteSpace(animationKey) && cache.TryGetValue(animationKey, out var cached))
+            return cached;
+
+        var result = BuildUEAnimPreviewMotionData(root, animation);
+        if (cache != null && !string.IsNullOrWhiteSpace(animationKey))
+            cache[animationKey] = result;
+
+        return result;
+    }
+
+    private static UEAnimPreviewMotionData BuildUEAnimPreviewMotionData(string root, JObject animation)
+    {
+        var animationPath = ResolveCatalogFile(root, (string?)animation["output"]);
+        if (string.IsNullOrWhiteSpace(animationPath) || !File.Exists(animationPath))
+        {
+            return UEAnimPreviewMotionData.Error(
+                "previewAnimationMissing",
+                "动画文件不存在，不能生成动画预览。");
+        }
+
+        try
+        {
+            var data = UEAnimReader.Read(animationPath);
+            return new UEAnimPreviewMotionData
+            {
+                ReadOk = true,
+                AnimatedTransformBones = data.Tracks
+                    .Where(track => !string.IsNullOrWhiteSpace(track.BoneName))
+                    .Where(HasPreviewAnimatedTransform)
+                    .Select(track => track.BoneName)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase),
+                AnimatedMorphCurves = data.Curves
+                    .Where(curve => IsAnimatedScalar(curve.Keys, 0.0001f))
+                    .Select(curve => NormalizePreviewMorphName(curve.Name))
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+            };
+        }
+        catch (Exception ex)
+        {
+            return UEAnimPreviewMotionData.Error(
+                "previewAnimationReadFailed",
+                $"动画 .ueanim 读取失败，不能生成动画预览：{ex.Message}");
+        }
+    }
+
+    private static bool HasPreviewAnimatedTransform(UEAnimTrack track)
+    {
+        return ShouldWritePreviewTranslationChannel(track.BoneName) && IsAnimatedVector(track.Positions, 0.01f)
+               || IsAnimatedRotation(track.Rotations, 0.01f);
+    }
+
+    private static bool ShouldWritePreviewTranslationChannel(string boneName)
+    {
+        if (string.IsNullOrWhiteSpace(boneName))
+            return false;
+
+        return boneName.Equals("root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Armature", StringComparison.OrdinalIgnoreCase)
+               || boneName.Equals("Bip001", StringComparison.OrdinalIgnoreCase)
+               || boneName.EndsWith("_root", StringComparison.OrdinalIgnoreCase)
+               || boneName.EndsWith("-root", StringComparison.OrdinalIgnoreCase)
+               || boneName.Contains("ik_", StringComparison.OrdinalIgnoreCase)
+               || boneName.Contains("_ik", StringComparison.OrdinalIgnoreCase)
+               || boneName.StartsWith("wq_root", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAnimatedVector(IReadOnlyList<UEAnimKey<Vector3>> keys, float epsilon)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Frame).First().Value;
+        return keys.Any(key => Vector3.Distance(key.Value, first) > epsilon);
+    }
+
+    private static bool IsAnimatedRotation(IReadOnlyList<UEAnimKey<Quaternion>> keys, float epsilonRadians)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = Quaternion.Normalize(keys.OrderBy(x => x.Frame).First().Value);
+        foreach (var key in keys)
+        {
+            var current = Quaternion.Normalize(key.Value);
+            var dot = MathF.Abs(Quaternion.Dot(first, current));
+            dot = Math.Clamp(dot, -1f, 1f);
+            if (2f * MathF.Acos(dot) > epsilonRadians)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static PreviewMorphTargetMesh[] GetOrBuildPreviewMorphTargets(
+        string root,
+        JObject model,
+        string modelKey,
+        Dictionary<string, PreviewMorphTargetMesh[]>? cache)
+    {
+        if (cache != null && !string.IsNullOrWhiteSpace(modelKey) && cache.TryGetValue(modelKey, out var cached))
+            return cached;
+
+        var modelPath = ResolveCatalogFile(root, (string?)model["output"]);
+        var result = ReadPreviewMorphTargetNames(modelPath);
+        if (cache != null && !string.IsNullOrWhiteSpace(modelKey))
+            cache[modelKey] = result;
+
+        return result;
+    }
+
+    private static PreviewMorphValidation ValidatePreviewMorphCurves(string[] animatedCurves, PreviewMorphTargetMesh[] targets)
+    {
+        if (animatedCurves.Length == 0)
+            return new PreviewMorphValidation(0, 0, 0, 0);
+
+        var validTargetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var incompatibleMeshes = 0;
+        foreach (var mesh in targets)
+        {
+            if (!mesh.IsCompatible)
+            {
+                if (mesh.HasAnyTargets)
+                    incompatibleMeshes++;
+                continue;
+            }
+
+            foreach (var name in mesh.TargetNames.Take(mesh.TargetCount))
+                validTargetNames.Add(NormalizePreviewMorphName(name));
+        }
+
+        var matched = animatedCurves.Count(validTargetNames.Contains);
+        return new PreviewMorphValidation(
+            animatedCurves.Length,
+            matched,
+            animatedCurves.Length - matched,
+            incompatibleMeshes);
+    }
+
+    private static bool IsAnimatedScalar(IReadOnlyList<UEAnimKey<float>> keys, float epsilon)
+    {
+        if (keys.Count < 2)
+            return false;
+
+        var first = keys.OrderBy(x => x.Frame).First().Value;
+        return keys.Any(key => MathF.Abs(key.Value - first) > epsilon);
+    }
+
+    private static PreviewMorphTargetMesh[] ReadPreviewMorphTargetNames(string modelPath)
+    {
+        if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath) || !IsSupportedGltfModel(modelPath))
+            return [];
+
+        try
+        {
+            var (gltf, _) = ReadGltfModel(modelPath);
+            return ArrayOf(gltf, "meshes")
+                .Select(mesh =>
+                {
+                    var primitiveTargetCounts = (mesh["primitives"] as JArray)?
+                        .OfType<JObject>()
+                        .Select(x => (x["targets"] as JArray)?.Count ?? 0)
+                        .Distinct()
+                        .ToArray() ?? [];
+                    var targetCount = primitiveTargetCounts.Length == 1 ? primitiveTargetCounts[0] : 0;
+                    var hasAnyTargets = primitiveTargetCounts.Any(x => x > 0);
+                    var targetNames = ReadPreviewTargetNames(mesh["extras"]);
+                    return new PreviewMorphTargetMesh(
+                        targetCount > 0 && targetNames.Length >= targetCount,
+                        hasAnyTargets,
+                        targetCount,
+                        targetNames);
+                })
+                .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string[] ReadPreviewTargetNames(JToken? extras)
+    {
+        if (extras == null)
+            return [];
+
+        JObject? extrasObject = extras as JObject;
+        if (extras.Type == JTokenType.String)
+        {
+            var text = extras.Value<string>();
+            if (string.IsNullOrWhiteSpace(text))
+                return [];
+
+            try
+            {
+                extrasObject = JObject.Parse(text);
+            }
+            catch
+            {
+                return [];
+            }
+        }
+
+        return extrasObject?["targetNames"] is JArray targetNames
+            ? targetNames.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToArray()
+            : [];
+    }
+
+    private static string NormalizePreviewMorphName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (char.IsLetterOrDigit(c))
+                builder.Append(char.ToLowerInvariant(c));
+        }
+
+        return builder.ToString();
     }
 
     private static SourceAnimationTrack[] GetOrBuildAnimationTracks(
@@ -5324,8 +5944,60 @@ internal static class UELibraryPostProcessor
             return "";
 
         return Path.IsPathRooted(value)
-            ? Path.GetFullPath(value)
+            ? ResolveMovedLibraryFile(root, Path.GetFullPath(value))
             : Path.GetFullPath(Path.Combine(root, value));
+    }
+
+    private static string ResolveMovedLibraryFile(string root, string fullPath)
+    {
+        if (File.Exists(fullPath) || Directory.Exists(fullPath))
+            return fullPath;
+
+        var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var libraryName = Path.GetFileName(fullRoot);
+        if (string.IsNullOrWhiteSpace(libraryName))
+            return fullPath;
+
+        var parts = fullPath
+            .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            .Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i < parts.Length - 1; i++)
+        {
+            if (!string.Equals(parts[i], libraryName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var tail = parts.Skip(i + 1).ToArray();
+            if (tail.Length == 0)
+                continue;
+
+            var candidate = Path.GetFullPath(Path.Combine(new[] { fullRoot }.Concat(tail).ToArray()));
+            if (File.Exists(candidate) || Directory.Exists(candidate))
+                return candidate;
+        }
+
+        return fullPath;
+    }
+
+    private static string NormalizeLibraryOutput(string root, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        var path = value.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+        var fullPath = Path.IsPathRooted(path)
+            ? ResolveMovedLibraryFile(root, Path.GetFullPath(path))
+            : Path.GetFullPath(Path.Combine(root, path));
+        return IsPathUnderRoot(root, fullPath)
+            ? MakeRelative(root, fullPath).Replace('\\', '/')
+            : value.Replace('\\', '/').TrimStart('/');
+    }
+
+    private static bool IsPathUnderRoot(string root, string path)
+    {
+        var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var fullPath = Path.GetFullPath(path);
+        return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string[] CompareHierarchy(
@@ -5450,6 +6122,12 @@ internal static class UELibraryPostProcessor
                         trackCoverage = validation.TrackCoverage,
                         hierarchyCompatible = validation.HierarchyCompatible,
                         isContainerAnimation = validation.IsContainerAnimation,
+                        previewVisibleMotion = validation.PreviewVisibleMotion,
+                        previewAnimatedTransformTrackCount = validation.PreviewAnimatedTransformTrackCount,
+                        previewAnimatedCurveCount = validation.PreviewAnimatedCurveCount,
+                        previewMatchedMorphCurveCount = validation.PreviewMatchedMorphCurveCount,
+                        previewUnmappedMorphCurveCount = validation.PreviewUnmappedMorphCurveCount,
+                        previewIncompatibleMorphMeshCount = validation.PreviewIncompatibleMorphMeshCount,
                         exportedReferencedAnimationCount = validation.ExportedReferencedAnimations.Length,
                         missingReferencedAnimationCount = validation.MissingReferencedAnimations.Length,
                         missingReferencedAnimations = validation.MissingReferencedAnimations.Take(32).ToArray(),
@@ -7075,6 +7753,12 @@ internal static class UELibraryPostProcessor
                 track_coverage REAL,
                 hierarchy_compatible INTEGER NOT NULL,
                 is_container_animation INTEGER NOT NULL,
+                preview_visible_motion INTEGER NOT NULL,
+                preview_animated_transform_track_count INTEGER NOT NULL,
+                preview_animated_curve_count INTEGER NOT NULL,
+                preview_matched_morph_curve_count INTEGER NOT NULL,
+                preview_unmapped_morph_curve_count INTEGER NOT NULL,
+                preview_incompatible_morph_mesh_count INTEGER NOT NULL,
                 is_usable_candidate INTEGER NOT NULL,
                 confidence_tier TEXT,
                 relationship_kind TEXT,
@@ -7148,7 +7832,13 @@ internal static class UELibraryPostProcessor
                 matched_track_bones INTEGER NOT NULL,
                 track_coverage REAL NOT NULL,
                 hierarchy_compatible INTEGER NOT NULL,
-                is_container_animation INTEGER NOT NULL
+                is_container_animation INTEGER NOT NULL,
+                preview_visible_motion INTEGER NOT NULL,
+                preview_animated_transform_track_count INTEGER NOT NULL,
+                preview_animated_curve_count INTEGER NOT NULL,
+                preview_matched_morph_curve_count INTEGER NOT NULL,
+                preview_unmapped_morph_curve_count INTEGER NOT NULL,
+                preview_incompatible_morph_mesh_count INTEGER NOT NULL
             );
             """);
         Execute(connection, transaction, """
@@ -7179,7 +7869,7 @@ internal static class UELibraryPostProcessor
             );
             """);
         foreach (var row in catalogRows)
-            InsertAsset(connection, transaction, row);
+            InsertAsset(connection, transaction, root, row);
 
         foreach (var material in materials.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
             InsertMaterialSidecar(connection, transaction, material);
@@ -7321,7 +8011,7 @@ internal static class UELibraryPostProcessor
         }
     }
 
-    private static void InsertAsset(SqliteConnection connection, SqliteTransaction transaction, JObject row)
+    private static void InsertAsset(SqliteConnection connection, SqliteTransaction transaction, string root, JObject row)
     {
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -7341,7 +8031,7 @@ internal static class UELibraryPostProcessor
         Add(command, "$sourceType", (string?)row["sourceType"]);
         Add(command, "$source", (string?)row["source"]);
         Add(command, "$objectPath", (string?)row["objectPath"]);
-        Add(command, "$output", (string?)row["output"]);
+        Add(command, "$output", NormalizeLibraryOutput(root, (string?)row["output"]));
         Add(command, "$format", (string?)row["format"]);
         Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
         Add(command, "$skeletonName", (string?)row["skeletonName"]);
@@ -7518,7 +8208,7 @@ internal static class UELibraryPostProcessor
             Add(command, "$objectType", (string?)row["objectType"]);
             Add(command, "$name", (string?)row["name"]);
             Add(command, "$objectPath", (string?)row["objectPath"]);
-            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$output", NormalizeLibraryOutput(root, (string?)row["output"]));
             command.ExecuteNonQuery();
         }
     }
@@ -7549,7 +8239,7 @@ internal static class UELibraryPostProcessor
             Add(command, "$sourceType", (string?)row["sourceType"]);
             Add(command, "$name", (string?)row["name"]);
             Add(command, "$objectPath", (string?)row["objectPath"]);
-            Add(command, "$output", (string?)row["output"]);
+            Add(command, "$output", NormalizeLibraryOutput(root, (string?)row["output"]));
             Add(command, "$skeletonPath", (string?)row["skeletonPath"]);
             Add(command, "$skeletonName", (string?)row["skeletonName"]);
             Add(command, "$skeletonGuid", (string?)row["skeletonGuid"]);
@@ -8706,6 +9396,8 @@ internal static class UELibraryPostProcessor
                 relation_id, name, source, output, status, duration, frame_count, track_count,
                 relation_source, usage_evidence, is_explicit_usage, is_skeleton_compatible,
                 validation_status, validation_category, validation_reason, track_coverage, hierarchy_compatible, is_container_animation,
+                preview_visible_motion, preview_animated_transform_track_count, preview_animated_curve_count,
+                preview_matched_morph_curve_count, preview_unmapped_morph_curve_count, preview_incompatible_morph_mesh_count,
                 is_usable_candidate, confidence_tier, relationship_kind, recommended_use, evidence_summary, is_deterministic_usage, is_compatibility_candidate,
                 segment_count, referenced_animation_count, exported_referenced_animation_count,
                 missing_referenced_animation_count, section_count
@@ -8714,6 +9406,8 @@ internal static class UELibraryPostProcessor
                 $relationId, $name, $source, $output, $status, $duration, $frameCount, $trackCount,
                 $relationSource, $usageEvidence, $isExplicitUsage, $isSkeletonCompatible,
                 $validationStatus, $validationCategory, $validationReason, $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                $previewVisibleMotion, $previewAnimatedTransformTrackCount, $previewAnimatedCurveCount,
+                $previewMatchedMorphCurveCount, $previewUnmappedMorphCurveCount, $previewIncompatibleMorphMeshCount,
                 $isUsableCandidate, $confidenceTier, $relationshipKind, $recommendedUse, $evidenceSummary, $isDeterministicUsage, $isCompatibilityCandidate,
                 $segmentCount, $referencedAnimationCount, $exportedReferencedAnimationCount,
                 $missingReferencedAnimationCount, $sectionCount
@@ -8737,6 +9431,12 @@ internal static class UELibraryPostProcessor
         Add(command, "$trackCoverage", (double?)animation["trackCoverage"]);
         Add(command, "$hierarchyCompatible", ((bool?)animation["hierarchyCompatible"] ?? false) ? 1 : 0);
         Add(command, "$isContainerAnimation", ((bool?)animation["isContainerAnimation"] ?? false) ? 1 : 0);
+        Add(command, "$previewVisibleMotion", ((bool?)animation["previewVisibleMotion"] ?? false) ? 1 : 0);
+        Add(command, "$previewAnimatedTransformTrackCount", (int?)animation["previewAnimatedTransformTrackCount"] ?? 0);
+        Add(command, "$previewAnimatedCurveCount", (int?)animation["previewAnimatedCurveCount"] ?? 0);
+        Add(command, "$previewMatchedMorphCurveCount", (int?)animation["previewMatchedMorphCurveCount"] ?? 0);
+        Add(command, "$previewUnmappedMorphCurveCount", (int?)animation["previewUnmappedMorphCurveCount"] ?? 0);
+        Add(command, "$previewIncompatibleMorphMeshCount", (int?)animation["previewIncompatibleMorphMeshCount"] ?? 0);
         Add(command, "$isUsableCandidate", ((bool?)animation["isUsableCandidate"] ?? false) ? 1 : 0);
         Add(command, "$confidenceTier", (string?)animation["confidenceTier"]);
         Add(command, "$relationshipKind", (string?)animation["relationshipKind"]);
@@ -8906,13 +9606,17 @@ internal static class UELibraryPostProcessor
                     model, animation, skeleton_path, status, candidate_reason, reason,
                     validation_category, track_source,
                     model_bone_count, animation_track_count, matched_track_bones,
-                    track_coverage, hierarchy_compatible, is_container_animation
+                    track_coverage, hierarchy_compatible, is_container_animation,
+                    preview_visible_motion, preview_animated_transform_track_count, preview_animated_curve_count,
+                    preview_matched_morph_curve_count, preview_unmapped_morph_curve_count, preview_incompatible_morph_mesh_count
                 )
                 VALUES (
                     $model, $animation, $skeletonPath, $status, $candidateReason, $reason,
                     $validationCategory, $trackSource,
                     $modelBoneCount, $animationTrackCount, $matchedTrackBones,
-                    $trackCoverage, $hierarchyCompatible, $isContainerAnimation
+                    $trackCoverage, $hierarchyCompatible, $isContainerAnimation,
+                    $previewVisibleMotion, $previewAnimatedTransformTrackCount, $previewAnimatedCurveCount,
+                    $previewMatchedMorphCurveCount, $previewUnmappedMorphCurveCount, $previewIncompatibleMorphMeshCount
                 );
                 """;
             Add(command, "$model", validation.ModelOutput);
@@ -8929,6 +9633,12 @@ internal static class UELibraryPostProcessor
             Add(command, "$trackCoverage", validation.TrackCoverage);
             Add(command, "$hierarchyCompatible", validation.HierarchyCompatible ? 1 : 0);
             Add(command, "$isContainerAnimation", validation.IsContainerAnimation ? 1 : 0);
+            Add(command, "$previewVisibleMotion", validation.PreviewVisibleMotion ? 1 : 0);
+            Add(command, "$previewAnimatedTransformTrackCount", validation.PreviewAnimatedTransformTrackCount);
+            Add(command, "$previewAnimatedCurveCount", validation.PreviewAnimatedCurveCount);
+            Add(command, "$previewMatchedMorphCurveCount", validation.PreviewMatchedMorphCurveCount);
+            Add(command, "$previewUnmappedMorphCurveCount", validation.PreviewUnmappedMorphCurveCount);
+            Add(command, "$previewIncompatibleMorphMeshCount", validation.PreviewIncompatibleMorphMeshCount);
             command.ExecuteNonQuery();
             var validationId = GetLastInsertRowId(connection, transaction);
             InsertAnimationValidationMissingTrackBones(connection, transaction, validationId, validation.MissingTrackBones);
@@ -10332,9 +11042,64 @@ internal static class UELibraryPostProcessor
         public double TrackCoverage { get; set; }
         public bool HierarchyCompatible { get; set; }
         public bool IsContainerAnimation { get; set; }
+        public bool PreviewVisibleMotion { get; set; }
+        public int PreviewAnimatedTransformTrackCount { get; set; }
+        public int PreviewAnimatedCurveCount { get; set; }
+        public int PreviewMatchedMorphCurveCount { get; set; }
+        public int PreviewUnmappedMorphCurveCount { get; set; }
+        public int PreviewIncompatibleMorphMeshCount { get; set; }
         public string[] ReferencedAnimations { get; set; } = [];
         public string[] ExportedReferencedAnimations { get; set; } = [];
         public string[] MissingReferencedAnimations { get; set; } = [];
         public string[] HierarchyMismatches { get; set; } = [];
     }
+
+    private sealed class PreviewMotionValidation
+    {
+        public bool HasVisibleMotion { get; set; }
+        public string ValidationCategory { get; set; } = "previewNoMotion";
+        public string Reason { get; set; } = "";
+        public int AnimatedTransformTrackCount { get; set; }
+        public int AnimatedCurveCount { get; set; }
+        public int MatchedMorphCurveCount { get; set; }
+        public int UnmappedMorphCurveCount { get; set; }
+        public int IncompatibleMorphMeshCount { get; set; }
+
+        public static PreviewMotionValidation Error(string category, string reason)
+            => new()
+            {
+                HasVisibleMotion = false,
+                ValidationCategory = category,
+                Reason = reason,
+            };
+    }
+
+    private sealed class UEAnimPreviewMotionData
+    {
+        public bool ReadOk { get; set; }
+        public string ErrorCategory { get; set; } = "";
+        public string ErrorReason { get; set; } = "";
+        public HashSet<string> AnimatedTransformBones { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public string[] AnimatedMorphCurves { get; set; } = [];
+
+        public static UEAnimPreviewMotionData Error(string category, string reason)
+            => new()
+            {
+                ReadOk = false,
+                ErrorCategory = category,
+                ErrorReason = reason,
+            };
+    }
+
+    private readonly record struct PreviewMorphValidation(
+        int AnimatedCurves,
+        int MatchedAnimatedCurves,
+        int UnmappedAnimatedCurves,
+        int IncompatibleMorphMeshes);
+
+    private readonly record struct PreviewMorphTargetMesh(
+        bool IsCompatible,
+        bool HasAnyTargets,
+        int TargetCount,
+        string[] TargetNames);
 }
