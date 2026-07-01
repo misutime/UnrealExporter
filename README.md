@@ -64,8 +64,8 @@ Example config files can be found in `/configs/examples`. The excluded paths in 
 | logOutputs             | `bool`          | If set to `true`, every exported file's path will be logged. If set to `false`, these logs are skipped. Note: The logging occurs **before** attempting to export the file, so if the program crashes, check the last few logged files (it will not always be the last file if you have multithreading enabled). | 
 | keepDirectoryStructure | `bool`          | If set to `true`, folders will be made matching those found in the .paks. If set to `false`, all files will be output at the root level of the `outputDir`.     |
 | lang                   | `string`        | Language that strings should be output in. [Supported languages](https://github.com/FabianFG/CUE4Parse/blob/master/CUE4Parse/UE4/Versions/ELanguage.cs). Useful for specifying the target language for localized resources. Will only work if the game supports the specified localization. Defaults to `English`. |
-| createNewCheckpoint    | `bool`          | If set to `true`, will output a new checkpoint file in the `/checkpoints` directory. If set to `false`, will not create a checkpoint file. More details about checkpoints below. |
-| useCheckpointFile      | `string`        | A __relative path__ to a checkpoint file in the `/checkpoints` directory, i.e. `/checkpoints/Tower of Fantasy 02-26-2024 06-08.ckpt`. If set to `latest`, the program will look for the latest checkpoint in the `/checkpoints` folder that contains the `gameTitle` provided, i.e, between `/checkpoints/Palworld 02-26-2024 00-00.ckpt` and `/checkpoints/Palworld 05-30-2024 00-00.ckpt`, the latter will be used (will not work if you changed the file name structure). More details about checkpoints below. |
+| createNewCheckpoint    | `bool`          | If set to `true`, will output a new SQLite checkpoint database in the `/checkpoints` directory. If set to `false`, will not create a checkpoint file. More details about checkpoints below. |
+| useCheckpointFile      | `string`        | A __relative path__ to a SQLite checkpoint database in the `/checkpoints` directory, i.e. `/checkpoints/Tower of Fantasy 02-26-2024 06-08.checkpoint.db`. If set to `latest`, the program will look for the latest SQLite checkpoint in the `/checkpoints` folder that starts with the `gameTitle` provided. More details about checkpoints below. |
 | export        | `Array(string)` | A list of files to export. Supports regex. Add a colon with the desired output type at the end, such as `:json` or `:png` (see [supported file types](#supported-file-types)). |
 | exclude      | `Array(string)` | A list of files to skip exporting. Supports regex. Useful for avoiding files that crash CUE4Parse. Note: the program will try to automatically skip files that cannot be parsed by CUE4Parse, however files causing issues such as segmentation faults and heap corruption will not be skipped as they are not technically a failed parse, so they will need to be added to the excluded paths. |
 
@@ -101,6 +101,11 @@ Create multiple JSONs in the `configs` folder, naming them something easy for yo
 
 团队操作流程见 [UE 游戏素材提取流程](docs/UE游戏素材提取流程.md)。常用项目命令见 [常用导出命令](docs/常用导出命令.md)。
 
+相关后处理项目已经拆分：
+
+- `D:\misutime\AssetLibraryBrowser`：读取 `asset_library.json` / `library_index.db` 的通用素材浏览器。
+- `D:\misutime\HumanoidRetargeter`：处理已导出模型/动画素材的 ARPG Humanoid 标准化、重定向和视觉门禁工具链。
+
 ### Neverness To Everness asset export
 
 本仓库当前已经放了几份本地 NTE 配置，运行命令时使用配置文件名，不需要带 `.json` 后缀。
@@ -129,15 +134,14 @@ dotnet run --project UnrealExporter nte-all-assets
 
 The GLB exporter embeds common material textures into the GLB so viewers and DCC tools can display the model immediately. It also keeps the Unreal material path and texture slot paths in `material.extras.textureSlots`, and still writes sidecar material JSON / texture files when material export is enabled.
 
-For a Unity-oriented pipeline, prefer:
+For a Unity-oriented pipeline, use this exporter as the Unreal asset extraction stage:
 
 ```text
-UnrealExporter -> GLB models with embedded preview textures + sidecar PNG/material JSON
-Blender/Assimp -> optional GLB to FBX batch conversion
-Unity Editor script -> rebuild Unity materials from material JSON / textureSlots
+UnrealExporter -> GLB models, .ueanim animations, textures, material sidecars, library_index.db
+HumanoidRetargeter -> optional already-exported asset standardization / Unity or Godot helper packages
 ```
 
-FBX is not written directly by this exporter at the moment. If FBX is required, export GLB first and convert it in Blender or Assimp.
+Unity/Godot post-processing scripts are maintained in `D:\misutime\HumanoidRetargeter`, not in this Unreal extraction project.
 
 #### [Config List](#config-list)
 If you pass the config list flag `--list`, the program will prompt you to select the configs you wish to use, listing the `gameTitle` for each object in the config. **This is enabled by default in the binary executable** unless an argument is passed.
@@ -155,7 +159,7 @@ Multiple config files detected. Select the ones you wish to execute with arrows 
 ## [Checkpoints](#checkpoints)
 Similar to FModel's `.fbkp` system, checkpoints allow you to export only new/modified files and skip unchanged files, reducing the amount of time needed to export. 
 
-A `.ckpt` file is a JSON that maps each file's path to its size, i.e. `"Hotta/Content/Resources/FB/FB_Gulan/Warning.uexp": 3513`. They are outputted to the `/checkpoints` folder by default, and named via `gameTitle` and a timestamp.
+Checkpoint files are lightweight SQLite databases named `<gameTitle> <timestamp>.checkpoint.db`. They store one row per source file in `checkpoint_files(path, size)`, plus creation metadata in `checkpoint_metadata`. They are outputted to the `/checkpoints` folder by default, and named via `gameTitle` and a timestamp.
 
 If a valid checkpoint is provided, the program will only export files that have different file sizes than the one in the checkpoint (modified files), or do not have an entry in the checkpoint (new files).
 

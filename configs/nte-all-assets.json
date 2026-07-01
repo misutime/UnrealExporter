@@ -1,0 +1,57 @@
+[
+  {
+    "gameTitle": "NevernessToEverness",
+    "version": "5.6",
+    "paksDir": "C:\\Program Files\\Neverness To Everness\\Client\\WindowsNoEditor\\HT\\Content\\Paks",
+    "outputDir": "F:\\UE5-Assets\\nte-all-assets",
+    "aes": "0x370E80AA7DCA90A938A4D85013C5A16129AB3079902532B3325CA5B72B740FC7",
+    "mappingsFile": "D:\\misutime\\UnrealExporter\\mappings\\NevernessToEverness.usmap",
+    "logOutputs": true,
+    "keepDirectoryStructure": true,
+    "lang": "English",
+    "maxDegreeOfParallelism": 6,
+    "maxHeavyExportDegreeOfParallelism": 2,
+    "memorySoftLimitGb": 44,
+    "memoryCheckIntervalMs": 1500,
+    "memoryWaitLogSeconds": 30,
+    "sourceIndexCommitInterval": 100,
+    "generateLibraryIndexes": true,
+    "useSharedTextures": true,
+    "writeDebugJson": false,
+    "generateSourceIndex": true,
+    "autoExportReferencedAssets": true,
+    "autoExportCompatibleAnimations": true,
+    "resumeExports": true,
+    "createNewCheckpoint": false,
+    "useCheckpointFile": "",
+    "export": [
+      "HT/Content/.*\\.uasset:gltf",
+      "HT/Content/.*\\.uasset:png",
+      "HT/Content/.*\\.uasset:ueanim",
+
+      "HT/Content/.*(?:/Materials?/|/MaterialInstances?/|/M_|/MI_|/MIC_|/MAT_).*\\.uasset:json",
+      "HT/Content/.*(?:/Blueprints?/|/BP_|/BPs/|/Actors?/|/Components?/).*\\.uasset:json",
+      "HT/Content/.*(?:/Data/|/DataAssets?/|/Tables?/|/PrimaryAssets?/).*\\.uasset:json",
+      "HT/Content/.*(?:/Animation/|/Animations/|/Anim/|/Montage/|/Montages/|ABP|AnimBP|BP_Anim|BS_|AO_).*\\.uasset:json",
+      "HT/Content/.*(?:ControlRig|IKRig|IKRetargeter|PhysicsAsset|Skeleton).*\\.uasset:json"
+    ],
+    "sourceIndexRegex": ["HT/Content/.*\\.(?:uasset|umap)"],
+    "exclude": [
+      "HT/Content/TestMaps/.*",
+      "HT/Content/Movies/.*",
+      "HT/Content/.*/Movies/.*",
+      "HT/Content/Developers/.*",
+      "HT/Content/.*/Developers/.*",
+      "HT/Content/PlaceHolder/.*",
+      "HT/Content/.*/PlaceHolder/.*",
+      "HT/Content/Tests/.*",
+      "HT/Content/.*/Tests/.*",
+      ".*Blockout.*",
+      ".*[/_]BO[/_].*",
+      ".*SM_COL_.*\\.uasset",
+      ".*SK_COL_.*\\.uasset",
+      ".*_Proxy.*\\.uasset",
+      ".*ProxyMesh.*\\.uasset"
+    ]
+  }
+]

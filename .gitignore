@@ -3,14 +3,11 @@
 /Content
 /output
 /output2
+/dist/
 /.cache
 .env
 /test
 **.ckpt
-/configs/**.json
-!config.json
-!configs/examples/
-!configs/examples/**.json
 desktop.ini
 **.old
 .vscode

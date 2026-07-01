@@ -4,10 +4,13 @@ default:
     just --list
 
 nte:
-    dotnet run --project UnrealExporter nte-useful-assets
+    dotnet run --project UnrealExporter nte-all-assets
 
 batman:
-    dotnet run --project UnrealExporter batman-models
+    dotnet run --project UnrealExporter batman-all-assets
 
-fortnite:
-    dotnet run --project UnrealExporter fortnite-useful-assets
+browser-project:
+    Write-Host "AssetLibraryBrowser moved to D:\misutime\AssetLibraryBrowser"
+
+humanoid-project:
+    Write-Host "HumanoidRetargeter moved to D:\misutime\HumanoidRetargeter"
